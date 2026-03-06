@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.6.0] - 2026-03-05
+- **added**: API spec discovery — auto-scans for `.http`, `.rest`, `openapi.yaml/json`, `swagger.yaml/json` and injects them into the test prompt so the agent uses real endpoints instead of guessing
+- **added**: `api_specs` field in `.leashd/test.yaml` for explicit API spec file paths (overrides auto-discovery)
+- **added**: Test session context injection on resume — reads `.leashd/test-session.md` and prepends it to the prompt so the agent resumes from prior progress
+- **added**: Docker commands (`docker compose`, `docker build`, `docker run`, etc.) auto-approved in both test and implement modes
+- **changed**: Phase 2 (Server Startup) now mentions Docker — checks for `docker-compose.yml`/`compose.yaml` before falling back to dev server
+- **changed**: Phase 5 (Backend Verification) now references discovered API spec files as authoritative endpoint source
+- **changed**: `leashd ws add` merges directories into existing workspaces instead of replacing
+- **added**: `leashd ws remove <name> <dir...>` removes specific directories from a workspace
+- **added**: `leashd restart` command (stop + start)
+- **added**: Live config reload via SIGHUP — `add-dir`, `remove-dir`, and workspace changes propagate to running daemon without restart; new `leashd reload` command
+- **changed**: Task pipeline simplified from 11 phases to 3 core phases (plan→implement→test) with dynamic phase insertion based on task keywords
+- **added**: Implement phase now includes mandatory lint/format, type check, and unit test verification before completion
+- **added**: Test phase uses agentic testing via TestRunnerPlugin (browser tools, multi-phase workflow, self-healing) instead of plain `uv run pytest`
+- **added**: `IMPLEMENT_BASH_AUTO_APPROVE` constant — auto-approves common dev tool bash commands during implement phase
+- **added**: `_build_phase_pipeline()` dynamically inserts `explore` and `validate_plan` phases based on task description keywords
+- **added**: `phase_pipeline` field on `TaskRun` for per-task phase customization with SQLite persistence and migration
+- **changed**: Auto-approvals are now cleared between phase transitions to prevent stale approvals leaking across phases
+- **changed**: `_merge_project_config` renamed to `merge_project_config` (public API for task orchestrator reuse)
+- **fixed**: `/plan` command now always routes to human review even when `auto_plan=True` — AI reviewer is only used for auto-initiated plans
+- **fixed**: Write/Edit auto-approve no longer enabled prematurely inside `can_use_tool` while session is still in plan mode — deferred to `_exit_plan_mode`
+- **fixed**: TaskOrchestrator `validate_spec` and `validate_plan` phases now use "plan" mode instead of "auto" to prevent unrestricted file writes during validation
+- **fixed**: ExitPlanMode is now denied for task-orchestrated sessions — phase transitions are managed by the orchestrator
+- **added**: `plan_origin` field on Session tracks how plan mode was entered (`"user"`, `"auto"`, or `"task"`)
+- **added**: `/stop` command — cancels all ongoing work (agent, autonomous task, loop) without resetting session
+- **changed**: `/clear` now also cancels autonomous tasks and autonomous loop before resetting
+- **fixed**: `SessionManager.reset()` now clears `mode_instruction` and `task_run_id`
+- **added**: `cost` field in `session.completed` event data for task cost tracking
+- **added**: SQLite persistence for `mode`, `mode_instruction`, `task_run_id` session fields
+- **changed**: Autonomous setup guide and quick start now use CLI commands (`leashd autonomous enable/setup`) instead of `.env` files as the primary configuration path
+- **added**: `leashd autonomous` CLI subcommand — `setup`, `enable`, `disable`, `show` for managing autonomous mode config
+- **added**: Autonomous mode section in `leashd init` setup wizard with guided prompts
+- **added**: `autonomous` YAML config section in `~/.leashd/config.yaml` with env var bridging for pydantic-settings
+- **added**: `resolve_policy_name()` resolves short policy names (e.g. `autonomous`) to full paths
+- **added**: `leashd config` now displays autonomous mode status
+- **added**: Task orchestrator plugin — multi-phase autonomous workflow (spec→explore→validate→plan→implement→test→PR) with crash recovery, SQLite persistence, retry loops, and per-chat concurrency
+- **added**: AI auto-approver plugin — Claude Haiku replaces human approval taps for `require_approval` tools
+- **added**: Autonomous loop plugin — post-task test-and-retry with `/test` integration
+- **added**: Autonomous policy (`autonomous.yaml`) for minimal-interruption operation
+- **added**: Compound command classification prevents policy evasion via `&&`/`||`/`;`
+- **added**: `approver_type` field in audit log entries
+- **added**: `session_mode` field in audit tool-attempt entries
+- **added**: Load CLAUDE.md from all workspace directories via SDK `add_dirs`
+- **added**: `session.completed` event emitted after each agent run for plugin integration
+- **added**: Auto-plan step — AI plan review via Claude Haiku replaces Telegram approval when `auto_plan=True`
+- **added**: Auto-PR creation — after tests pass in autonomous mode, agent creates a PR when `auto_pr=True`
+- **added**: `gh-cli-pr` policy rule in `autonomous.yaml` for GitHub CLI PR operations
+- **added**: Task orchestrator documentation across all docs (architecture, plugins, events, configuration, engine)
+
+
 ## [0.5.0] - 2026-03-02
 - **added**: Daemon mode — `leashd` now runs in the background by default; `leashd stop` for graceful shutdown, `leashd status` to check, `leashd start -f` for foreground
 - **added**: CLI subcommands — `leashd init`, `add-dir`, `remove-dir`, `dirs`, `config` for managing configuration without manual `.env` editing
