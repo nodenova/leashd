@@ -43,7 +43,9 @@ uv run ruff check --fix . && uv run ruff format .
 leashd start           # start as background daemon
 leashd start -f        # start in foreground (useful for dev)
 leashd stop            # graceful shutdown
+leashd restart         # stop + start
 leashd status          # check if running
+leashd reload          # send SIGHUP to reload config without restart
 
 # Config management
 leashd init            # first-time setup wizard
@@ -52,6 +54,12 @@ leashd add-dir <path>  # add approved directory
 leashd remove-dir <path>
 leashd dirs            # list approved dirs
 leashd clean           # remove all runtime artifacts
+
+# Autonomous mode
+leashd autonomous setup    # guided setup for autonomous features
+leashd autonomous enable   # enable autonomous mode
+leashd autonomous disable  # disable autonomous mode
+leashd autonomous show     # show current autonomous config
 
 # Type checking
 uv run mypy leashd/
@@ -69,13 +77,13 @@ The system follows a three-layer safety pipeline: **Sandbox → Policy → Appro
 
 **CLI** (`cli.py`) — argparse subcommand router. Entry point is `main.py:run()` → `cli.py:main()`. Dispatches `start`, `stop`, `status`, `init`, `add-dir`, `remove-dir`, `dirs`, `config`, `clean`, `ws`. Bare `leashd` (no subcommand) triggers smart-start: checks cwd, prompts to approve if needed, then daemonizes.
 
-**Daemon** (`daemon.py`) — background process lifecycle via PID file at `~/.leashd/leashd.pid`. `start_daemon()` spawns `leashd _run` as a detached subprocess; `stop_daemon()` sends SIGTERM with 10s grace period. `is_running()` auto-cleans stale PID files and falls back to `pgrep`.
+**Daemon** (`daemon.py`) — background process lifecycle via PID file at `~/.leashd/leashd.pid`. `start_daemon()` spawns `leashd _run` as a detached subprocess; `stop_daemon()` sends SIGTERM with 10s grace period. `is_running()` auto-cleans stale PID files and falls back to `pgrep`. SIGHUP triggers live config reload (`leashd reload`) — `add-dir`, `remove-dir`, and workspace changes propagate without restart.
 
 **Config Store** (`config_store.py`) — persistent global config I/O at `~/.leashd/config.yaml` and workspaces at `~/.leashd/workspaces.yaml`. `inject_global_config_as_env()` bridges YAML values to `os.environ` so pydantic-settings picks them up. Atomic writes via temp-file + rename.
 
 **Setup** (`setup.py`) — interactive first-time wizard (`leashd init`). Prompts for cwd approval, Telegram bot token, and user ID. Writes to global config store.
 
-**Engine** (`core/engine.py`) is the central orchestrator. It receives user messages from connectors, passes them through the middleware chain, routes messages to the Claude Code agent, and sends responses back through connectors. Supports `/dir`, `/plan <text>`, `/edit <text>`, `/git`, `/workspace` (alias `/ws`), `/task <description>`, `/stop`, `/cancel`, and `/tasks` commands.
+**Engine** (`core/engine.py`) is the central orchestrator. It receives user messages from connectors, passes them through the middleware chain, routes messages to the Claude Code agent, and sends responses back through connectors. Supports `/dir`, `/plan <text>`, `/edit <text>`, `/default`, `/git`, `/workspace` (alias `/ws`), `/task <description>`, `/tasks`, `/stop`, `/cancel`, `/status`, and `/clear` commands.
 
 **Safety pipeline** (all in `core/safety/`):
 0. **Gatekeeper** (`gatekeeper.py`) — `ToolGatekeeper` orchestrates the full sandbox → policy → approval chain per tool call, emitting events at each stage. Extracted from Engine to keep it focused on message routing.
@@ -100,7 +108,10 @@ The system follows a three-layer safety pipeline: **Sandbox → Policy → Appro
 - Built-in: `TestRunnerPlugin` activates 9-phase test workflow via `/test` command, auto-approves browser tools and test commands
 - Built-in: `MergeResolverPlugin` handles `/git merge` conflict resolution, auto-approves Edit/Write/Read and git read commands
 - Built-in: `TestConfigLoaderPlugin` loads per-project test configuration from `.leashd/test.yaml` to customize the `/test` workflow
-- Built-in: `TaskOrchestrator` drives autonomous tasks through spec→explore→validate→plan→implement→test→PR with crash recovery, SQLite persistence (`core/task.py`), and per-chat serialization (`core/queue.py`)
+- Built-in: `TaskOrchestrator` drives autonomous tasks through plan→implement→test (with dynamic explore/validate insertion) with crash recovery, SQLite persistence (`core/task.py`), and per-chat serialization (`core/queue.py`)
+- Built-in: `AutoApprover` replaces human approval taps with Claude CLI evaluation for `require_approval` actions; has circuit breaker and audit logging
+- Built-in: `AutoPlanReviewer` AI-driven plan review via Claude CLI when `auto_plan=True`
+- Built-in: `AutonomousLoop` post-task test-and-retry with exponential backoff, optional PR creation
 
 **Interactions** (`core/interactions.py`): `InteractionCoordinator` bridges Claude's `AskUserQuestion` and `ExitPlanMode` SDK events to connectors — forwards questions/plan reviews to Telegram, collects user responses, and returns them to the agent.
 
@@ -186,7 +197,7 @@ Session metadata lives in a separate fixed-location store at `{leashd_root}/.lea
 After completing each feature, bug fix, or notable change, add a concise entry to `CHANGELOG.md` under the **current (latest) version heading**. All new entries accumulate under that version until a new version is explicitly introduced (e.g., bumping from `0.2.1` to `0.2.2` or `0.3.0`).
 
 ```markdown
-## [0.3.0] - 2026-02-26
+## [0.6.0] - 2026-03-07
 - **category**: Short description of what changed
 ```
 

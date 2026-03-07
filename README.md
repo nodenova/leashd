@@ -99,6 +99,16 @@ Claude starts working. When it needs to do something gated by policy (e.g. write
 
 **Autonomous policy** — `autonomous.yaml` is purpose-built for autonomous mode. Hard blocks remain (credentials, `rm -rf`, force push), but dev tools, file writes, and test runners are auto-allowed.
 
+**`/stop` command** — stop all ongoing work (agent, task, autonomous loop) without resetting the session.
+
+**`leashd restart` & `leashd reload`** — restart the daemon or live-reload config via SIGHUP without downtime.
+
+**`leashd autonomous` CLI** — guided setup, quick enable/disable for autonomous features. See [Autonomous Setup Guide](docs/autonomous-setup-guide.md).
+
+**Compound command classification** — the policy engine now splits `&&`, `||`, and `;` chains and evaluates each segment independently, preventing policy evasion via compound commands.
+
+**Agentic testing in task orchestrator** — the test phase uses `TestRunnerPlugin` for structured 9-phase testing instead of plain `pytest`, with API spec discovery for smarter test prompts.
+
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ---
@@ -112,9 +122,25 @@ leashd start           # start daemon (background)
 leashd start -f        # start in foreground (useful for debugging)
 leashd status          # check if daemon is running
 leashd stop            # graceful shutdown
+leashd restart         # stop + start
+leashd reload          # reload config without restart (SIGHUP)
+leashd version         # print version and exit
 ```
 
 Logs go to `~/.leashd/logs/app.log` by default. Set `LEASHD_LOG_DIR` to change the path.
+
+---
+
+## Autonomous Mode
+
+```bash
+leashd autonomous          # show current autonomous settings
+leashd autonomous setup    # run autonomous config wizard
+leashd autonomous enable   # quick-enable with defaults
+leashd autonomous disable  # disable autonomous mode
+```
+
+See the [Autonomous Setup Guide](docs/autonomous-setup-guide.md) for details.
 
 ---
 
@@ -178,6 +204,18 @@ All settings are environment variables prefixed with `LEASHD_`. Set them in `~/.
 | `LEASHD_TASK_ORCHESTRATOR` | `false` | Enable multi-phase task orchestrator (`/task` command). |
 | `LEASHD_TASK_MAX_RETRIES` | `3` | Max test-failure retries per task. |
 | `LEASHD_TASK_PHASE_TIMEOUT_SECONDS` | `1800` | Max seconds per phase (30 minutes). |
+| `LEASHD_INTERACTION_TIMEOUT_SECONDS` | `300` | Timeout for agent-user interactions (plan review, questions). |
+| `LEASHD_AUTO_APPROVER` | `false` | Enable AI auto-approver (replaces human approval taps). |
+| `LEASHD_AUTO_APPROVER_MODEL` | — | Model for auto-approver evaluations. |
+| `LEASHD_AUTO_APPROVER_MAX_CALLS` | `50` | Max tool call evaluations per request. |
+| `LEASHD_AUTONOMOUS_LOOP` | `false` | Enable post-task test-and-retry loop. |
+| `LEASHD_AUTONOMOUS_MAX_RETRIES` | `3` | Max retries in autonomous loop. |
+| `LEASHD_AUTO_PLAN` | `false` | Enable AI plan reviewer (replaces manual plan review). |
+| `LEASHD_AUTO_PLAN_MODEL` | — | Model for auto plan reviewer. |
+| `LEASHD_AUTO_PR` | `false` | Auto-create PRs after `/task` completion. |
+| `LEASHD_AUTO_PR_BASE_BRANCH` | `main` | Base branch for auto PRs. |
+| `LEASHD_LOG_MAX_BYTES` | `10485760` | Max log file size before rotation (10 MB). |
+| `LEASHD_LOG_BACKUP_COUNT` | `5` | Number of rotated log backups. |
 
 ---
 
@@ -248,6 +286,7 @@ Once the daemon is running and your bot is set up, these slash commands are avai
 | `/test` | 9-phase agent-driven test workflow with browser automation |
 | `/task <description>` | Autonomous multi-phase task: spec → explore → plan → implement → test → PR |
 | `/tasks` | List active and recent tasks for the current chat |
+| `/stop` | Stop all ongoing work (agent, task, loop) without resetting session |
 | `/cancel` | Cancel the active task in the current chat |
 | `/ws` | Manage workspaces inline |
 | `/status` | Show current session, mode, and directory |
