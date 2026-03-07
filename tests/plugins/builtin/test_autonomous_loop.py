@@ -79,9 +79,9 @@ class TestDetectTestFailure:
     def test_exit_code_1(self):
         assert detect_test_failure("Process exited with exit code 1") is True
 
-    def test_mixed_signals_failure_wins(self):
+    def test_success_overrides_when_both_present(self):
         content = "tests passed but Error: something went wrong"
-        assert detect_test_failure(content) is True
+        assert detect_test_failure(content) is False
 
     def test_success_overrides_no_failure(self):
         content = "Build succeeded. 0 failed tests."
@@ -698,3 +698,94 @@ class TestEventUnsubscribe:
         handler_count = len(event_bus._handlers.get(MESSAGE_IN, []))
         assert handler_count == 1
         await loop.stop()
+
+
+class TestEvaluatorIntegration:
+    """Tests for AI-driven evaluation in the autonomous loop."""
+
+    async def test_evaluator_advance_takes_success_path(
+        self, loop_plugin, mock_connector
+    ):
+        """When evaluator returns ADVANCE, loop takes success path."""
+        from unittest.mock import patch
+
+        from leashd.plugins.builtin._cli_evaluator import PhaseDecision
+
+        loop_plugin._session_states["chat-1"] = _LoopState(
+            phase="testing",
+            retry_count=0,
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+        )
+
+        with patch(
+            "leashd.plugins.builtin.autonomous_loop.evaluate_phase_outcome",
+            new_callable=AsyncMock,
+            return_value=PhaseDecision(action="advance", reason="tests pass"),
+        ):
+            await loop_plugin._evaluate_test_results(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="All tests pass.",
+            )
+
+        assert "chat-1" not in loop_plugin.session_states
+
+    async def test_evaluator_retry_takes_retry_path(self, loop_plugin, mock_engine):
+        """When evaluator returns RETRY, loop triggers retry."""
+        from unittest.mock import patch
+
+        from leashd.plugins.builtin._cli_evaluator import PhaseDecision
+
+        loop_plugin._session_states["chat-1"] = _LoopState(
+            phase="testing",
+            retry_count=0,
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+        )
+
+        with patch(
+            "leashd.plugins.builtin.autonomous_loop.evaluate_phase_outcome",
+            new_callable=AsyncMock,
+            return_value=PhaseDecision(action="retry", reason="3 tests failed"),
+        ):
+            await loop_plugin._evaluate_test_results(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="FAILED: test_x",
+            )
+
+        mock_engine.handle_message.assert_called_once()
+        state = loop_plugin.session_states.get("chat-1")
+        assert state is not None
+        assert state.phase == "retrying"
+
+    async def test_evaluator_fallback_on_error(self, loop_plugin, mock_connector):
+        """When evaluator raises, falls back to heuristic."""
+        from unittest.mock import patch
+
+        loop_plugin._session_states["chat-1"] = _LoopState(
+            phase="testing",
+            retry_count=0,
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+        )
+
+        with patch(
+            "leashd.plugins.builtin.autonomous_loop.evaluate_phase_outcome",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("CLI down"),
+        ):
+            await loop_plugin._evaluate_test_results(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="All tests pass. Build succeeded.",
+            )
+
+        assert "chat-1" not in loop_plugin.session_states

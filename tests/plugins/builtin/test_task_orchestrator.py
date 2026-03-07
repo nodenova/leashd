@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -19,6 +19,7 @@ from leashd.core.events import (
 from leashd.core.task import TaskRun, TaskStore
 from leashd.core.test_output import detect_test_failure
 from leashd.plugins.base import PluginContext
+from leashd.plugins.builtin._cli_evaluator import PhaseDecision
 from leashd.plugins.builtin.task_orchestrator import (
     IMPLEMENT_BASH_AUTO_APPROVE,
     TaskOrchestrator,
@@ -28,6 +29,21 @@ from leashd.plugins.builtin.task_orchestrator import (
 )
 from leashd.storage.sqlite import SqliteSessionStore
 from tests.conftest import MockConnector
+
+
+@pytest.fixture(autouse=True)
+def _mock_phase_evaluator():
+    """Prevent evaluate_phase_outcome from calling the real CLI in tests.
+
+    Falls back to _next_phase deterministic logic via exception.
+    Tests that explicitly test the evaluator override this with their own patch.
+    """
+    with patch(
+        "leashd.plugins.builtin.task_orchestrator.evaluate_phase_outcome",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("evaluator disabled in tests"),
+    ) as mock:
+        yield mock
 
 
 @pytest.fixture
@@ -191,8 +207,8 @@ class TestDetectTestFailure:
     def test_traceback(self):
         assert detect_test_failure("Traceback (most recent call last):")
 
-    def test_mixed_signals_failure_wins(self):
-        assert detect_test_failure("tests passed but Error: something went wrong")
+    def test_success_overrides_when_both_present(self):
+        assert not detect_test_failure("tests passed but Error: something went wrong")
 
 
 class TestBuildPhasePrompt:
@@ -220,7 +236,7 @@ class TestBuildPhasePrompt:
         task.max_retries = 3
         prompt = _build_phase_prompt(task)
         assert "test_foo FAILED" in prompt
-        assert "retry attempt 2" in prompt
+        assert "retry attempt 1" in prompt
 
     def test_pr_includes_base_branch(self):
         task = _make_task(phase="pr")
@@ -1310,3 +1326,89 @@ class TestEventUnsubscribe:
 
         assert cancel_count == 1
         await orch.stop()
+
+
+class TestEvaluatorIntegration:
+    """Tests for AI-driven phase evaluation with fallback."""
+
+    async def test_advance_uses_evaluator(
+        self, orchestrator, event_bus, task_store, mock_engine
+    ):
+        """When evaluator returns ADVANCE, task advances to next phase."""
+        task = _make_task(
+            chat_id="c1",
+            phase="test",
+            phase_pipeline=["pending", "plan", "implement", "test", "pr", "completed"],
+        )
+        task.phase_context["test_output"] = "All tests pass."
+        await task_store.save(task)
+        orchestrator._active_tasks["c1"] = task
+
+        with patch(
+            "leashd.plugins.builtin.task_orchestrator.evaluate_phase_outcome",
+            new_callable=AsyncMock,
+            return_value=PhaseDecision(action="advance", reason="tests pass"),
+        ) as mock_eval:
+            result = await orchestrator._evaluate_and_advance(task)
+            mock_eval.assert_called_once()
+            assert result == "pr"
+
+    async def test_advance_falls_back_on_evaluator_error(
+        self, orchestrator, event_bus, task_store
+    ):
+        """When evaluator raises, falls back to _next_phase deterministic logic."""
+        task = _make_task(
+            chat_id="c1",
+            phase="test",
+            phase_pipeline=["pending", "plan", "implement", "test", "pr", "completed"],
+        )
+        task.phase_context["test_output"] = "All tests pass. 0 failed."
+        await task_store.save(task)
+
+        # autouse fixture already patches with side_effect=RuntimeError
+        result = await orchestrator._evaluate_and_advance(task)
+        assert result == "pr"
+
+    def test_next_phase_fallback_no_failures(self):
+        """Production output with 'No failures to fix' should not trigger retry."""
+        task = _make_task(phase="test")
+        task.phase_context["test_output"] = (
+            "All green — 2510 passed, 0 failed. No failures to fix."
+        )
+        assert _next_phase(task) == "pr"
+
+    def test_retry_prompt_correct_attempt_number(self):
+        task = _make_task(phase="retry")
+        task.phase_context["test_output"] = "test_foo FAILED"
+        task.retry_count = 1
+        task.max_retries = 3
+        prompt = _build_phase_prompt(task)
+        assert "attempt 1 of 3" in prompt
+
+    def test_retry_prompt_no_duplicate_test_output(self):
+        task = _make_task(
+            phase="retry",
+            phase_pipeline=["pending", "plan", "implement", "test", "pr", "completed"],
+        )
+        task.phase_context["test_output"] = "FAILED: test_x"
+        task.phase_context["plan_output"] = "Plan done"
+        task.retry_count = 1
+        task.max_retries = 3
+        prompt = _build_phase_prompt(task)
+        # test_output should appear only in the retry section, not also as prior context
+        assert prompt.count("FAILED: test_x") == 1
+
+    async def test_setup_test_phase_includes_retry_context(
+        self, orchestrator, mock_engine
+    ):
+        task = _make_task(chat_id="c1", phase="test")
+        task.retry_count = 1
+        task.phase_context["test_output"] = "test_foo FAILED"
+        task.phase_context["retry_output"] = "Fixed import"
+
+        mock_session = mock_engine.session_manager.get_or_create.return_value
+        prompt = orchestrator._setup_test_phase(task, mock_session)
+        assert "PREVIOUS TEST FAILURE" in prompt
+        assert "RETRY FIX OUTPUT" in prompt
+        assert "test_foo FAILED" in prompt
+        assert "Fixed import" in prompt

@@ -37,6 +37,7 @@ from leashd.core.events import (
 )
 from leashd.core.test_output import detect_test_failure
 from leashd.plugins.base import LeashdPlugin, PluginMeta
+from leashd.plugins.builtin._cli_evaluator import evaluate_phase_outcome
 
 if TYPE_CHECKING:
     from typing import Protocol
@@ -60,8 +61,6 @@ logger = structlog.get_logger()
 
 @dataclass
 class _LoopState:
-    """Per-chat tracking for the autonomous test-and-retry loop."""
-
     phase: Literal["testing", "retrying", "creating_pr"] = "testing"
     retry_count: int = 0
     chat_id: str = ""
@@ -124,7 +123,6 @@ class AutonomousLoop(LeashdPlugin):
         self._engine = engine
 
     async def _on_session_completed(self, event: Event) -> None:
-        """Handle session completion — decide next action based on state machine."""
         session = event.data.get("session")
         if not session:
             return
@@ -177,7 +175,6 @@ class AutonomousLoop(LeashdPlugin):
             return
 
     async def _on_user_message(self, event: Event) -> None:
-        """Cancel active autonomous loop when user sends a message."""
         chat_id = event.data.get("chat_id", "")
         task = self._active_tasks.pop(chat_id, None)
         if task and not task.done():
@@ -189,7 +186,6 @@ class AutonomousLoop(LeashdPlugin):
             )
 
     async def _submit_test(self, chat_id: str, session_id: str, user_id: str) -> None:
-        """Submit /test --unit --no-e2e via engine command handler."""
         if not self._engine:
             logger.error("autonomous_loop_no_engine")
             return
@@ -235,7 +231,6 @@ class AutonomousLoop(LeashdPlugin):
         user_id: str,
         response_content: str,
     ) -> None:
-        """Evaluate test output and decide: success, retry, or escalate."""
         if not self._engine:
             logger.error("autonomous_loop_no_engine")
             return
@@ -244,7 +239,17 @@ class AutonomousLoop(LeashdPlugin):
         if not state:
             return
 
-        test_failed = detect_test_failure(response_content)
+        try:
+            decision = await evaluate_phase_outcome(
+                response_content,
+                current_phase="test",
+                retry_count=state.retry_count,
+                max_retries=self._max_retries,
+            )
+            test_failed = decision.action in ("retry", "escalate")
+        except Exception:
+            logger.exception("phase_evaluator_failed_in_loop")
+            test_failed = detect_test_failure(response_content)
 
         if not test_failed:
             await self._handle_success(chat_id, state)
@@ -274,7 +279,6 @@ class AutonomousLoop(LeashdPlugin):
         response_content: str,
         attempt: int,
     ) -> None:
-        """Re-submit to the Engine with failure context."""
         if not self._engine:
             return
 
@@ -327,7 +331,6 @@ class AutonomousLoop(LeashdPlugin):
             raise
         except Exception:
             logger.exception("autonomous_loop_retry_error", session_id=session_id)
-            # Escalate: hand control to human when automation can't recover
             await self._escalate(
                 chat_id=chat_id,
                 session_id=session_id,
@@ -342,7 +345,6 @@ class AutonomousLoop(LeashdPlugin):
         response_content: str,
         attempt: int,
     ) -> None:
-        """Send escalation to user via connector."""
         failure_summary = response_content[-500:] if response_content else "(no output)"
 
         message = (
@@ -376,7 +378,6 @@ class AutonomousLoop(LeashdPlugin):
         )
 
     async def _handle_success(self, chat_id: str, state: _LoopState) -> None:
-        """On test success — create PR if auto_pr enabled, else notify and clean up."""
         if state.retry_count > 0 and self._connector:
             await self._connector.send_message(
                 chat_id,
@@ -397,7 +398,6 @@ class AutonomousLoop(LeashdPlugin):
             self._session_states.pop(chat_id, None)
 
     async def _submit_pr_creation(self, chat_id: str, state: _LoopState) -> None:
-        """Submit a PR-creation prompt to the Engine."""
         if not self._engine:
             logger.error("autonomous_loop_no_engine_for_pr")
             self._session_states.pop(chat_id, None)
@@ -455,17 +455,14 @@ class AutonomousLoop(LeashdPlugin):
 
     @property
     def active_chats(self) -> set[str]:
-        """Return chat IDs with active autonomous loops (for testing/monitoring)."""
         return set(self._active_tasks.keys())
 
     @property
     def session_states(self) -> dict[str, _LoopState]:
-        """Read-only view of session states (for testing/monitoring)."""
         return dict(self._session_states)
 
     @property
     def retry_counts(self) -> dict[str, int]:
-        """Read-only view of retry counts (for testing/monitoring)."""
         return {
             chat_id: state.retry_count
             for chat_id, state in self._session_states.items()

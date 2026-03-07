@@ -11,12 +11,10 @@ _FAILURE_INDICATORS = [
     "assertionerror",
     "failed:",
     "fail:",
-    "pytest: ",
     "exit code 1",
     "exit code 2",
     "build failed",
     "error:",
-    "failures",
 ]
 
 _SUCCESS_INDICATORS = [
@@ -26,6 +24,11 @@ _SUCCESS_INDICATORS = [
     "0 failed",
     "build succeeded",
     "no errors",
+    "no failures",
+    "all green",
+    "0 errors",
+    "all checks pass",
+    "passed, 0 failed",
 ]
 
 
@@ -33,14 +36,13 @@ def detect_test_failure(output: str) -> bool:
     """Heuristic: detect test failures from test-runner output.
 
     Returns True when the output looks like a failed test run.
-    Success indicators override failure indicators when no unambiguous
-    failure marker is present.
+    Success indicators take priority — if any success indicator is
+    present, the output is treated as passing.
     """
     if not output:
         return False
     lower = output.lower()
-    has_failure = any(ind in lower for ind in _FAILURE_INDICATORS)
     has_success = any(ind in lower for ind in _SUCCESS_INDICATORS)
-    if has_success and not has_failure:
+    if has_success:
         return False
-    return has_failure
+    return any(ind in lower for ind in _FAILURE_INDICATORS)

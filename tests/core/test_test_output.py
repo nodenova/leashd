@@ -50,10 +50,22 @@ class TestFalsePositiveRegression:
         output = "Build succeeded. 0 failed."
         assert detect_test_failure(output) is False
 
-    def test_mixed_signals_failure_wins(self):
+    def test_success_overrides_when_both_present(self):
         output = "tests passed but Error: something went wrong"
-        assert detect_test_failure(output) is True
+        assert detect_test_failure(output) is False
 
     def test_all_passing_with_no_failures(self):
         output = "All passing. 42 tests complete."
+        assert detect_test_failure(output) is False
+
+    def test_no_failures_to_fix(self):
+        output = "All green — 2510 passed, 0 failed. No failures to fix."
+        assert detect_test_failure(output) is False
+
+    def test_all_green(self):
+        output = "All green — 0 failed."
+        assert detect_test_failure(output) is False
+
+    def test_failures_indicator_removed(self):
+        output = "No failures"
         assert detect_test_failure(output) is False

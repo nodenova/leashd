@@ -41,6 +41,7 @@ from leashd.core.queue import KeyedAsyncQueue
 from leashd.core.task import TaskPhase, TaskRun, TaskStore
 from leashd.core.test_output import detect_test_failure
 from leashd.plugins.base import LeashdPlugin, PluginMeta
+from leashd.plugins.builtin._cli_evaluator import PhaseDecision, evaluate_phase_outcome
 from leashd.plugins.builtin.browser_tools import (
     BROWSER_MUTATION_TOOLS,
     BROWSER_READONLY_TOOLS,
@@ -159,7 +160,6 @@ _VALIDATE_KEYWORDS = re.compile(
 
 
 def _build_phase_pipeline(task_description: str, *, auto_pr: bool) -> list[TaskPhase]:
-    """Build a per-task phase pipeline based on keywords in the description."""
     pipeline: list[TaskPhase] = ["pending"]
 
     if _EXPLORE_KEYWORDS.search(task_description):
@@ -180,7 +180,6 @@ def _build_phase_pipeline(task_description: str, *, auto_pr: bool) -> list[TaskP
 
 
 def _next_phase(task: TaskRun) -> TaskPhase:
-    """Determine the next phase based on the current phase and outcome."""
     if task.phase == "test":
         ctx = task.phase_context.get("test_output", "")
         if detect_test_failure(ctx):
@@ -257,7 +256,6 @@ _PHASE_INSTRUCTIONS: dict[TaskPhase, str] = {
 
 
 def _build_phase_prompt(task: TaskRun) -> str:
-    """Build a context-aware prompt for the current phase."""
     lines = [
         f"AUTONOMOUS TASK (phase: {task.phase})",
         f"TASK: {task.task}",
@@ -269,6 +267,8 @@ def _build_phase_prompt(task: TaskRun) -> str:
     for prev_phase in pipeline:
         if prev_phase == task.phase:
             break
+        if task.phase == "retry" and prev_phase == "test":
+            continue
         key = f"{prev_phase}_output"
         output = task.phase_context.get(key)
         if output:
@@ -280,7 +280,7 @@ def _build_phase_prompt(task: TaskRun) -> str:
         test_output = task.phase_context.get("test_output", "(no output)")
         lines.append(
             f"The previous test run found failures. This is retry attempt "
-            f"{task.retry_count + 1} of {task.max_retries}. Fix the failures."
+            f"{task.retry_count} of {task.max_retries}. Fix the failures."
         )
         lines.append(f"\nLast test output (tail):\n{test_output}")
     else:
@@ -347,7 +347,6 @@ class TaskOrchestrator(LeashdPlugin):
             context.event_bus.subscribe(event_name, handler)
 
     async def start(self) -> None:
-        """Set up TaskStore and recover in-flight tasks from SQLite."""
         if self._store is None and self._db_path:
             import aiosqlite as _aiosqlite
 
@@ -389,10 +388,7 @@ class TaskOrchestrator(LeashdPlugin):
             await self._db.close()
             self._db = None
 
-    # ── Event handlers ──────────────────────────────────────────
-
     async def _on_task_submitted(self, event: Event) -> None:
-        """Handle a new /task submission."""
         chat_id = event.data.get("chat_id", "")
 
         existing = self._active_tasks.get(chat_id)
@@ -429,7 +425,6 @@ class TaskOrchestrator(LeashdPlugin):
         await self._advance(task)
 
     async def _on_session_completed(self, event: Event) -> None:
-        """Handle agent session completion — advance the state machine."""
         session = event.data.get("session")
         if not session:
             return
@@ -460,7 +455,6 @@ class TaskOrchestrator(LeashdPlugin):
         bg.add_done_callback(lambda _t: self._running_tasks.pop(chat_id, None))
 
     async def _on_user_message(self, event: Event) -> None:
-        """Cancel active task when user sends a message to that chat."""
         chat_id = event.data.get("chat_id", "")
         text = event.data.get("text", "").strip().lower()
 
@@ -473,16 +467,56 @@ class TaskOrchestrator(LeashdPlugin):
         if text in ("/cancel", "/stop", "/clear"):
             await self._cancel_task(task, "User cancelled")
 
-    # ── State machine ───────────────────────────────────────────
+    async def _evaluate_and_advance(self, task: TaskRun) -> TaskPhase:
+        phase_output = task.phase_context.get(f"{task.phase}_output", "")
+        try:
+            decision = await evaluate_phase_outcome(
+                phase_output,
+                task_description=task.task,
+                current_phase=task.phase,
+                phase_pipeline=task.phase_pipeline,
+                retry_count=task.retry_count,
+                max_retries=task.max_retries,
+            )
+            logger.info(
+                "phase_decision",
+                run_id=task.run_id,
+                action=decision.action,
+                reason=decision.reason,
+                method=decision.method,
+            )
+            return self._decision_to_phase(task, decision)
+        except Exception:
+            logger.exception("phase_evaluator_failed", run_id=task.run_id)
+            return _next_phase(task)
+
+    def _decision_to_phase(self, task: TaskRun, decision: PhaseDecision) -> TaskPhase:
+        if decision.action == "advance":
+            pipeline = task.phase_pipeline or _PHASE_ORDER
+            try:
+                idx = pipeline.index(task.phase)
+            except ValueError:
+                return "failed"
+            if idx + 1 < len(pipeline):
+                return pipeline[idx + 1]
+            return "completed"
+        if decision.action == "retry":
+            if task.retry_count < task.max_retries:
+                return "retry"
+            return "escalated"
+        if decision.action == "escalate":
+            return "escalated"
+        if decision.action == "complete":
+            return "completed"
+        return "failed"
 
     async def _advance(self, task: TaskRun) -> None:
-        """Determine next phase, transition, persist, and execute."""
 
         async def _do_advance() -> None:
             if task.is_terminal():
                 return
 
-            new_phase = _next_phase(task)
+            new_phase = await self._evaluate_and_advance(task)
 
             if new_phase == "retry":
                 task.retry_count += 1
@@ -529,7 +563,6 @@ class TaskOrchestrator(LeashdPlugin):
         await self._queue.enqueue(task.chat_id, _do_advance)
 
     async def _execute_phase(self, task: TaskRun) -> None:
-        """Build phase prompt and submit to the engine."""
         if not self._engine:
             logger.error("task_orchestrator_no_engine", run_id=task.run_id)
             return
@@ -572,7 +605,6 @@ class TaskOrchestrator(LeashdPlugin):
             await self._handle_terminal(task)
 
     def _setup_test_phase(self, task: TaskRun, session: Any) -> str:
-        """Configure the session for agentic testing via TestRunnerPlugin's infra."""
         engine = self._engine
         if engine is None:
             raise RuntimeError("Engine not set — call set_engine() first")
@@ -619,6 +651,18 @@ class TaskOrchestrator(LeashdPlugin):
                 lines.append(output)
                 lines.append("")
 
+        if task.retry_count > 0:
+            prev_test = task.phase_context.get("test_output")
+            if prev_test:
+                lines.append("--- PREVIOUS TEST FAILURE ---")
+                lines.append(prev_test)
+                lines.append("")
+            prev_retry = task.phase_context.get("retry_output")
+            if prev_retry:
+                lines.append("--- RETRY FIX OUTPUT ---")
+                lines.append(prev_retry)
+                lines.append("")
+
         session_context = read_test_session_context(task.working_directory)
         if session_context:
             lines.append(
@@ -634,7 +678,6 @@ class TaskOrchestrator(LeashdPlugin):
         return "\n".join(lines)
 
     async def _resume_task(self, task: TaskRun) -> None:
-        """Resume a task after daemon restart."""
         if self._connector:
             await self._connector.send_message(
                 task.chat_id,
@@ -659,10 +702,7 @@ class TaskOrchestrator(LeashdPlugin):
         self._running_tasks[task.chat_id] = bg
         bg.add_done_callback(lambda _t: self._running_tasks.pop(task.chat_id, None))
 
-    # ── Terminal state handlers ─────────────────────────────────
-
     async def _handle_terminal(self, task: TaskRun) -> None:
-        """Handle task reaching a terminal state."""
         self._active_tasks.pop(task.chat_id, None)
 
         if self._engine:
@@ -765,7 +805,6 @@ class TaskOrchestrator(LeashdPlugin):
         )
 
     async def _cancel_task(self, task: TaskRun, reason: str) -> None:
-        """Cancel a running task."""
         bg = self._running_tasks.pop(task.chat_id, None)
         if bg and not bg.done():
             bg.cancel()
@@ -793,10 +832,7 @@ class TaskOrchestrator(LeashdPlugin):
             reason=reason,
         )
 
-    # ── Stale task cleanup ──────────────────────────────────────
-
     async def cleanup_stale(self, max_age_hours: int = _STALE_TASK_HOURS) -> int:
-        """Mark tasks as failed if stale for longer than max_age_hours."""
         active = await self.store.load_all_active()
         now = datetime.now(timezone.utc)
         cleaned = 0
@@ -815,8 +851,6 @@ class TaskOrchestrator(LeashdPlugin):
                     age_hours=age_hours,
                 )
         return cleaned
-
-    # ── Read-only accessors for monitoring ──────────────────────
 
     @property
     def active_tasks(self) -> dict[str, TaskRun]:
