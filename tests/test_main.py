@@ -23,7 +23,12 @@ def mock_engine():
 def mock_config(tmp_path):
     cfg = MagicMock()
     cfg.approved_directories = [tmp_path]
+    cfg.connector = None
     cfg.telegram_bot_token = None
+    cfg.slack_bot_token = None
+    cfg.whatsapp_gateway_url = None
+    cfg.signal_phone_number = None
+    cfg.imessage_server_url = None
     return cfg
 
 
@@ -203,10 +208,7 @@ class TestDaemonCleanup:
             patch("leashd.main.inject_global_config_as_env"),
             patch("leashd.main.LeashdConfig", return_value=mock_config),
             patch("leashd.main.build_engine", return_value=mock_engine),
-            patch(
-                "leashd.connectors.telegram.TelegramConnector",
-                return_value=mock_connector,
-            ),
+            patch("leashd.main._build_connector", return_value=mock_connector),
             patch("leashd.daemon.cleanup") as mock_cleanup,
             pytest.raises(SystemExit) as exc_info,
         ):
@@ -221,11 +223,15 @@ class TestTelegramMode:
     async def test_telegram_mode_starts_connector(self, mock_engine):
         cfg = MagicMock()
         cfg.approved_directories = ["/tmp"]
+        cfg.connector = None
         cfg.telegram_bot_token = "fake:token"
+        cfg.slack_bot_token = None
+        cfg.whatsapp_gateway_url = None
+        cfg.signal_phone_number = None
+        cfg.imessage_server_url = None
 
         mock_connector = AsyncMock()
 
-        # Pre-set stop event so _run_telegram returns immediately
         stop_event = asyncio.Event()
         stop_event.set()
 
@@ -233,10 +239,7 @@ class TestTelegramMode:
             patch("leashd.main.inject_global_config_as_env"),
             patch("leashd.main.LeashdConfig", return_value=cfg),
             patch("leashd.main.build_engine", return_value=mock_engine),
-            patch(
-                "leashd.connectors.telegram.TelegramConnector",
-                return_value=mock_connector,
-            ),
+            patch("leashd.main._build_connector", return_value=mock_connector),
             patch("leashd.main.asyncio.Event", return_value=stop_event),
             patch("leashd.main.asyncio.get_running_loop") as mock_loop,
         ):
@@ -252,7 +255,12 @@ class TestTelegramMode:
     async def test_connector_start_failure_calls_engine_shutdown(self, mock_engine):
         cfg = MagicMock()
         cfg.approved_directories = ["/tmp"]
+        cfg.connector = None
         cfg.telegram_bot_token = "fake:token"
+        cfg.slack_bot_token = None
+        cfg.whatsapp_gateway_url = None
+        cfg.signal_phone_number = None
+        cfg.imessage_server_url = None
 
         mock_connector = AsyncMock()
         mock_connector.start.side_effect = ConnectorError("network down")
@@ -261,10 +269,7 @@ class TestTelegramMode:
             patch("leashd.main.inject_global_config_as_env"),
             patch("leashd.main.LeashdConfig", return_value=cfg),
             patch("leashd.main.build_engine", return_value=mock_engine),
-            patch(
-                "leashd.connectors.telegram.TelegramConnector",
-                return_value=mock_connector,
-            ),
+            patch("leashd.main._build_connector", return_value=mock_connector),
         ):
             with pytest.raises(SystemExit) as exc_info:
                 await main()
@@ -277,7 +282,12 @@ class TestTelegramMode:
     async def test_connector_error_clean_exit(self, mock_engine, capsys):
         cfg = MagicMock()
         cfg.approved_directories = ["/tmp"]
+        cfg.connector = None
         cfg.telegram_bot_token = "fake:token"
+        cfg.slack_bot_token = None
+        cfg.whatsapp_gateway_url = None
+        cfg.signal_phone_number = None
+        cfg.imessage_server_url = None
 
         mock_connector = AsyncMock()
         mock_connector.start.side_effect = ConnectorError(
@@ -288,10 +298,7 @@ class TestTelegramMode:
             patch("leashd.main.inject_global_config_as_env"),
             patch("leashd.main.LeashdConfig", return_value=cfg),
             patch("leashd.main.build_engine", return_value=mock_engine),
-            patch(
-                "leashd.connectors.telegram.TelegramConnector",
-                return_value=mock_connector,
-            ),
+            patch("leashd.main._build_connector", return_value=mock_connector),
         ):
             with pytest.raises(SystemExit) as exc_info:
                 await main()

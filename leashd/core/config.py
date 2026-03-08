@@ -77,7 +77,25 @@ class LeashdConfig(BaseSettings):
     rate_limit_burst: int = 5
 
     # Connector
+    connector: str | None = None  # telegram | slack | whatsapp | signal | imessage
     telegram_bot_token: str | None = None
+
+    # Slack
+    slack_bot_token: str | None = None
+    slack_app_token: str | None = None
+
+    # WhatsApp (via OpenClaw gateway)
+    whatsapp_gateway_url: str | None = None
+    whatsapp_gateway_token: str | None = None
+    whatsapp_phone_number: str | None = None
+
+    # Signal (via signal-cli)
+    signal_phone_number: str | None = None
+    signal_cli_url: str | None = None
+
+    # iMessage (via BlueBubbles)
+    imessage_server_url: str | None = None
+    imessage_password: str | None = None
 
     # Workspaces
     workspace_config_root: Path | None = None

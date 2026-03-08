@@ -14,8 +14,10 @@ if TYPE_CHECKING:
 from leashd.config_store import (
     add_approved_directory,
     config_path,
+    get_active_connector_name,
     get_approved_directories,
     get_autonomous_config,
+    get_connector_config,
     get_workspaces,
     inject_global_config_as_env,
     load_global_config,
@@ -132,6 +134,35 @@ def _source_hint(field: str, yaml_data: dict[str, Any]) -> str:
     return ""
 
 
+_CONNECTOR_DISPLAY_NAMES: dict[str, str] = {
+    "telegram": "Telegram",
+    "slack": "Slack",
+    "whatsapp": "WhatsApp",
+    "signal": "Signal",
+    "imessage": "iMessage",
+}
+
+_SENSITIVE_FIELDS = frozenset({"bot_token", "app_token", "gateway_token", "password"})
+
+
+def _mask_value(key: str, value: str) -> str:
+    """Mask sensitive config values for display."""
+    if key in _SENSITIVE_FIELDS:
+        return value[:8] + "..." if len(value) > 8 else "***"
+    return value
+
+
+def _print_connector_section(name: str, section: dict[str, Any]) -> None:
+    """Print a connector section with masked sensitive fields."""
+    display = _CONNECTOR_DISPLAY_NAMES.get(name, name)
+    print(f"\nConnector: {display}")
+    for key, value in section.items():
+        if isinstance(value, list):
+            print(f"  {key}: {', '.join(str(v) for v in value)}")
+        else:
+            print(f"  {key}: {_mask_value(key, str(value))}")
+
+
 def _print_resolved_config(config: LeashdConfig, yaml_data: dict[str, Any]) -> None:
     """Display config from the resolved LeashdConfig object."""
     dirs = config.approved_directories
@@ -151,6 +182,12 @@ def _print_resolved_config(config: LeashdConfig, yaml_data: dict[str, Any]) -> N
             )
     else:
         print("\nTelegram: not configured")
+
+    active = get_active_connector_name(yaml_data)
+    if active and active != "telegram":
+        section = yaml_data.get(active, {})
+        if isinstance(section, dict) and section:
+            _print_connector_section(active, section)
 
     autonomous = get_autonomous_config(yaml_data)
     if autonomous.get("enabled"):
@@ -176,6 +213,12 @@ def _print_yaml_only_config(yaml_data: dict[str, Any]) -> None:
             print(f"Allowed user IDs: {', '.join(str(uid) for uid in user_ids)}")
     else:
         print("\nTelegram: not configured")
+
+    active = get_active_connector_name(yaml_data)
+    if active and active != "telegram":
+        section = yaml_data.get(active, {})
+        if isinstance(section, dict) and section:
+            _print_connector_section(active, section)
 
     autonomous = get_autonomous_config(yaml_data)
     if autonomous.get("enabled"):
@@ -286,6 +329,110 @@ def _handle_autonomous_disable() -> None:
     save_global_config(data)
     inject_global_config_as_env(force=True)
     print("\u2713 Autonomous mode disabled")
+
+
+def _handle_connector(args: argparse.Namespace) -> None:
+    """Route connector subcommands."""
+    sub = getattr(args, "connector_command", None)
+    if sub is None or sub == "show":
+        _handle_connector_show()
+    elif sub == "setup":
+        name = getattr(args, "connector_name", None)
+        _handle_connector_setup(name)
+    elif sub == "remove":
+        _handle_connector_remove()
+
+
+def _handle_connector_show() -> None:
+    """Display current connector configuration."""
+    data = load_global_config()
+    name, section = get_connector_config(data)
+
+    if not name:
+        print("No connector configured.")
+        print("Run 'leashd connector setup' to set one up.")
+        return
+
+    display = _CONNECTOR_DISPLAY_NAMES.get(name, name)
+    print(f"Active connector: {display}\n")
+    for key, value in section.items():
+        if isinstance(value, list):
+            print(f"  {key}: {', '.join(str(v) for v in value)}")
+        else:
+            print(f"  {key}: {_mask_value(key, str(value))}")
+
+
+def _handle_connector_setup(name: str | None) -> None:
+    """Run the connector setup wizard."""
+    from leashd.setup import _CONNECTOR_FIELDS, _configure_connector
+
+    data = load_global_config()
+
+    if name is None:
+        print("Available connectors: telegram, slack, whatsapp, signal, imessage")
+        try:
+            name = input("Connector to set up: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return
+        if not name:
+            print("No connector selected.")
+            return
+
+    if name not in _CONNECTOR_FIELDS:
+        print(f"Unknown connector: {name}", file=sys.stderr)
+        print(
+            "Available: telegram, slack, whatsapp, signal, imessage",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    existing = data.get(name, {})
+    if not isinstance(existing, dict):
+        existing = {}
+
+    if existing:
+        display = _CONNECTOR_DISPLAY_NAMES.get(name, name)
+        try:
+            answer = input(f"{display} already configured. Reconfigure? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Kept existing configuration.")
+            return
+
+    result = _configure_connector(name, existing, input_fn=input)
+    data[name] = result
+    save_global_config(data)
+    inject_global_config_as_env(force=True)
+    display = _CONNECTOR_DISPLAY_NAMES.get(name, name)
+    print(f"\u2713 {display} connector configured")
+
+
+def _handle_connector_remove() -> None:
+    """Remove connector configuration from YAML."""
+    data = load_global_config()
+    name = get_active_connector_name(data)
+
+    if not name:
+        print("No connector configured. Nothing to remove.")
+        return
+
+    display = _CONNECTOR_DISPLAY_NAMES.get(name, name)
+    try:
+        answer = input(f"Remove {display} connector config? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+    if answer.strip().lower() not in ("y", "yes"):
+        print("Kept existing configuration.")
+        return
+
+    del data[name]
+    if data.get("connector") == name:
+        del data["connector"]
+    save_global_config(data)
+    inject_global_config_as_env(force=True)
+    print(f"\u2713 {display} connector removed")
 
 
 def _handle_clean() -> None:
@@ -668,6 +815,23 @@ def main() -> None:
     auto_sub.add_parser("enable", help="Quick-enable autonomous mode with defaults")
     auto_sub.add_parser("disable", help="Disable autonomous mode")
 
+    # Connector management
+    connector_parser = subparsers.add_parser(
+        "connector", help="Manage connector settings"
+    )
+    connector_sub = connector_parser.add_subparsers(dest="connector_command")
+    connector_sub.add_parser("show", help="Show connector config (default)")
+    connector_setup_parser = connector_sub.add_parser(
+        "setup", help="Run connector setup wizard"
+    )
+    connector_setup_parser.add_argument(
+        "connector_name",
+        nargs="?",
+        default=None,
+        help="Connector name (telegram, slack, whatsapp, signal, imessage)",
+    )
+    connector_sub.add_parser("remove", help="Remove connector config")
+
     # Workspace management
     ws_parser = subparsers.add_parser("ws", help="Manage workspaces")
     ws_sub = ws_parser.add_subparsers(dest="ws_command")
@@ -732,5 +896,7 @@ def main() -> None:
         print(f"leashd {__version__}")
     elif args.command == "autonomous":
         _handle_autonomous(args)
+    elif args.command == "connector":
+        _handle_connector(args)
     elif args.command == "ws":
         _handle_ws(args)

@@ -67,14 +67,14 @@ class TestPromptOptional:
 
 class TestRunSetup:
     def test_adds_cwd(self, fake_config_dir, tmp_path):
-        inputs = iter(["y", "", "n"])
+        inputs = iter(["y", "", "n", ""])
         result = run_setup(tmp_path, input_fn=lambda _prompt: next(inputs))
 
         dirs = result.get("approved_directories", [])
         assert str(tmp_path.resolve()) in dirs
 
     def test_skips_telegram(self, fake_config_dir, tmp_path):
-        inputs = iter(["y", "", "n"])
+        inputs = iter(["y", "", "n", ""])
         result = run_setup(tmp_path, input_fn=lambda _prompt: next(inputs))
 
         telegram = result.get("telegram", {})
@@ -103,12 +103,12 @@ class TestRunSetup:
             call_count += 1
             if call_count == 1:
                 return "y"  # add dir
-            return ""  # skip telegram token / decline autonomous
+            return ""  # skip telegram token / decline autonomous / skip connector
 
         result = run_setup(tmp_path, input_fn=counting_input)
         assert "allowed_user_ids" not in result.get("telegram", {})
-        # dir + token + autonomous
-        assert call_count == 3
+        # dir + token + autonomous + connector
+        assert call_count == 4
 
     def test_rerun_skips_existing_dir(self, fake_config_dir, tmp_path):
         """When cwd already in approved dirs, dir prompt is skipped."""
@@ -121,7 +121,7 @@ class TestRunSetup:
             return ""
 
         run_setup(tmp_path, input_fn=counting_input)
-        assert call_count == 2  # token + autonomous
+        assert call_count == 3  # token + autonomous + connector
 
     def test_rerun_skips_existing_token(self, fake_config_dir, tmp_path):
         """When dir and token already set, only user-id and autonomous prompts shown."""
@@ -187,3 +187,49 @@ class TestRunSetup:
         run_setup(tmp_path, input_fn=lambda _prompt: next(inputs))
         captured = capsys.readouterr()
         assert "Invalid user ID" in captured.out
+
+
+class TestRunSetupConnector:
+    def test_skip_connector_choice(self, fake_config_dir, tmp_path, capsys):
+        """Pressing Enter skips connector setup."""
+        # y=add dir, ""=skip telegram, "n"=skip autonomous, ""=skip connector
+        inputs = iter(["y", "", "n", ""])
+        result = run_setup(tmp_path, input_fn=lambda _prompt: next(inputs))
+        for name in ("slack", "whatsapp", "signal", "imessage"):
+            assert name not in result or not result.get(name)
+        captured = capsys.readouterr()
+        assert "Skipped" in captured.out
+
+    def test_configure_slack_in_setup(self, fake_config_dir, tmp_path):
+        """Choosing 'slack' in init sets up Slack connector fields."""
+        # y=add dir, ""=skip telegram, "n"=skip autonomous,
+        # "slack"=choose connector, "xoxb-tok"=bot_token, "xapp-tok"=app_token
+        inputs = iter(["y", "", "n", "slack", "xoxb-tok", "xapp-tok"])
+        result = run_setup(tmp_path, input_fn=lambda _prompt: next(inputs))
+        assert result["slack"]["bot_token"] == "xoxb-tok"
+        assert result["slack"]["app_token"] == "xapp-tok"
+
+    def test_unknown_connector_skipped(self, fake_config_dir, tmp_path, capsys):
+        """Entering an unknown connector name prints 'Unknown' message."""
+        # y=add dir, ""=skip telegram, "n"=skip autonomous, "foobar"=unknown
+        inputs = iter(["y", "", "n", "foobar"])
+        run_setup(tmp_path, input_fn=lambda _prompt: next(inputs))
+        captured = capsys.readouterr()
+        assert "Unknown connector: foobar" in captured.out
+
+    def test_connector_skipped_when_telegram_active(self, fake_config_dir, tmp_path):
+        """Connector step is skipped when Telegram is already configured."""
+        # y=add dir, "tok"=telegram token, "111"=user id, "n"=skip autonomous
+        inputs = iter(["y", "tok", "111", "n"])
+        result = run_setup(tmp_path, input_fn=lambda _prompt: next(inputs))
+        assert result["telegram"]["bot_token"] == "tok"
+        # No StopIteration — connector step was skipped
+
+    def test_configure_signal_in_setup(self, fake_config_dir, tmp_path):
+        """Choosing 'signal' in init sets up Signal connector fields."""
+        # y=add dir, ""=skip telegram, "n"=skip autonomous,
+        # "signal"=choose connector, "+15551234567"=phone, "http://localhost:8080"=cli_url
+        inputs = iter(["y", "", "n", "signal", "+15551234567", "http://localhost:8080"])
+        result = run_setup(tmp_path, input_fn=lambda _prompt: next(inputs))
+        assert result["signal"]["phone_number"] == "+15551234567"
+        assert result["signal"]["cli_url"] == "http://localhost:8080"

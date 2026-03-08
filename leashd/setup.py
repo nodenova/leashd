@@ -7,6 +7,7 @@ from typing import Any
 from leashd.config_store import (
     add_approved_directory,
     config_path,
+    get_active_connector_name,
     load_global_config,
     save_global_config,
 )
@@ -42,6 +43,98 @@ def _prompt_optional(
         print(f"  ({hint})")
     value = input_fn(f"  {label}: ").strip()
     return value if value else None
+
+
+_CONNECTOR_FIELDS: dict[str, list[tuple[str, str, str]]] = {
+    "telegram": [
+        (
+            "bot_token",
+            "Bot token",
+            "Create one: talk to @BotFather on Telegram, send /newbot",
+        ),
+        (
+            "allowed_user_ids",
+            "Allowed user ID",
+            "Find yours: message @userinfobot on Telegram",
+        ),
+    ],
+    "slack": [
+        (
+            "bot_token",
+            "Bot token (xoxb-...)",
+            "Bot User OAuth Token from api.slack.com/apps",
+        ),
+        (
+            "app_token",
+            "App token (xapp-...)",
+            "App-Level Token from Socket Mode settings",
+        ),
+    ],
+    "whatsapp": [
+        ("gateway_url", "Gateway URL", "WebSocket URL, e.g. ws://127.0.0.1:18789"),
+        ("gateway_token", "Gateway token", "Auth token from OpenClaw config"),
+        (
+            "phone_number",
+            "Phone number",
+            "WhatsApp account number, e.g. +15551234567",
+        ),
+    ],
+    "signal": [
+        (
+            "phone_number",
+            "Phone number",
+            "Signal account number, e.g. +15551234567",
+        ),
+        ("cli_url", "signal-cli URL", "Default: http://localhost:8080"),
+    ],
+    "imessage": [
+        (
+            "server_url",
+            "BlueBubbles server URL",
+            "e.g. http://192.168.1.100:1234",
+        ),
+        ("password", "Server password", "BlueBubbles API password"),
+    ],
+}
+
+_VALID_CONNECTOR_NAMES = tuple(_CONNECTOR_FIELDS.keys())
+
+
+def _configure_connector(
+    name: str,
+    existing: dict[str, Any],
+    *,
+    input_fn: Callable[[str], str] = input,
+) -> dict[str, Any]:
+    """Interactive config builder for a named connector.
+
+    Prompts for each field defined in ``_CONNECTOR_FIELDS[name]``.
+    Shows the current value in brackets when one exists.
+    """
+    fields = _CONNECTOR_FIELDS.get(name)
+    if not fields:
+        return existing
+
+    config = dict(existing)
+    for yaml_key, label, hint in fields:
+        current = config.get(yaml_key)
+        if isinstance(current, list):
+            display_current = ", ".join(str(v) for v in current)
+        else:
+            display_current = str(current) if current else ""
+        display_label = f"{label} [{display_current}]" if display_current else label
+        value = _prompt_optional(display_label, hint, input_fn=input_fn)
+        if value:
+            if name == "telegram" and yaml_key == "allowed_user_ids":
+                try:
+                    int(value)
+                except ValueError:
+                    print("  Invalid user ID — must be a number. Skipped.")
+                    continue
+                config[yaml_key] = [value]
+            else:
+                config[yaml_key] = value
+    return config
 
 
 def run_setup(
@@ -120,6 +213,30 @@ def run_setup(
             autonomous = _configure_autonomous(autonomous, input_fn=input_fn)
             data["autonomous"] = autonomous
             print("  \u2713 Autonomous mode configured\n")
+        else:
+            print("  - Skipped\n")
+
+    # --- Connector choice (optional) ---
+    active = get_active_connector_name(data)
+    if not active:
+        print("  \U0001f50c Connector setup (optional \u2014 press Enter to skip)")
+        print("  Available: slack, whatsapp, signal, imessage")
+        choice = _prompt_optional(
+            "Connector",
+            "",
+            input_fn=input_fn,
+        )
+        if choice:
+            choice = choice.lower()
+        if choice and choice in ("slack", "whatsapp", "signal", "imessage"):
+            section = data.get(choice, {})
+            if not isinstance(section, dict):
+                section = {}
+            section = _configure_connector(choice, section, input_fn=input_fn)
+            data[choice] = section
+            print(f"  \u2713 {choice.title()} connector configured\n")
+        elif choice:
+            print(f"  Unknown connector: {choice}. Skipped.\n")
         else:
             print("  - Skipped\n")
 

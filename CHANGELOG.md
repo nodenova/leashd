@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.7.0] - 2026-03-07
+- **added**: `leashd connector` CLI subcommand (`show`, `setup [name]`, `remove`) for managing connector configuration
+- **added**: Interactive setup wizards for Slack, WhatsApp, Signal, and iMessage connectors
+- **changed**: `leashd init` now offers connector setup after Telegram and autonomous configuration
+- **changed**: `leashd config` now displays active connector settings with masked secrets
+- **changed**: Hardened connector test suites (WhatsApp, iMessage, Slack, Signal) — added ~90 new tests covering state cleanup after resolution, approve-all/auto-approve flows, error handler paths, lifecycle management, file upload, edge cases (missing sender, empty text, field fallbacks), and Block Kit helpers; strengthened existing tests to verify actual arguments and state transitions instead of just "no exception"
+- **added**: Slack connector with Block Kit buttons and streaming support
+- **added**: WhatsApp connector via OpenClaw gateway WebSocket bridge
+- **added**: Signal connector via signal-cli HTTP daemon
+- **added**: iMessage connector via BlueBubbles REST API
+- **added**: Shared connector utilities (`_shared.py`) for text-based approval fallback
+- **added**: Connector factory with auto-detection in `main.py`
+- **added**: Optional dependency groups for each connector in `pyproject.toml`
+
 ## [0.6.0] - 2026-03-07
 - **added**: Task orchestrator — multi-phase autonomous workflow (plan→implement→test→PR) with crash recovery, SQLite persistence, and per-chat concurrency; dynamic phase insertion (explore, validate) based on task keywords
 - **added**: AI-driven phase transition evaluator replaces brittle substring heuristics — uses Claude CLI to decide advance/retry/escalate/complete between phases

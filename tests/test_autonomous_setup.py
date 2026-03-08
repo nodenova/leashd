@@ -258,8 +258,8 @@ class TestConfigureAutonomous:
 class TestRunSetupAutonomous:
     def test_skip_autonomous(self, fake_config_dir, tmp_path):
         """Declining autonomous mode skips configuration."""
-        # y=add dir, ""=skip telegram, "n"=skip autonomous
-        inputs = iter(["y", "", "n"])
+        # y=add dir, ""=skip telegram, "n"=skip autonomous, ""=skip connector
+        inputs = iter(["y", "", "n", ""])
         result = run_setup(tmp_path, input_fn=lambda _: next(inputs))
         assert "autonomous" not in result or not result.get("autonomous", {}).get(
             "enabled"
@@ -267,8 +267,8 @@ class TestRunSetupAutonomous:
 
     def test_enable_autonomous(self, fake_config_dir, tmp_path):
         """Enabling autonomous mode creates config section."""
-        # y=add dir, ""=skip telegram, y=enable autonomous, y=auto PR, ""=main branch, y=loop
-        inputs = iter(["y", "", "y", "y", "", "y"])
+        # y=add dir, ""=skip telegram, y=enable autonomous, y=auto PR, ""=main branch, y=loop, ""=skip connector
+        inputs = iter(["y", "", "y", "y", "", "y", ""])
         result = run_setup(tmp_path, input_fn=lambda _: next(inputs))
         autonomous = result.get("autonomous", {})
         assert autonomous.get("enabled") is True

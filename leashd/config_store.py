@@ -135,7 +135,95 @@ def inject_global_config_as_env(*, force: bool = False) -> None:
                 [str(uid) for uid in user_ids]
             )
 
+    _inject_connector_configs(data, force=force)
     _inject_autonomous_config(data, force=force)
+
+
+# --- Connector config bridging ---
+
+_CONNECTOR_FIELD_MAP: dict[str, list[tuple[str, str]]] = {
+    "slack": [
+        ("bot_token", "LEASHD_SLACK_BOT_TOKEN"),
+        ("app_token", "LEASHD_SLACK_APP_TOKEN"),
+    ],
+    "whatsapp": [
+        ("gateway_url", "LEASHD_WHATSAPP_GATEWAY_URL"),
+        ("gateway_token", "LEASHD_WHATSAPP_GATEWAY_TOKEN"),
+        ("phone_number", "LEASHD_WHATSAPP_PHONE_NUMBER"),
+    ],
+    "signal": [
+        ("phone_number", "LEASHD_SIGNAL_PHONE_NUMBER"),
+        ("cli_url", "LEASHD_SIGNAL_CLI_URL"),
+    ],
+    "imessage": [
+        ("server_url", "LEASHD_IMESSAGE_SERVER_URL"),
+        ("password", "LEASHD_IMESSAGE_PASSWORD"),
+    ],
+}
+
+
+def _inject_connector_configs(data: dict[str, Any], *, force: bool = False) -> None:
+    """Bridge connector YAML sections → LEASHD_* env vars."""
+    for section, fields in _CONNECTOR_FIELD_MAP.items():
+        section_data = data.get(section, {})
+        if not isinstance(section_data, dict):
+            continue
+        for yaml_key, env_key in fields:
+            val = section_data.get(yaml_key)
+            if val and (force or env_key not in os.environ):
+                os.environ[env_key] = str(val)
+
+
+# --- Connector detection ---
+
+_CONNECTOR_NAMES = ("telegram", "slack", "whatsapp", "signal", "imessage")
+
+_CONNECTOR_DETECT_KEY: dict[str, str] = {
+    "telegram": "bot_token",
+    "slack": "bot_token",
+    "whatsapp": "gateway_url",
+    "signal": "phone_number",
+    "imessage": "server_url",
+}
+
+
+def get_active_connector_name(data: dict[str, Any] | None = None) -> str | None:
+    """Detect which connector is configured in YAML.
+
+    Checks explicit ``connector`` field first, then auto-detects by
+    presence of the primary key in each connector section.  Priority
+    order matches ``main.py:_detect_connector()``.
+    """
+    if data is None:
+        data = load_global_config()
+    explicit = data.get("connector")
+    if isinstance(explicit, str) and explicit in _CONNECTOR_NAMES:
+        return explicit
+    for name in _CONNECTOR_NAMES:
+        section = data.get(name, {})
+        if isinstance(section, dict):
+            detect_key = _CONNECTOR_DETECT_KEY.get(name, "")
+            if section.get(detect_key):
+                return name
+    return None
+
+
+def get_connector_config(
+    data: dict[str, Any] | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """Return ``(connector_name, section_dict)`` for the active connector.
+
+    Returns ``(None, {})`` when no connector is configured.
+    """
+    if data is None:
+        data = load_global_config()
+    name = get_active_connector_name(data)
+    if name is None:
+        return None, {}
+    section = data.get(name, {})
+    if not isinstance(section, dict):
+        return name, {}
+    return name, section
 
 
 # --- Autonomous config bridging ---
