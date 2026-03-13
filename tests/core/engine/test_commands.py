@@ -645,6 +645,7 @@ class TestDirCommand:
         result = await eng.handle_command("user1", "dir", "api", "chat1")
 
         assert "Switched to api" in result
+        session = eng.session_manager.get("user1", "chat1")
         assert session.working_directory == str(d2.resolve())
         assert session.claude_session_id is None
 
@@ -749,6 +750,335 @@ class TestDirCommand:
         await eng.handle_command("user1", "dir", "api", "chat1")
 
         assert "chat1" not in eng._gatekeeper._auto_approved_tools
+
+
+class TestDirSessionCleanup:
+    """Verify /dir switch performs full session cleanup (like /clear)."""
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_resets_session(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        original_id = session.session_id
+        assert session.message_count == 1
+
+        await eng.handle_command("user1", "dir", "api", "chat1")
+
+        session = eng.session_manager.get("user1", "chat1")
+        assert session.session_id != original_id
+        assert session.claude_session_id is None
+        assert session.message_count == 0
+        assert session.total_cost == 0.0
+        assert session.working_directory == str(d2.resolve())
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_cancels_pending_approvals(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ac = ApprovalCoordinator(mock_connector, config)
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            approval_coordinator=ac,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        pending = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "rm -rf /"},
+        )
+        ac.pending["ap-1"] = pending
+
+        await eng.handle_command("user1", "dir", "api", "chat1")
+
+        assert pending.decision is False
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_cancels_pending_interactions(
+        self, audit_logger, policy_engine, mock_connector, tmp_path, event_bus
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            interaction_coordinator=ic,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        pending = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending
+        ic._chat_index["chat1"] = "int-1"
+
+        await eng.handle_command("user1", "dir", "api", "chat1")
+
+        assert "int-1" not in ic.pending
+        assert "chat1" not in ic._chat_index
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_cancels_running_agent(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng = Engine(
+            connector=mock_connector,
+            agent=agent,
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        eng._executing_sessions["chat1"] = "sess-42"
+        await eng.handle_command("user1", "dir", "api", "chat1")
+
+        agent.cancel.assert_awaited_once_with("sess-42")
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_clears_pending_messages(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        eng._pending_messages["chat1"] = ["queued msg"]
+        await eng.handle_command("user1", "dir", "api", "chat1")
+
+        assert "chat1" not in eng._pending_messages
+
+
+class TestWorkspaceSessionCleanup:
+    """Verify /ws and /ws exit perform full session cleanup."""
+
+    @pytest.mark.asyncio
+    async def test_ws_activate_resets_session(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        from leashd.core.workspace import Workspace
+
+        d1 = tmp_path / "fe"
+        d2 = tmp_path / "be"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[tmp_path, d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+        eng._workspaces = {
+            "myws": Workspace(name="myws", directories=[d1, d2], description="Test"),
+        }
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        original_id = session.session_id
+        assert session.message_count == 1
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+
+        session = eng.session_manager.get("user1", "chat1")
+        assert session.session_id != original_id
+        assert session.claude_session_id is None
+        assert session.message_count == 0
+        assert session.workspace_name == "myws"
+
+    @pytest.mark.asyncio
+    async def test_ws_activate_cancels_pending_approvals(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        from leashd.core.workspace import Workspace
+
+        d1 = tmp_path / "fe"
+        d2 = tmp_path / "be"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[tmp_path, d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ac = ApprovalCoordinator(mock_connector, config)
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            approval_coordinator=ac,
+        )
+        eng._workspaces = {
+            "myws": Workspace(name="myws", directories=[d1, d2], description="Test"),
+        }
+
+        await eng.handle_message("user1", "hello", "chat1")
+        pending = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-1"] = pending
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+
+        assert pending.decision is False
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_ws_exit_resets_session(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        from leashd.core.workspace import Workspace
+
+        d1 = tmp_path / "fe"
+        d2 = tmp_path / "be"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[tmp_path, d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+        eng._workspaces = {
+            "myws": Workspace(name="myws", directories=[d1, d2], description="Test"),
+        }
+
+        await eng.handle_message("user1", "hello", "chat1")
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        ws_session_id = session.session_id
+        assert session.workspace_name == "myws"
+
+        result = await eng.handle_command("user1", "ws", "exit", "chat1")
+
+        assert "exited" in result.lower()
+        session = eng.session_manager.get("user1", "chat1")
+        assert session.session_id != ws_session_id
+        assert session.workspace_name is None
+        assert session.workspace_directories == []
+        assert session.message_count == 0
+
+    @pytest.mark.asyncio
+    async def test_ws_exit_cancels_running_agent(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        from leashd.core.workspace import Workspace
+
+        d1 = tmp_path / "fe"
+        d2 = tmp_path / "be"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[tmp_path, d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng = Engine(
+            connector=mock_connector,
+            agent=agent,
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+        eng._workspaces = {
+            "myws": Workspace(name="myws", directories=[d1, d2], description="Test"),
+        }
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.workspace_name = "myws"
+        eng._executing_sessions["chat1"] = "sess-99"
+
+        await eng.handle_command("user1", "ws", "exit", "chat1")
+
+        agent.cancel.assert_awaited_with("sess-99")
 
 
 class TestDirSwitchDataPaths:
@@ -2307,7 +2637,7 @@ class TestStopCommand:
         assert pending.event.is_set()
 
     @pytest.mark.asyncio
-    async def test_stop_does_not_reset_session(
+    async def test_stop_clears_claude_session_id(
         self, config, audit_logger, policy_engine, mock_connector
     ):
         agent = FakeAgent()
@@ -2323,14 +2653,13 @@ class TestStopCommand:
         await eng.handle_message("user1", "hello", "chat1")
         session = eng.session_manager.get("user1", "chat1")
         original_id = session.session_id
-        original_claude_id = session.claude_session_id
         original_count = session.message_count
 
         await eng.handle_command("user1", "stop", "", "chat1")
 
         session_after = eng.session_manager.get("user1", "chat1")
         assert session_after.session_id == original_id
-        assert session_after.claude_session_id == original_claude_id
+        assert session_after.claude_session_id is None
         assert session_after.message_count == original_count
 
 
@@ -2569,3 +2898,946 @@ class TestBrowserShutdown:
 
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             await eng._kill_playwright_mcp()
+
+
+class TestCleanupSession:
+    """Unit tests for _cleanup_session shared helper."""
+
+    async def _make_engine_with_coordinators(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        ac = ApprovalCoordinator(mock_connector, config)
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng = Engine(
+            connector=mock_connector,
+            agent=agent,
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            approval_coordinator=ac,
+            interaction_coordinator=ic,
+        )
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        return eng, ac, ic, agent, session
+
+    @pytest.mark.asyncio
+    async def test_cleanup_cancels_approvals(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        eng, ac, _ic, _agent, session = await self._make_engine_with_coordinators(
+            config, audit_logger, policy_engine, mock_connector, event_bus
+        )
+        pending = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-1"] = pending
+
+        await eng._cleanup_session(session, "chat1")
+
+        assert pending.decision is False
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_cancels_interactions(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        eng, _ac, ic, _agent, session = await self._make_engine_with_coordinators(
+            config, audit_logger, policy_engine, mock_connector, event_bus
+        )
+        pending = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending
+        ic._chat_index["chat1"] = "int-1"
+
+        await eng._cleanup_session(session, "chat1")
+
+        assert "int-1" not in ic.pending
+        assert "chat1" not in ic._chat_index
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_cancels_running_agent(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        eng, _ac, _ic, agent, session = await self._make_engine_with_coordinators(
+            config, audit_logger, policy_engine, mock_connector, event_bus
+        )
+        eng._executing_sessions["chat1"] = "sess-42"
+
+        await eng._cleanup_session(session, "chat1")
+
+        agent.cancel.assert_awaited_once_with("sess-42")
+
+    @pytest.mark.asyncio
+    async def test_cleanup_shuts_down_browser(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        eng, _ac, _ic, _agent, session = await self._make_engine_with_coordinators(
+            config, audit_logger, policy_engine, mock_connector, event_bus
+        )
+        session.mode = "web"
+
+        with patch.object(
+            eng, "_shutdown_browser", new_callable=AsyncMock
+        ) as mock_browser:
+            await eng._cleanup_session(session, "chat1")
+            mock_browser.assert_awaited_once_with(session)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_cleans_interrupt_ui(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        eng, _ac, _ic, _agent, session = await self._make_engine_with_coordinators(
+            config, audit_logger, policy_engine, mock_connector, event_bus
+        )
+        eng._pending_interrupts["chat1"] = "irpt-1"
+        eng._interrupt_to_chat["irpt-1"] = "chat1"
+        eng._interrupt_message_ids["chat1"] = "msg-99"
+
+        await eng._cleanup_session(session, "chat1")
+
+        assert "chat1" not in eng._pending_interrupts
+        assert "irpt-1" not in eng._interrupt_to_chat
+        assert "chat1" not in eng._interrupt_message_ids
+        assert any(
+            d["chat_id"] == "chat1" and d["message_id"] == "msg-99"
+            for d in mock_connector.deleted_messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_disables_auto_approve(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        eng, _ac, _ic, _agent, session = await self._make_engine_with_coordinators(
+            config, audit_logger, policy_engine, mock_connector, event_bus
+        )
+        eng._gatekeeper.enable_auto_approve("chat1")
+        eng._gatekeeper.enable_tool_auto_approve("chat1", "Write")
+
+        await eng._cleanup_session(session, "chat1")
+
+        assert "chat1" not in eng._gatekeeper._auto_approved_chats
+        assert "chat1" not in eng._gatekeeper._auto_approved_tools
+
+    @pytest.mark.asyncio
+    async def test_cleanup_clears_pending_messages(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        eng, _ac, _ic, _agent, session = await self._make_engine_with_coordinators(
+            config, audit_logger, policy_engine, mock_connector, event_bus
+        )
+        eng._pending_messages["chat1"] = ["queued msg"]
+
+        await eng._cleanup_session(session, "chat1")
+
+        assert "chat1" not in eng._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_cleanup_without_coordinators(
+        self, config, audit_logger, policy_engine, mock_connector
+    ):
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+        assert eng.approval_coordinator is None
+        assert eng.interaction_coordinator is None
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+
+        await eng._cleanup_session(session, "chat1")
+
+    @pytest.mark.asyncio
+    async def test_cleanup_does_not_affect_other_chats(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        eng, ac, ic, _agent, session = await self._make_engine_with_coordinators(
+            config, audit_logger, policy_engine, mock_connector, event_bus
+        )
+
+        other_approval = PendingApproval(
+            approval_id="ap-other",
+            chat_id="chat2",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-other"] = other_approval
+
+        other_interaction = PendingInteraction(
+            interaction_id="int-other", chat_id="chat2", kind="question"
+        )
+        ic.pending["int-other"] = other_interaction
+        ic._chat_index["chat2"] = "int-other"
+
+        eng._pending_interrupts["chat2"] = "irpt-2"
+        eng._interrupt_to_chat["irpt-2"] = "chat2"
+        eng._gatekeeper.enable_auto_approve("chat2")
+        eng._pending_messages["chat2"] = ["other"]
+
+        await eng._cleanup_session(session, "chat1")
+
+        assert other_approval.decision is None
+        assert not other_approval.event.is_set()
+        assert "int-other" in ic.pending
+        assert "chat2" in ic._chat_index
+        assert "chat2" in eng._pending_interrupts
+        assert "chat2" in eng._gatekeeper._auto_approved_chats
+        assert "chat2" in eng._pending_messages
+
+
+class TestStopFullCleanup:
+    """Additional /stop cleanup tests."""
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_pending_interactions(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            interaction_coordinator=ic,
+        )
+
+        pending = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending
+        ic._chat_index["chat1"] = "int-1"
+
+        await eng.handle_command("user1", "stop", "", "chat1")
+
+        assert "int-1" not in ic.pending
+        assert "chat1" not in ic._chat_index
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_stop_cleans_up_interrupt_ui(
+        self, config, audit_logger, policy_engine, mock_connector
+    ):
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        eng._pending_interrupts["chat1"] = "irpt-1"
+        eng._interrupt_to_chat["irpt-1"] = "chat1"
+        eng._interrupt_message_ids["chat1"] = "msg-99"
+
+        await eng.handle_command("user1", "stop", "", "chat1")
+
+        assert "chat1" not in eng._pending_interrupts
+        assert "irpt-1" not in eng._interrupt_to_chat
+        assert "chat1" not in eng._interrupt_message_ids
+
+    @pytest.mark.asyncio
+    async def test_stop_disables_auto_approve(
+        self, config, audit_logger, policy_engine, mock_connector
+    ):
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        eng._gatekeeper.enable_auto_approve("chat1")
+
+        await eng.handle_command("user1", "stop", "", "chat1")
+
+        assert "chat1" not in eng._gatekeeper._auto_approved_chats
+
+    @pytest.mark.asyncio
+    async def test_stop_clears_pending_messages(
+        self, config, audit_logger, policy_engine, mock_connector
+    ):
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        eng._pending_messages["chat1"] = ["queued"]
+
+        await eng.handle_command("user1", "stop", "", "chat1")
+
+        assert "chat1" not in eng._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_stop_full_cleanup(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        ac = ApprovalCoordinator(mock_connector, config)
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng = Engine(
+            connector=mock_connector,
+            agent=agent,
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            approval_coordinator=ac,
+            interaction_coordinator=ic,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.mode = "web"
+
+        pending_approval = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-1"] = pending_approval
+
+        pending_interaction = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending_interaction
+        ic._chat_index["chat1"] = "int-1"
+
+        eng._executing_sessions["chat1"] = "sess-42"
+        eng._pending_interrupts["chat1"] = "irpt-1"
+        eng._interrupt_to_chat["irpt-1"] = "chat1"
+        eng._interrupt_message_ids["chat1"] = "msg-99"
+        eng._gatekeeper.enable_auto_approve("chat1")
+        eng._pending_messages["chat1"] = ["queued"]
+
+        with patch.object(eng, "_shutdown_browser", new_callable=AsyncMock) as mock_br:
+            await eng.handle_command("user1", "stop", "", "chat1")
+
+        assert pending_approval.decision is False
+        assert "int-1" not in ic.pending
+        agent.cancel.assert_awaited_once_with("sess-42")
+        mock_br.assert_awaited_once()
+        assert "chat1" not in eng._pending_interrupts
+        assert "chat1" not in eng._gatekeeper._auto_approved_chats
+        assert "chat1" not in eng._pending_messages
+
+
+class TestDirSwitchFullCleanup:
+    """Additional /dir cleanup tests."""
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_shuts_down_browser(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.mode = "web"
+
+        with patch.object(
+            eng, "_shutdown_browser", new_callable=AsyncMock
+        ) as mock_browser:
+            await eng.handle_command("user1", "dir", "api", "chat1")
+            mock_browser.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_cleans_interrupt_ui(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        eng._pending_interrupts["chat1"] = "irpt-1"
+        eng._interrupt_to_chat["irpt-1"] = "chat1"
+        eng._interrupt_message_ids["chat1"] = "msg-99"
+
+        await eng.handle_command("user1", "dir", "api", "chat1")
+
+        assert "chat1" not in eng._pending_interrupts
+        assert "irpt-1" not in eng._interrupt_to_chat
+        assert "chat1" not in eng._interrupt_message_ids
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_does_not_affect_other_chats(
+        self, audit_logger, policy_engine, mock_connector, tmp_path, event_bus
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ac = ApprovalCoordinator(mock_connector, config)
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            approval_coordinator=ac,
+            interaction_coordinator=ic,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+
+        other_approval = PendingApproval(
+            approval_id="ap-other",
+            chat_id="chat2",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-other"] = other_approval
+        eng._gatekeeper.enable_auto_approve("chat2")
+        eng._pending_messages["chat2"] = ["other"]
+
+        await eng.handle_command("user1", "dir", "api", "chat1")
+
+        assert other_approval.decision is None
+        assert "chat2" in eng._gatekeeper._auto_approved_chats
+        assert "chat2" in eng._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_dir_switch_full_cleanup(
+        self, audit_logger, policy_engine, mock_connector, tmp_path, event_bus
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ac = ApprovalCoordinator(mock_connector, config)
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng = Engine(
+            connector=mock_connector,
+            agent=agent,
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            approval_coordinator=ac,
+            interaction_coordinator=ic,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.mode = "web"
+
+        pending_approval = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-1"] = pending_approval
+
+        pending_interaction = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending_interaction
+        ic._chat_index["chat1"] = "int-1"
+
+        eng._executing_sessions["chat1"] = "sess-42"
+        eng._pending_interrupts["chat1"] = "irpt-1"
+        eng._interrupt_to_chat["irpt-1"] = "chat1"
+        eng._interrupt_message_ids["chat1"] = "msg-99"
+        eng._gatekeeper.enable_auto_approve("chat1")
+        eng._pending_messages["chat1"] = ["queued"]
+
+        with patch.object(eng, "_shutdown_browser", new_callable=AsyncMock) as mock_br:
+            await eng.handle_command("user1", "dir", "api", "chat1")
+
+        assert pending_approval.decision is False
+        assert "int-1" not in ic.pending
+        agent.cancel.assert_awaited_once_with("sess-42")
+        mock_br.assert_awaited_once()
+        assert "chat1" not in eng._pending_interrupts
+        assert "chat1" not in eng._gatekeeper._auto_approved_chats
+        assert "chat1" not in eng._pending_messages
+        session = eng.session_manager.get("user1", "chat1")
+        assert session.message_count == 0
+        assert session.working_directory == str(d2.resolve())
+
+
+class TestWorkspaceFullCleanup:
+    """Additional /ws and /ws exit cleanup tests."""
+
+    def _make_ws_engine(
+        self,
+        tmp_path,
+        mock_connector,
+        policy_engine,
+        audit_logger,
+        *,
+        agent=None,
+        ac=None,
+        ic=None,
+    ):
+        d1 = tmp_path / "fe"
+        d2 = tmp_path / "be"
+        d1.mkdir(exist_ok=True)
+        d2.mkdir(exist_ok=True)
+        config = LeashdConfig(
+            approved_directories=[tmp_path, d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        from leashd.core.workspace import Workspace
+
+        kw: dict = {}
+        if ac:
+            kw["approval_coordinator"] = ac
+        if ic:
+            kw["interaction_coordinator"] = ic
+        eng = Engine(
+            connector=mock_connector,
+            agent=agent or FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            **kw,
+        )
+        eng._workspaces = {
+            "myws": Workspace(name="myws", directories=[d1, d2], description="Test"),
+        }
+        return eng, config
+
+    @pytest.mark.asyncio
+    async def test_ws_activate_cancels_interactions(
+        self, audit_logger, policy_engine, mock_connector, tmp_path, event_bus
+    ):
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger, ic=ic
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        pending = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending
+        ic._chat_index["chat1"] = "int-1"
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+
+        assert "int-1" not in ic.pending
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_ws_activate_cancels_running_agent(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger, agent=agent
+        )
+
+        eng._executing_sessions["chat1"] = "sess-42"
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+
+        agent.cancel.assert_awaited_once_with("sess-42")
+
+    @pytest.mark.asyncio
+    async def test_ws_activate_clears_pending_messages(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger
+        )
+
+        eng._pending_messages["chat1"] = ["queued"]
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+
+        assert "chat1" not in eng._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_ws_activate_shuts_down_browser(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.mode = "web"
+
+        with patch.object(
+            eng, "_shutdown_browser", new_callable=AsyncMock
+        ) as mock_browser:
+            await eng.handle_command("user1", "workspace", "myws", "chat1")
+            mock_browser.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ws_activate_full_cleanup(
+        self, audit_logger, policy_engine, mock_connector, tmp_path, event_bus
+    ):
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ac = ApprovalCoordinator(mock_connector, config)
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng, _ = self._make_ws_engine(
+            tmp_path,
+            mock_connector,
+            policy_engine,
+            audit_logger,
+            agent=agent,
+            ac=ac,
+            ic=ic,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.mode = "web"
+
+        pending_approval = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-1"] = pending_approval
+
+        pending_interaction = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending_interaction
+        ic._chat_index["chat1"] = "int-1"
+
+        eng._executing_sessions["chat1"] = "sess-42"
+        eng._pending_interrupts["chat1"] = "irpt-1"
+        eng._interrupt_to_chat["irpt-1"] = "chat1"
+        eng._interrupt_message_ids["chat1"] = "msg-99"
+        eng._gatekeeper.enable_auto_approve("chat1")
+        eng._pending_messages["chat1"] = ["queued"]
+
+        with patch.object(eng, "_shutdown_browser", new_callable=AsyncMock) as mock_br:
+            await eng.handle_command("user1", "workspace", "myws", "chat1")
+
+        assert pending_approval.decision is False
+        assert "int-1" not in ic.pending
+        agent.cancel.assert_awaited_once_with("sess-42")
+        mock_br.assert_awaited_once()
+        assert "chat1" not in eng._pending_interrupts
+        assert "chat1" not in eng._gatekeeper._auto_approved_chats
+        assert "chat1" not in eng._pending_messages
+        session = eng.session_manager.get("user1", "chat1")
+        assert session.message_count == 0
+        assert session.workspace_name == "myws"
+
+    @pytest.mark.asyncio
+    async def test_ws_exit_cancels_pending_approvals(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ac = ApprovalCoordinator(mock_connector, config)
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger, ac=ac
+        )
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+
+        pending = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-1"] = pending
+
+        await eng.handle_command("user1", "ws", "exit", "chat1")
+
+        assert pending.decision is False
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_ws_exit_cancels_pending_interactions(
+        self, audit_logger, policy_engine, mock_connector, tmp_path, event_bus
+    ):
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger, ic=ic
+        )
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+
+        pending = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending
+        ic._chat_index["chat1"] = "int-1"
+
+        await eng.handle_command("user1", "ws", "exit", "chat1")
+
+        assert "int-1" not in ic.pending
+        assert pending.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_ws_exit_clears_pending_messages(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger
+        )
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+        eng._pending_messages["chat1"] = ["queued"]
+
+        await eng.handle_command("user1", "ws", "exit", "chat1")
+
+        assert "chat1" not in eng._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_ws_exit_shuts_down_browser(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger
+        )
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.mode = "web"
+
+        with patch.object(
+            eng, "_shutdown_browser", new_callable=AsyncMock
+        ) as mock_browser:
+            await eng.handle_command("user1", "ws", "exit", "chat1")
+            mock_browser.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_ws_exit_disables_auto_approve(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        eng, _ = self._make_ws_engine(
+            tmp_path, mock_connector, policy_engine, audit_logger
+        )
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+        eng._gatekeeper.enable_auto_approve("chat1")
+
+        await eng.handle_command("user1", "ws", "exit", "chat1")
+
+        assert "chat1" not in eng._gatekeeper._auto_approved_chats
+
+    @pytest.mark.asyncio
+    async def test_ws_exit_full_cleanup(
+        self, audit_logger, policy_engine, mock_connector, tmp_path, event_bus
+    ):
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        ac = ApprovalCoordinator(mock_connector, config)
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng, _ = self._make_ws_engine(
+            tmp_path,
+            mock_connector,
+            policy_engine,
+            audit_logger,
+            agent=agent,
+            ac=ac,
+            ic=ic,
+        )
+
+        await eng.handle_command("user1", "workspace", "myws", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.mode = "web"
+
+        pending_approval = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-1"] = pending_approval
+
+        pending_interaction = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending_interaction
+        ic._chat_index["chat1"] = "int-1"
+
+        eng._executing_sessions["chat1"] = "sess-42"
+        eng._pending_interrupts["chat1"] = "irpt-1"
+        eng._interrupt_to_chat["irpt-1"] = "chat1"
+        eng._interrupt_message_ids["chat1"] = "msg-99"
+        eng._gatekeeper.enable_auto_approve("chat1")
+        eng._pending_messages["chat1"] = ["queued"]
+
+        with patch.object(eng, "_shutdown_browser", new_callable=AsyncMock) as mock_br:
+            await eng.handle_command("user1", "ws", "exit", "chat1")
+
+        assert pending_approval.decision is False
+        assert "int-1" not in ic.pending
+        agent.cancel.assert_awaited_once_with("sess-42")
+        mock_br.assert_awaited_once()
+        assert "chat1" not in eng._pending_interrupts
+        assert "chat1" not in eng._gatekeeper._auto_approved_chats
+        assert "chat1" not in eng._pending_messages
+        session = eng.session_manager.get("user1", "chat1")
+        assert session.message_count == 0
+        assert session.workspace_name is None
+
+
+class TestClearFullCleanup:
+    """Additional /clear cleanup tests."""
+
+    @pytest.mark.asyncio
+    async def test_clear_clears_pending_messages(
+        self, config, audit_logger, policy_engine, mock_connector
+    ):
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        eng._pending_messages["chat1"] = ["queued"]
+
+        await eng.handle_command("user1", "clear", "", "chat1")
+
+        assert "chat1" not in eng._pending_messages
+
+    @pytest.mark.asyncio
+    async def test_clear_full_cleanup(
+        self, config, audit_logger, policy_engine, mock_connector, event_bus
+    ):
+        ac = ApprovalCoordinator(mock_connector, config)
+        ic = InteractionCoordinator(mock_connector, config, event_bus)
+        agent = AsyncMock()
+        agent.cancel = AsyncMock()
+        eng = Engine(
+            connector=mock_connector,
+            agent=agent,
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            approval_coordinator=ac,
+            interaction_coordinator=ic,
+        )
+
+        await eng.handle_message("user1", "hello", "chat1")
+        session = eng.session_manager.get("user1", "chat1")
+        session.mode = "web"
+
+        pending_approval = PendingApproval(
+            approval_id="ap-1",
+            chat_id="chat1",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+        )
+        ac.pending["ap-1"] = pending_approval
+
+        pending_interaction = PendingInteraction(
+            interaction_id="int-1", chat_id="chat1", kind="question"
+        )
+        ic.pending["int-1"] = pending_interaction
+        ic._chat_index["chat1"] = "int-1"
+
+        eng._executing_sessions["chat1"] = "sess-42"
+        eng._pending_interrupts["chat1"] = "irpt-1"
+        eng._interrupt_to_chat["irpt-1"] = "chat1"
+        eng._interrupt_message_ids["chat1"] = "msg-99"
+        eng._gatekeeper.enable_auto_approve("chat1")
+        eng._pending_messages["chat1"] = ["queued"]
+
+        with patch.object(eng, "_shutdown_browser", new_callable=AsyncMock) as mock_br:
+            result = await eng.handle_command("user1", "clear", "", "chat1")
+
+        assert "cleared" in result.lower()
+        assert pending_approval.decision is False
+        assert "int-1" not in ic.pending
+        agent.cancel.assert_awaited_once_with("sess-42")
+        mock_br.assert_awaited_once()
+        assert "chat1" not in eng._pending_interrupts
+        assert "chat1" not in eng._gatekeeper._auto_approved_chats
+        assert "chat1" not in eng._pending_messages
+        session = eng.session_manager.get("user1", "chat1")
+        assert session.message_count == 0

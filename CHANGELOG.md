@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.1] - 2026-03-13
+- **fixed**: `/stop` clears stale SDK session ID — prevents resume failures on next message
+- **fixed**: Streaming responder resets on agent retry — error text from failed resume no longer leaks into responses
+- **fixed**: Catch-all handler in `handle_message` — unexpected errors return a clean message instead of the connector's generic fallback
+- **fixed**: `/dir` and `/ws` perform full session cleanup before switching — cancels agent, approvals, interactions, and pending messages
+
 ## [0.7.0] - 2026-03-11
 - **added**: `/web` command — autonomous web browser agent with content-level human approval and recipe system (e.g., `/web linkedin_comment --topic "AI"`)
 - **added**: Two browser backends — choose between Playwright MCP (default) and agent-browser (Vercel's Rust CLI) via `leashd browser set-backend`; persistent login profiles via `leashd browser set-profile`

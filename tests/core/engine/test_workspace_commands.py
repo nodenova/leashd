@@ -213,6 +213,7 @@ class TestWorkspaceCommand:
 
         result = await eng.handle_command("user1", "workspace", "ws", "chat1")
         assert "ws" in result
+        session = eng.session_manager.get("user1", "chat1")
         assert session.claude_session_id is None
 
     @pytest.mark.asyncio
@@ -240,6 +241,7 @@ class TestWorkspaceCommand:
         # Exit
         result = await eng.handle_command("user1", "workspace", "exit", "chat1")
         assert "exited" in result.lower()
+        session = eng.session_manager.get("user1", "chat1")
         assert session.workspace_name is None
         assert session.workspace_directories == []
 
@@ -381,6 +383,7 @@ class TestDirDeactivatesWorkspace:
             n for n, p in eng._dir_names.items() if str(p) != session.working_directory
         )
         await eng.handle_command("user1", "dir", target_name, "chat1")
+        session = eng.session_manager.get("user1", "chat1")
         assert session.workspace_name is None
         assert session.workspace_directories == []
         assert session.working_directory == str(eng._dir_names[target_name])

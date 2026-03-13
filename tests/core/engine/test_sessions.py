@@ -756,8 +756,8 @@ class TestSessionPersistenceOnDirSwitch:
 
         await eng.handle_command("user1", "dir", "api", "chat1")
 
-        store.save.assert_awaited_once()
-        saved_session = store.save.call_args[0][0]
+        assert store.save.await_count >= 1
+        saved_session = store.save.call_args_list[-1][0][0]
         assert saved_session.working_directory == str(d2.resolve())
         assert saved_session.claude_session_id is None
 
@@ -1304,9 +1304,8 @@ class TestRealisticSessionScenarios:
         session = await sm.get_or_create("user1", "chat1", str(tmp_path))
         session.claude_session_id = "stale-id"
 
-        with pytest.raises(StorageError):
-            await eng.handle_message("user1", "hello", "chat1")
-
+        result = await eng.handle_message("user1", "hello", "chat1")
+        assert "error" in result.lower()
         assert session.claude_session_id is None
 
     @pytest.mark.asyncio
@@ -1332,8 +1331,8 @@ class TestRealisticSessionScenarios:
             audit=audit_logger,
         )
 
-        with pytest.raises(StorageError):
-            await eng.handle_message("user1", "hello", "chat1")
+        result = await eng.handle_message("user1", "hello", "chat1")
+        assert "error" in result.lower()
 
         session = sm.get("user1", "chat1")
         assert session.message_count == 1

@@ -42,6 +42,7 @@ class BaseAgent(Protocol):
         on_text_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_tool_activity: Callable[[ToolActivity | None], Coroutine[Any, Any, None]]
         | None = None,
+        on_retry: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> AgentResponse: ...
 
     async def cancel(self, session_id: str) -> None: ...

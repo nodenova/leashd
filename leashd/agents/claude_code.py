@@ -254,6 +254,7 @@ class ClaudeCodeAgent(BaseAgent):
         on_text_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_tool_activity: Callable[[ToolActivity | None], Coroutine[Any, Any, None]]
         | None = None,
+        on_retry: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> AgentResponse:
         options = self._build_options(session, can_use_tool)
 
@@ -272,6 +273,7 @@ class ClaudeCodeAgent(BaseAgent):
                 options,
                 on_text_chunk=on_text_chunk,
                 on_tool_activity=on_tool_activity,
+                on_retry=on_retry,
             )
             if not response:
                 return AgentResponse(content="No response from agent.", is_error=True)
@@ -468,6 +470,7 @@ class ClaudeCodeAgent(BaseAgent):
         on_text_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_tool_activity: Callable[[ToolActivity | None], Coroutine[Any, Any, None]]
         | None = None,
+        on_retry: Callable[[], Coroutine[Any, Any, None]] | None = None,
     ) -> AgentResponse:
         stderr_buf = _StderrBuffer()
         self._stderr_buffers[session.session_id] = stderr_buf
@@ -475,6 +478,8 @@ class ClaudeCodeAgent(BaseAgent):
 
         last_error: AgentResponse | None = None
         for _attempt in range(_MAX_RETRIES):
+            if _attempt > 0 and on_retry:
+                await on_retry()
             start = time.monotonic()
             stderr_buf.clear()
             tools_used: list[str] = []

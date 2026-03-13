@@ -464,6 +464,26 @@ class Engine:
             await self._store.teardown()
         await self.agent.shutdown()
 
+    async def _cleanup_session(self, session: Session, chat_id: str) -> None:
+        """Cancel active work, shut down browser, and clean up state for a chat."""
+        if self.approval_coordinator:
+            await self.approval_coordinator.cancel_pending(chat_id)
+        if self.interaction_coordinator:
+            self.interaction_coordinator.cancel_pending(chat_id)
+        session_id = self._executing_sessions.get(chat_id)
+        if session_id:
+            self._interrupted_chats.add(chat_id)
+            await self.agent.cancel(session_id)
+        old_iid = self._pending_interrupts.pop(chat_id, None)
+        if old_iid:
+            self._interrupt_to_chat.pop(old_iid, None)
+            mid = self._interrupt_message_ids.pop(chat_id, None)
+            if mid and self.connector:
+                await self.connector.delete_message(chat_id, mid)
+        await self._shutdown_browser(session)
+        self._gatekeeper.disable_auto_approve(chat_id)
+        self._pending_messages.pop(chat_id, None)
+
     async def _shutdown_browser(self, session: Session) -> None:
         if session.mode != "web":
             return
@@ -643,6 +663,10 @@ class Engine:
             if chat_id not in self._interrupted_chats and not is_transient:
                 self._pending_messages.pop(chat_id, None)
             return f"Error: {e}"
+        except Exception:
+            logger.exception("unexpected_error_in_handle_message", chat_id=chat_id)
+            self._pending_messages.pop(chat_id, None)
+            return "Error: An unexpected error occurred. Please try again."
         finally:
             self._executing_chats.discard(chat_id)
             self._executing_sessions.pop(chat_id, None)
@@ -744,6 +768,12 @@ class Engine:
         )
         pre_exec_claude_id = session.claude_session_id
 
+        async def _handle_agent_retry() -> None:
+            if responder:
+                await responder.delete_all_messages()
+                responder.reset()
+            logger.info("agent_retry_streaming_reset", chat_id=chat_id)
+
         try:
             response = await self._execute_agent_with_timeout(
                 text,
@@ -753,6 +783,7 @@ class Engine:
                 on_tool_activity,
                 chat_id,
                 deadline=deadline,
+                on_retry=_handle_agent_retry,
             )
 
             if response.is_error and self._is_retryable_response(response):
@@ -777,6 +808,7 @@ class Engine:
                     on_tool_activity,
                     chat_id,
                     deadline=deadline,
+                    on_retry=_handle_agent_retry,
                 )
 
             # Check interrupt BEFORE persisting session — /clear may have
@@ -786,6 +818,8 @@ class Engine:
                 self._interrupted_chats.discard(chat_id)
                 if responder:
                     await responder.deactivate()
+                session.claude_session_id = None
+                await self.session_manager.save(session)
                 if self.connector:
                     int_msg_id = await self.connector.send_message_with_id(
                         chat_id, "\u26a1 Task interrupted."
@@ -962,6 +996,8 @@ class Engine:
                 self._interrupted_chats.discard(chat_id)
                 if responder:
                     await responder.deactivate()
+                session.claude_session_id = None
+                await self.session_manager.save(session)
                 return ""
             if tool_state.plan_adjustment_feedback:
                 logger.info("plan_adjustment_restart", chat_id=chat_id)
@@ -1011,7 +1047,10 @@ class Engine:
             await self.session_manager.save(session)
             error_msg = f"Error: {e}"
             if self.connector:
-                await self.connector.send_message(chat_id, error_msg)
+                try:
+                    await self.connector.send_message(chat_id, error_msg)
+                except Exception:
+                    logger.exception("error_notification_send_failed", chat_id=chat_id)
             raise
 
     async def _execute_agent_with_timeout(
@@ -1023,6 +1062,7 @@ class Engine:
         on_tool_activity: Any,
         chat_id: str,
         deadline: AgentDeadline | None = None,
+        on_retry: Any = None,
     ) -> AgentResponse:
         pre_exec_claude_id = session.claude_session_id
         if deadline is None:
@@ -1034,6 +1074,7 @@ class Engine:
                 can_use_tool=can_use_tool,
                 on_text_chunk=on_text_chunk,
                 on_tool_activity=on_tool_activity,
+                on_retry=on_retry,
             )
         )
         try:
@@ -1173,10 +1214,10 @@ class Engine:
             )
 
         if command == "dir":
-            return await self._handle_dir_command(session, args, chat_id)
+            return await self._handle_dir_command(session, args, chat_id, user_id)
 
         if command in ("workspace", "ws"):
-            return await self._handle_workspace_command(session, args, chat_id)
+            return await self._handle_workspace_command(session, args, chat_id, user_id)
 
         if command == "plan":
             old_mode = session.mode
@@ -1294,21 +1335,10 @@ class Engine:
                     },
                 )
             )
-            if self.approval_coordinator:
-                await self.approval_coordinator.cancel_pending(chat_id)
-            if self.interaction_coordinator:
-                self.interaction_coordinator.cancel_pending(chat_id)
-            session_id = self._executing_sessions.get(chat_id)
-            if session_id:
-                self._interrupted_chats.add(chat_id)
-                await self.agent.cancel(session_id)
-            old_iid = self._pending_interrupts.pop(chat_id, None)
-            if old_iid:
-                self._interrupt_to_chat.pop(old_iid, None)
-                mid = self._interrupt_message_ids.pop(chat_id, None)
-                if mid and self.connector:
-                    await self.connector.delete_message(chat_id, mid)
-            await self._shutdown_browser(session)
+            await self._cleanup_session(session, chat_id)
+            if session.claude_session_id:
+                session.claude_session_id = None
+                await self.session_manager.save(session)
             logger.info("all_work_stopped", user_id=user_id, chat_id=chat_id)
             return "All work stopped."
 
@@ -1368,26 +1398,8 @@ class Engine:
                     },
                 )
             )
-            if self.approval_coordinator:
-                await self.approval_coordinator.cancel_pending(chat_id)
-            if self.interaction_coordinator:
-                self.interaction_coordinator.cancel_pending(chat_id)
-            session_id = self._executing_sessions.get(chat_id)
-            if session_id:
-                # Mark as interrupted BEFORE cancelling so _execute_turn skips
-                # update_from_result and doesn't overwrite the reset session.
-                self._interrupted_chats.add(chat_id)
-                await self.agent.cancel(session_id)
-            old_iid = self._pending_interrupts.pop(chat_id, None)
-            if old_iid:
-                self._interrupt_to_chat.pop(old_iid, None)
-                mid = self._interrupt_message_ids.pop(chat_id, None)
-                if mid and self.connector:
-                    await self.connector.delete_message(chat_id, mid)
-            await self._shutdown_browser(session)
+            await self._cleanup_session(session, chat_id)
             await self.session_manager.reset(user_id, chat_id)
-            self._gatekeeper.disable_auto_approve(chat_id)
-            self._pending_messages.pop(chat_id, None)
             logger.info("session_cleared", user_id=user_id, chat_id=chat_id)
             return "Session cleared. Next message starts a fresh conversation."
 
@@ -1494,7 +1506,7 @@ class Engine:
         )
 
     async def _handle_dir_command(
-        self, session: Session, args: str, chat_id: str
+        self, session: Session, args: str, chat_id: str, user_id: str
     ) -> str:
         if not args:
             if self.connector and len(self._dir_names) > 1:
@@ -1528,14 +1540,15 @@ class Engine:
         if str(target_path) == session.working_directory:
             return f"Already in {target}."
 
-        session.working_directory = str(target_path)
-        session.claude_session_id = None
         old_workspace = session.workspace_name
+        await self._cleanup_session(session, chat_id)
+        await self.session_manager.reset(user_id, chat_id)
+        session = self.session_manager.get(user_id, chat_id)
+
+        session.working_directory = str(target_path)
         session.workspace_name = None
         session.workspace_directories = []
-        self._gatekeeper.disable_auto_approve(chat_id)
 
-        # Save session to the stable session store BEFORE switching message DB
         await self.session_manager.save(session)
         await self._switch_paths(target_path)
 
@@ -1549,7 +1562,7 @@ class Engine:
         return f"Switched to {target} ({target_path}){suffix}"
 
     async def _handle_workspace_command(
-        self, session: Session, args: str, chat_id: str
+        self, session: Session, args: str, chat_id: str, user_id: str
     ) -> str:
         if not self._workspaces:
             return "No workspaces defined. Add .leashd/workspaces.yaml to configure."
@@ -1587,8 +1600,9 @@ class Engine:
             if not session.workspace_name:
                 return "No workspace active."
             old_name = session.workspace_name
-            session.workspace_name = None
-            session.workspace_directories = []
+            await self._cleanup_session(session, chat_id)
+            await self.session_manager.reset(user_id, chat_id)
+            session = self.session_manager.get(user_id, chat_id)
             await self.session_manager.save(session)
             logger.info("workspace_deactivated", chat_id=chat_id, workspace=old_name)
             return f"Exited workspace '{old_name}'. Back to single-directory mode."
@@ -1600,11 +1614,13 @@ class Engine:
         ws = self._workspaces[target]
         primary = ws.primary_directory
 
+        await self._cleanup_session(session, chat_id)
+        await self.session_manager.reset(user_id, chat_id)
+        session = self.session_manager.get(user_id, chat_id)
+
         session.workspace_name = ws.name
         session.workspace_directories = [str(d) for d in ws.directories]
         session.working_directory = str(primary)
-        session.claude_session_id = None
-        self._gatekeeper.disable_auto_approve(chat_id)
 
         await self.session_manager.save(session)
         await self._switch_paths(primary)
