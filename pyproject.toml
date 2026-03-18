@@ -113,8 +113,6 @@ exclude = [
 [tool.hatch.build.targets.wheel]
 packages = ["leashd"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"webui/dist" = "leashd/data/webui"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
