@@ -668,6 +668,62 @@ class TestDirCommand:
 
         assert "Already in" in result
 
+    async def test_dir_blocked_while_agent_executing(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        # Simulate an agent actively executing in this chat
+        eng._executing_chats.add("chat1")
+
+        result = await eng.handle_command("user1", "dir", "api", "chat1")
+
+        assert "Cannot switch" in result
+        assert "/stop" in result
+
+    async def test_dir_list_allowed_while_agent_executing(
+        self, audit_logger, policy_engine, mock_connector, tmp_path
+    ):
+        d1 = tmp_path / "leashd"
+        d2 = tmp_path / "api"
+        d1.mkdir()
+        d2.mkdir()
+        config = LeashdConfig(
+            approved_directories=[d1, d2],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=mock_connector,
+            agent=FakeAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        # Listing dirs (no args) should work even while executing
+        eng._executing_chats.add("chat1")
+
+        result = await eng.handle_command("user1", "dir", "", "chat1")
+
+        # Should show directory list, not a "Cannot switch" error
+        assert "Cannot switch" not in result
+
     async def test_status_shows_directory(
         self, audit_logger, policy_engine, mock_connector, tmp_path
     ):

@@ -266,7 +266,8 @@ class TestDefaultButtonNoAutoApprove:
         result = await hook("ExitPlanMode", {}, None)
         await task
 
-        assert result.behavior == "allow"
+        assert result.behavior == "deny"
+        assert "plan approved" in result.message.lower()
         auto = eng._gatekeeper._auto_approved_tools.get("chat1", set())
         assert "Write" not in auto
         assert "Edit" not in auto

@@ -1,6 +1,6 @@
 [project]
 name = "leashd"
-version = "0.10.0"
+version = "0.11.0"
 description = "Safety-first agentic coding framework with pluggable runtimes. Run Claude Code or Codex as a governed daemon — sandbox, YAML policies, human-in-the-loop approval"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -101,14 +101,22 @@ build-backend = "hatchling.build"
 exclude = [
     "tests/",
     ".claude/",
+    ".github/",
     ".vscode/",
     ".leashd/",
     ".env",
     ".env.example",
+    ".editorconfig",
+    ".gitignore",
     ".mcp.json",
+    ".python-version",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
     "specs/",
     "docs/",
+    "releases/",
     "Makefile",
+    "uv.lock",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -124,6 +132,7 @@ addopts = "--tb=short -q"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks integration tests",
+    "e2e: marks end-to-end browser tests (require playwright and chromium)",
 ]
 
 [tool.ruff]
@@ -204,4 +213,5 @@ dev = [
     "types-pyyaml>=6.0.12.20250915",
     "httpx>=0.28.0",
     "httpx-ws>=0.7.0",
+    "playwright>=1.40.0",
 ]

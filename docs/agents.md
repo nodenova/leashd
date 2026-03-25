@@ -92,7 +92,7 @@ sequenceDiagram
 | Option | Source |
 |---|---|
 | `cwd` | `session.working_directory` |
-| `max_turns` | `config.effective_max_turns(session.mode)` — mode-specific limit (web: 300, test: 200, default: 150) |
+| `max_turns` | `config.effective_max_turns(session.mode)` — mode-specific limit (web: 300, test: 200, default: 250) |
 | `system_prompt` | `config.system_prompt` + plan mode instruction (if `session.mode == "plan"`) |
 | `allowed_tools` | `config.allowed_tools` |
 | `disallowed_tools` | `config.disallowed_tools` |
@@ -151,6 +151,34 @@ When the Anthropic API returns a transient error, the SDK surfaces it as a `Resu
 
 **User-facing message:** When all retries are exhausted and the error is still retryable, `execute()` replaces the raw API error with a friendly message: *"The AI service is temporarily unavailable. Please try again in a moment."* The response still carries `is_error=True` so callers can distinguish it from a success.
 
+## `ClaudeCliAgent`
+
+`ClaudeCliAgent` (`agents/runtimes/claude_cli.py`) wraps the Claude Code CLI binary directly via the NDJSON subprocess protocol. Unlike `ClaudeCodeAgent`, it has **no dependency on `claude-agent-sdk`** — only the `claude` CLI binary needs to be installed and authenticated.
+
+### How It Works
+
+The agent spawns `claude` with `--output-format stream-json --input-format stream-json --permission-prompt-tool stdio` and communicates via bidirectional NDJSON over stdin/stdout. It parses five message types: `control_response`, `stream_event`, `assistant`, `result`, and `system`. Tool permissions are handled via `control_request` messages with a `can_use_tool` callback — the same gatekeeper pipeline as the SDK agent.
+
+### Capabilities
+
+| Feature | Supported |
+|---|---|
+| Tool gating | Yes — same safety pipeline as `ClaudeCodeAgent` |
+| Session resume | Yes — via NDJSON `session_id` fields |
+| Streaming | Yes — real-time via `stream_event` messages |
+| MCP servers | Yes — from `.mcp.json` and config |
+| Attachments | Yes — images as base64, PDFs uploaded to `.leashd/uploads/` |
+| Stability | Beta |
+
+### When to Use
+
+- **`claude-cli`** (default) — lighter dependency footprint, no SDK required, direct CLI protocol
+- **`claude-code`** — if you need SDK-specific features or prefer the SDK's session management
+
+### Shared Helpers
+
+Both `ClaudeCliAgent` and `ClaudeCodeAgent` share common utilities extracted to `agents/runtimes/_helpers.py`: truncation, retry logic, backoff delays, content block building, workspace context formatting, MCP server discovery, and error mapping.
+
 ## Writing a Custom Agent
 
 Implement the `BaseAgent` protocol:
@@ -181,14 +209,16 @@ class MyAgent:
         pass
 ```
 
-The agent is passed to `build_engine()` — there is no separate registration mechanism.
+Register the agent with the runtime registry in `agents/registry.py` via `register_agent()`, or pass it directly to `build_engine()`.
 
 ## Switching Runtimes
 
 ```bash
-leashd runtime show          # current runtime
-leashd runtime list          # available runtimes with stability
-leashd runtime set codex     # switch to codex
+leashd runtime show              # current runtime
+leashd runtime list              # available runtimes with stability
+leashd runtime set claude-cli    # switch to claude-cli (default)
+leashd runtime set claude-code   # switch to claude-code (SDK)
+leashd runtime set codex         # switch to codex
 ```
 
 The runtime is persisted in `~/.leashd/config.yaml`. The agent is created once at

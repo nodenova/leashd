@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.0] - 2026-03-21
+
+- **added**: `claude-cli` runtime — wraps Claude Code CLI directly via NDJSON subprocess protocol with full tool gating, session resume, streaming, and MCP support; no `claude-agent-sdk` dependency required
+- **added**: Playwright E2E test suite — 61 browser tests covering auth, chat, streaming, approvals, interactions, settings, command palette, reconnection, and task updates
+- **added**: Vitest JS unit tests — 39 tests for WebUI utility functions (`formatMessageTime`, `PendingStateCache`, `renderMarkdown` XSS safety, `parseRoute`, `filterSlashCommands`)
+- **added**: `LEASHD_MAX_CONCURRENT_AGENTS` config (default 5) — caps parallel agent subprocesses to prevent resource exhaustion
+- **changed**: Default `max_turns` increased from 150 to 250; added `leashd turns show/set` CLI commands and WebUI settings support
+- **changed**: Enter key on mobile now inserts a newline instead of sending; use the Send button to submit
+- **changed**: `make check` now runs unit tests, E2E browser tests, and JS unit tests; CI separates unit from E2E so Playwright issues don't block unit runs
+- **fixed**: `claude-cli` runtime stability — large NDJSON lines no longer hang the reader (10 MiB buffer), zombie processes cleaned up on kill, stderr surfaced in error paths, non-JSON stdout lines no longer poison the JSON parser
+- **fixed**: WebUI conversation history garbled after page reload — streaming buffer content is now stored instead of agent result text; also fixed duplicate text from cumulative partial-message snapshots
+- **fixed**: Question card textarea draft lost after WebSocket reconnect (screen lock, PWA backgrounding) — draft now persisted to sessionStorage and restored on re-render
+- **fixed**: Post-plan implementation retry loop could repeat indefinitely — added circuit breaker that escalates to the user after 2 failed retries
+- **fixed**: `/dir` and `/ws` commands now refuse to switch while an agent is executing, preventing silent destruction of in-flight work
+- **fixed**: PDF attachment filename collisions — added UUID prefix to uploaded filenames
+
 ## [0.10.0] - 2026-03-18
 - **added**: WebUI push notifications — layered system with Web Push via Service Worker (lock-screen alerts when browser is closed), in-page notifications (Web Notification API + audio chime + tab title flash), and optional Telegram cross-notification with deep links
 - **added**: PWA support — manifest, Service Worker, and installability on iOS/Android/desktop with safe-area inset handling for notched devices

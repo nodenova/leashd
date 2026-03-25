@@ -30,6 +30,10 @@ make check
 
 CLI commands are discoverable via `leashd --help` and `leashd <subcommand> --help`.
 
+## Specs
+
+Before exploring the codebase, read the relevant spec in `specs/app/`. Start with `specs/app/00-quick-reference.md` for the file-to-class map, then consult the numbered spec for whichever subsystem you're working on. These are detailed technical references that save significant exploration time. **Always verify spec information against the actual source code** — specs can drift from the implementation, so treat them as a starting point, not the source of truth.
+
 ## Mandatory Post-Implementation Check
 
 **ALWAYS run `make check` after finishing any implementation work and fix ALL issues before considering the task complete.** Non-negotiable. `make check` runs ruff, mypy, and pytest. mypy runs with `|| true` in the Makefile but you should still fix any type errors it reports.

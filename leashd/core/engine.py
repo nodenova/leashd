@@ -305,12 +305,16 @@ class _StreamingResponder:
             await self._connector.clear_activity(self._chat_id)
             self._has_activity = False
         await self._connector.close_agent_group(self._chat_id)
-        source = final_text if len(final_text) > len(self._buffer) else self._buffer
-        tail = (
-            source[self._display_offset :]
-            if self._display_offset < len(source)
-            else source
-        )
+        if len(final_text) > len(self._buffer):
+            # final_text has content not in the streaming buffer (e.g.
+            # sub-agent output filtered during streaming).  _display_offset
+            # was calculated from _buffer and is meaningless here.
+            source = final_text
+            offset = 0
+        else:
+            source = self._buffer
+            offset = self._display_offset
+        tail = source[offset:] if offset < len(source) else source
 
         summary = self._build_tools_summary()
         if summary:
@@ -805,6 +809,7 @@ class Engine:
         *,
         _skip_auto_plan: bool = False,
         attachments: list[Attachment] | None = None,
+        _plan_exit_retries: int = 0,
     ) -> str:
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(
@@ -969,11 +974,24 @@ class Engine:
             )
 
             duration_ms = round((time.monotonic() - start) * 1000)
+            # Prefer the streaming buffer for storage — it matches what the
+            # user saw during live streaming.  response.content may differ
+            # (e.g. only the last turn's text, or a text_parts fallback with
+            # duplicates from --include-partial-messages snapshots).
+            stored_content = response.content
+            if responder and responder.buffer:
+                stored_content = responder.buffer
+            elif responder and not responder.buffer and response.content:
+                logger.warning(
+                    "streaming_buffer_empty_at_persist",
+                    response_len=len(response.content),
+                    chat_id=chat_id,
+                )
             await self._message_logger.log(
                 user_id=user_id,
                 chat_id=chat_id,
                 role="assistant",
-                content=response.content,
+                content=stored_content,
                 cost=response.cost,
                 duration_ms=duration_ms,
                 session_id=response.session_id,
@@ -1122,6 +1140,17 @@ class Engine:
                     _skip_auto_plan=True,
                 )
             if tool_state.clean_proceed or tool_state.proceed_in_context:
+                if _plan_exit_retries >= 2:
+                    logger.error(
+                        "plan_exit_retry_limit",
+                        chat_id=chat_id,
+                        retries=_plan_exit_retries,
+                        error=str(e),
+                    )
+                    raise AgentError(
+                        "Implementation failed repeatedly after plan approval. "
+                        "Please try again."
+                    ) from e
                 plan = self._resolve_plan_content(
                     tool_state, "", session.working_directory
                 )
@@ -1136,6 +1165,7 @@ class Engine:
                     clear_context=tool_state.clean_proceed,
                     target_mode=tool_state.target_mode,
                     attachments=tool_state.plan_attachments,
+                    _plan_exit_retries=_plan_exit_retries + 1,
                 )
             duration_ms = round((time.monotonic() - start) * 1000)
             logger.error(
@@ -1722,6 +1752,13 @@ class Engine:
     async def _handle_dir_command(
         self, session: Session, args: str, chat_id: str, user_id: str
     ) -> str:
+        # Listing (no args) is safe; only block actual switches while executing
+        if args and args.strip() and chat_id in self._executing_chats:
+            return (
+                "Cannot switch directories — an agent is running in this conversation.\n"
+                "Use /stop first, or open a new conversation tab."
+            )
+
         if not args:
             if self.connector and len(self._dir_names) > 1:
                 buttons: list[list[InlineButton]] = []
@@ -1777,6 +1814,13 @@ class Engine:
             return "No workspaces defined. Add .leashd/workspaces.yaml to configure."
 
         target = args.strip()
+
+        # Listing (no args) is safe; only block actual switches while executing
+        if target and chat_id in self._executing_chats:
+            return (
+                "Cannot switch workspaces — an agent is running in this conversation.\n"
+                "Use /stop first, or open a new conversation tab."
+            )
 
         if not target:
             tree = ["Workspaces:"]
@@ -2001,6 +2045,7 @@ class Engine:
         clear_context: bool = False,
         target_mode: str = "edit",
         attachments: list[Attachment] | None = None,
+        _plan_exit_retries: int = 0,
     ) -> str:
         logger.info("plan_mode_exit", chat_id=chat_id, trigger=trigger)
         if clear_context:
@@ -2021,6 +2066,7 @@ class Engine:
             chat_id,
             _skip_auto_plan=True,
             attachments=attachments,
+            _plan_exit_retries=_plan_exit_retries,
         )
 
     def _build_implementation_prompt(self, plan_content: str) -> str:
@@ -2188,7 +2234,9 @@ class Engine:
                     state.target_mode = result.target_mode
                     if responder:
                         await responder.delete_all_messages()
-                        responder.reset()
+                        # Don't reset() — buffer is needed for DB persistence
+                        # (line ~982).  deactivate() below stops all streaming
+                        # and the implementation turn creates a new responder.
                     if result.clear_context:
                         session.agent_resume_token = None
                         state.clean_proceed = True
@@ -2197,38 +2245,13 @@ class Engine:
                     if responder:
                         await responder.deactivate()
 
-                    async def _cancel_agent() -> None:
-                        try:
-                            await asyncio.sleep(0.1)
-                            await self.agent.cancel(session.session_id)
-                        except Exception:
-                            logger.debug(
-                                "cancel_agent_failed",
-                                session_id=session.session_id,
-                            )
-
-                    t = asyncio.create_task(_cancel_agent())
-                    state._bg_tasks.add(t)
-                    t.add_done_callback(state._bg_tasks.discard)
-                    return result.permission
+                    return PermissionDeny(
+                        message="Plan approved. Implementation will begin in a new turn."
+                    )
 
                 state.plan_adjustment_feedback = result.message
                 if responder:
                     await responder.deactivate()
-
-                async def _cancel_agent_adjust() -> None:
-                    try:
-                        await asyncio.sleep(0.1)
-                        await self.agent.cancel(session.session_id)
-                    except Exception:
-                        logger.debug(
-                            "cancel_agent_failed",
-                            session_id=session.session_id,
-                        )
-
-                t = asyncio.create_task(_cancel_agent_adjust())
-                state._bg_tasks.add(t)
-                t.add_done_callback(state._bg_tasks.discard)
                 return result
 
             if tool_name == "EnterPlanMode" and session.mode in ("auto", "edit"):

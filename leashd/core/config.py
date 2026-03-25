@@ -62,10 +62,11 @@ class LeashdConfig(BaseSettings):
     approved_directories: list[Path]
 
     # Agent settings
-    agent_runtime: str = "claude-code"
-    max_turns: int = 150
+    agent_runtime: str = "claude-cli"
+    max_turns: int = 250
     web_max_turns: int = 300
     test_max_turns: int = 200
+    max_concurrent_agents: int = 5
     agent_timeout_seconds: int = 3600  # 60 minutes
     system_prompt: str | None = None
     allowed_tools: list[str] = []

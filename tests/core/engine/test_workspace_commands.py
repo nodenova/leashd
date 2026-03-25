@@ -427,3 +427,70 @@ class TestDirDeactivatesWorkspace:
         result = await eng.handle_command("user1", "dir", target_name, "chat1")
         assert "deactivated" not in result
         assert "Switched to" in result
+
+
+class TestWorkspaceGuardDuringExecution:
+    async def test_workspace_switch_blocked_while_agent_executing(
+        self, tmp_path, mock_connector, policy_engine, audit_logger
+    ):
+        dir_a = tmp_path / "repo"
+        dir_a.mkdir()
+        config = LeashdConfig(
+            approved_directories=[tmp_path, dir_a],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        workspaces = {
+            "ws": Workspace(name="ws", directories=[dir_a]),
+        }
+        eng = _make_engine(
+            config, mock_connector, policy_engine, audit_logger, workspaces
+        )
+
+        eng._executing_chats.add("chat1")
+
+        result = await eng.handle_command("user1", "workspace", "ws", "chat1")
+        assert "Cannot switch" in result
+        assert "/stop" in result
+
+    async def test_workspace_exit_blocked_while_agent_executing(
+        self, tmp_path, mock_connector, policy_engine, audit_logger
+    ):
+        dir_a = tmp_path / "repo"
+        dir_a.mkdir()
+        config = LeashdConfig(
+            approved_directories=[tmp_path, dir_a],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        workspaces = {
+            "ws": Workspace(name="ws", directories=[dir_a]),
+        }
+        eng = _make_engine(
+            config, mock_connector, policy_engine, audit_logger, workspaces
+        )
+
+        eng._executing_chats.add("chat1")
+
+        result = await eng.handle_command("user1", "workspace", "exit", "chat1")
+        assert "Cannot switch" in result
+
+    async def test_workspace_list_allowed_while_agent_executing(
+        self, tmp_path, mock_connector, policy_engine, audit_logger
+    ):
+        dir_a = tmp_path / "repo"
+        dir_a.mkdir()
+        config = LeashdConfig(
+            approved_directories=[tmp_path, dir_a],
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        workspaces = {
+            "ws": Workspace(name="ws", directories=[dir_a]),
+        }
+        eng = _make_engine(
+            config, mock_connector, policy_engine, audit_logger, workspaces
+        )
+
+        eng._executing_chats.add("chat1")
+
+        # Listing (no args) should work even while executing
+        result = await eng.handle_command("user1", "workspace", "", "chat1")
+        assert "Cannot switch" not in result

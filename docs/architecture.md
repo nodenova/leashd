@@ -28,7 +28,9 @@
 | Audit logger | `AuditLogger` | `core/safety/audit.py` |
 | Interaction coordinator | `InteractionCoordinator` | `core/interactions.py` |
 | Agent protocol | `BaseAgent` | `agents/base.py` |
-| Claude Code agent | `ClaudeCodeAgent` | `agents/claude_code.py` |
+| Claude CLI agent | `ClaudeCliAgent` | `agents/runtimes/claude_cli.py` |
+| Claude Code agent | `ClaudeCodeAgent` | `agents/runtimes/claude_code.py` |
+| Runtime helpers | `_helpers` | `agents/runtimes/_helpers.py` |
 | Connector protocol | `BaseConnector` | `connectors/base.py` |
 | Middleware chain | `MiddlewareChain` | `middleware/base.py` |
 | Auth middleware | `AuthMiddleware` | `middleware/auth.py` |
@@ -76,7 +78,7 @@ flowchart TB
     end
 
     subgraph Extensions["Extensions"]
-        agent["ClaudeCodeAgent"]
+        agent["ClaudeCliAgent / ClaudeCodeAgent"]
         connector["BaseConnector"]
         middleware["MiddlewareChain"]
         plugins["PluginRegistry"]

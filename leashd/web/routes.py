@@ -232,6 +232,7 @@ def create_rest_router(
                     "effort": raw.get("effort", "medium"),
                     "runtime": raw.get("agent_runtime", "claude-code"),
                     "default_mode": raw.get("default_mode", "default"),
+                    "max_turns": raw.get("max_turns", 250),
                 },
                 "autonomous": {
                     "enabled": autonomous.get("enabled", False),
@@ -365,6 +366,10 @@ def _validate_config_update(body: dict[str, Any]) -> str | None:
             return f"runtime must be one of: {', '.join(sorted(_VALID_RUNTIMES))}"
         if "default_mode" in agent and agent["default_mode"] not in _VALID_MODES:
             return f"default_mode must be one of: {', '.join(sorted(_VALID_MODES))}"
+        if "max_turns" in agent:
+            mt = agent["max_turns"]
+            if not isinstance(mt, int) or mt < 1:
+                return "max_turns must be a positive integer"
 
     if "autonomous" in body:
         auto = body["autonomous"]

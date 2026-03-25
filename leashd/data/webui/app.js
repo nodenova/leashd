@@ -296,6 +296,10 @@ window.addEventListener("resize", () => {
   update();
 })();
 
+function isTouchDevice() {
+  return window.matchMedia("(hover: none) and (pointer: coarse)").matches;
+}
+
 // ============================================================
 // Theme Manager
 // ============================================================
@@ -304,7 +308,7 @@ const ThemeManager = {
 
   init() {
     const saved = localStorage.getItem("leashd_theme") || "auto";
-    const savedColor = localStorage.getItem("leashd_color_theme") || "cool-midnight";
+    const savedColor = localStorage.getItem("leashd_color_theme") || "matrix";
     this.apply(saved);
     this.applyColorTheme(savedColor);
     this._mediaQuery.addEventListener("change", () => {
@@ -351,7 +355,7 @@ const ThemeManager = {
   },
 
   currentColorTheme() {
-    return document.documentElement.getAttribute("data-color-theme") || "cool-midnight";
+    return document.documentElement.getAttribute("data-color-theme") || "matrix";
   },
 
   _updateHljsTheme(theme) {
@@ -1442,10 +1446,12 @@ function onMessage(payload) {
     addCopyButtons(content);
     delete state.streamingMessages[messageId];
     scrollToBottom();
+    scheduleSidebarRefresh();
     return;
   }
 
   addAssistantMessage(text, { messageId, buttons });
+  scheduleSidebarRefresh();
 }
 
 function onStreamToken(payload) {
@@ -1519,6 +1525,9 @@ function onMessageComplete(payload) {
     addCopyButtons(content);
     delete state.streamingMessages[messageId];
   }
+  // Refresh sidebar so the conversation preview updates from the DB
+  // (session is persisted after agent completes, not when the user sends)
+  scheduleSidebarRefresh();
 }
 
 function onMessageDelete(payload) {
@@ -1807,10 +1816,13 @@ function onQuestion(payload) {
   PendingStateCache.saveQuestion(state.sessionId, payload);
   hideEmptyState();
 
+  const _draftKey = `leashd_qdraft_${interaction_id}`;
+
   let answered = false;
   function submitAnswer(answer, label) {
     if (answered) return;
     answered = true;
+    try { sessionStorage.removeItem(_draftKey); } catch { /* ignore */ }
     PendingStateCache.removeQuestion(state.sessionId);
     wsSend("interaction_response", { interaction_id, answer });
     resolveQuestionCard(row, label);
@@ -1846,15 +1858,42 @@ function onQuestion(payload) {
 
   // Option buttons — single click sends immediately
   if (options && options.length > 0) {
+    const hasRichOptions = options.some(o => o.description || o.markdown);
     const optionsWrap = document.createElement("div");
-    optionsWrap.className = "question-options";
+    optionsWrap.className = hasRichOptions
+      ? "question-options question-options-rich"
+      : "question-options";
     for (const opt of options) {
-      const btn = document.createElement("button");
-      btn.className = "question-option-btn";
-      btn.textContent = opt.label || opt.text || opt.value || "";
+      const labelText = opt.label || opt.text || opt.value || "";
       const value = opt.value || opt.label || "";
-      btn.onclick = () => submitAnswer(value, opt.label || opt.text || value);
-      optionsWrap.appendChild(btn);
+      if (hasRichOptions) {
+        const wrap = document.createElement("div");
+        wrap.className = "question-option-card";
+        const btn = document.createElement("button");
+        btn.className = "question-option-btn";
+        btn.textContent = labelText;
+        btn.onclick = () => submitAnswer(value, labelText);
+        wrap.appendChild(btn);
+        if (opt.description) {
+          const desc = document.createElement("div");
+          desc.className = "question-option-desc";
+          desc.textContent = opt.description;
+          wrap.appendChild(desc);
+        }
+        if (opt.markdown) {
+          const pre = document.createElement("pre");
+          pre.className = "question-option-markdown";
+          pre.textContent = opt.markdown;
+          wrap.appendChild(pre);
+        }
+        optionsWrap.appendChild(wrap);
+      } else {
+        const btn = document.createElement("button");
+        btn.className = "question-option-btn";
+        btn.textContent = labelText;
+        btn.onclick = () => submitAnswer(value, labelText);
+        optionsWrap.appendChild(btn);
+      }
     }
     card.appendChild(optionsWrap);
   }
@@ -1872,11 +1911,23 @@ function onQuestion(payload) {
       sendBtn.click();
     }
   });
-  // Auto-resize as user types
+  // Auto-resize as user types and persist draft across reconnects
   textarea.addEventListener("input", () => {
     textarea.style.height = "auto";
     textarea.style.height = Math.min(textarea.scrollHeight, 160) + "px";
+    try { sessionStorage.setItem(_draftKey, textarea.value); } catch { /* ignore */ }
   });
+
+  // Restore draft typed before reconnect
+  try {
+    const saved = sessionStorage.getItem(_draftKey);
+    if (saved) {
+      textarea.value = saved;
+      textarea.style.height = "auto";
+      textarea.style.height = Math.min(textarea.scrollHeight, 160) + "px";
+    }
+  } catch { /* ignore */ }
+
   inputArea.appendChild(textarea);
 
   const btnRow = document.createElement("div");
@@ -1915,6 +1966,10 @@ function resolveQuestionCard(row, chosenLabel) {
   const card = row.querySelector(".question-card");
   if (!card) return;
   card.classList.add("resolved");
+  const iid = row.getAttribute("data-interaction-id");
+  if (iid) {
+    try { sessionStorage.removeItem(`leashd_qdraft_${iid}`); } catch { /* ignore */ }
+  }
   // Replace input area with resolved label
   const inputArea = card.querySelector(".question-input-area");
   if (inputArea) inputArea.remove();
@@ -2170,7 +2225,7 @@ messageInput.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); CommandPalette.hide(); return; }
     if (e.key === "Enter") { e.preventDefault(); if (CommandPalette.selectCurrent()) return; }
   }
-  if (e.key === "Enter" && !e.shiftKey) {
+  if (e.key === "Enter" && !e.shiftKey && !isTouchDevice()) {
     e.preventDefault();
     sendMessage();
   }

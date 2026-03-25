@@ -26,8 +26,10 @@ leashd is controlled entirely from the command line. The `leashd` command manage
 | `leashd browser set-profile <path>` | Set browser profile directory for `/web` |
 | `leashd browser clear-profile` | Clear browser profile (use temporary) |
 | `leashd runtime show` | Show current agent runtime |
-| `leashd runtime set <name>` | Switch runtime (`claude-code`, `codex`) |
+| `leashd runtime set <name>` | Switch runtime (`claude-cli`, `claude-code`, `codex`) |
 | `leashd runtime list` | List available runtimes with stability |
+| `leashd turns show` | Display current max turns setting |
+| `leashd turns set <N>` | Set max turns to N (positive integer) |
 | `leashd plugin list` | List installed Claude Code plugins |
 | `leashd plugin add <source>` | Install from directory or zip |
 | `leashd plugin remove <name>` | Uninstall a plugin |
@@ -169,7 +171,8 @@ leashd runtime show
 
 ```bash
 leashd runtime set codex          # switch to codex
-leashd runtime set claude-code    # switch back to claude-code
+leashd runtime set claude-code    # switch to claude-code (SDK)
+leashd runtime set claude-cli     # switch to claude-cli (native subprocess, default)
 ```
 
 Persists the choice in `~/.leashd/config.yaml` under the `agent_runtime` key. A daemon restart (`leashd restart`) is required for the change to take effect.
@@ -183,6 +186,27 @@ leashd runtime list
 Shows all registered runtimes with their stability level and marks the active one.
 
 **Source:** `cli.py`, `agents/registry.py`
+
+## Max Turns
+
+Configure the maximum number of agent turns per message.
+
+### Viewing Current Setting
+
+```bash
+leashd turns show
+```
+
+### Setting Max Turns
+
+```bash
+leashd turns set 300    # set to 300 turns
+leashd turns set 100    # set to 100 turns
+```
+
+Persists to `~/.leashd/config.yaml`. Also configurable via `LEASHD_MAX_TURNS` environment variable or the WebUI settings page. A daemon restart is required.
+
+**Source:** `cli.py`
 
 ## Plugin Management
 

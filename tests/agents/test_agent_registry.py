@@ -51,7 +51,7 @@ class TestRegisterAgent:
 class TestGetAvailableRuntimeNames:
     def test_returns_sorted_names(self):
         names = get_available_runtime_names()
-        assert names == ["claude-code", "codex"]
+        assert names == ["claude-cli", "claude-code", "codex"]
 
     def test_returns_list(self):
         assert isinstance(get_available_runtime_names(), list)

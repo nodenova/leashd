@@ -162,6 +162,9 @@ def _print_resolved_config(config: LeashdConfig, yaml_data: dict[str, Any]) -> N
     runtime_hint = _source_hint("agent_runtime", yaml_data)
     print(f"Agent runtime: {config.agent_runtime}{runtime_hint}")
 
+    turns_hint = _source_hint("max_turns", yaml_data)
+    print(f"Max turns: {config.max_turns}{turns_hint}")
+
     autonomous = get_autonomous_config(yaml_data)
     if autonomous.get("enabled"):
         print("\nAutonomous mode: ENABLED")
@@ -692,6 +695,36 @@ def _handle_effort_set(level: str) -> None:
     save_global_config(data)
     inject_global_config_as_env(force=True)
     print(f"\u2713 Thinking effort set to {level}")
+    _notify_daemon_reload()
+
+
+def _handle_turns(args: argparse.Namespace) -> None:
+    """Route turns subcommands."""
+    sub = getattr(args, "turns_command", None)
+    if sub is None or sub == "show":
+        _handle_turns_show()
+    elif sub == "set":
+        _handle_turns_set(args.value)
+
+
+def _handle_turns_show() -> None:
+    """Display current max turns setting."""
+    data = load_global_config()
+    value = data.get("max_turns", 250)
+    print(f"Max turns: {value}")
+
+
+def _handle_turns_set(value: int) -> None:
+    """Set the max turns per request."""
+    if value < 1:
+        print("Error: max turns must be a positive integer", file=sys.stderr)
+        sys.exit(1)
+
+    data = load_global_config()
+    data["max_turns"] = value
+    save_global_config(data)
+    inject_global_config_as_env(force=True)
+    print(f"\u2713 Max turns set to {value}")
     _notify_daemon_reload()
 
 
@@ -1446,6 +1479,13 @@ def main() -> None:
     effort_set = effort_sub.add_parser("set", help="Set thinking effort level")
     effort_set.add_argument("level", choices=["low", "medium", "high", "max"])
 
+    # Max turns
+    turns_parser = subparsers.add_parser("turns", help="Manage max turns per request")
+    turns_sub = turns_parser.add_subparsers(dest="turns_command")
+    turns_sub.add_parser("show", help="Show current max turns (default)")
+    turns_set = turns_sub.add_parser("set", help="Set max turns per request")
+    turns_set.add_argument("value", type=int, help="Max turns (positive integer)")
+
     # Agent runtime
     runtime_parser = subparsers.add_parser("runtime", help="Manage agent runtime")
     runtime_sub = runtime_parser.add_subparsers(dest="runtime_command")
@@ -1564,6 +1604,8 @@ def main() -> None:
         _handle_browser(args)
     elif args.command == "effort":
         _handle_effort(args)
+    elif args.command == "turns":
+        _handle_turns(args)
     elif args.command == "runtime":
         _handle_runtime(args)
     elif args.command == "workflow":

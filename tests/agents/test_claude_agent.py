@@ -6,17 +6,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from leashd.agents.base import AgentResponse, ToolActivity
-from leashd.agents.runtimes.claude_code import (
-    _AUTO_MODE_INSTRUCTION,
-    _PLAN_MODE_INSTRUCTION,
-    _STDERR_MAX_LINES,
-    ClaudeCodeAgent,
-    _describe_tool,
-    _friendly_error,
-    _is_retryable_error,
-    _StderrBuffer,
-    _truncate,
+from leashd.agents.runtimes._helpers import (
+    AUTO_MODE_INSTRUCTION as _AUTO_MODE_INSTRUCTION,
 )
+from leashd.agents.runtimes._helpers import (
+    PLAN_MODE_INSTRUCTION as _PLAN_MODE_INSTRUCTION,
+)
+from leashd.agents.runtimes._helpers import (
+    STDERR_MAX_LINES as _STDERR_MAX_LINES,
+)
+from leashd.agents.runtimes._helpers import (
+    StderrBuffer as _StderrBuffer,
+)
+from leashd.agents.runtimes._helpers import (
+    describe_tool as _describe_tool,
+)
+from leashd.agents.runtimes._helpers import (
+    friendly_error as _friendly_error,
+)
+from leashd.agents.runtimes._helpers import (
+    is_retryable_error as _is_retryable_error,
+)
+from leashd.agents.runtimes._helpers import (
+    truncate as _truncate,
+)
+from leashd.agents.runtimes.claude_code import ClaudeCodeAgent
 from leashd.core.config import LeashdConfig
 from leashd.core.session import Session
 from leashd.exceptions import AgentError
@@ -1568,8 +1582,8 @@ class TestStreamEventStreaming:
         # "Done" comes from AssistantMessage because no text was streamed
         assert chunks == ["Done"]
 
-    async def test_stream_flag_resets_between_turns(self, agent, session):
-        """After processing an AssistantMessage, the stream flag resets for the next turn."""
+    async def test_stream_flag_not_reset_between_partial_messages(self, agent, session):
+        """Once streaming is active, partial assistant messages don't re-send text."""
         # Turn 1: stream event + assistant
         evt1 = self._make_stream_event(
             {
@@ -1578,7 +1592,8 @@ class TestStreamEventStreaming:
             }
         )
         assistant1 = _make_assistant_message([_make_text_block("A")])
-        # Turn 2: assistant only (no stream events)
+        # Turn 2: assistant only (no stream events) — text arrives via
+        # finalize/response.content, not incrementally streamed
         assistant2 = _make_assistant_message([_make_text_block("B")])
         result_msg = _make_result_message(result="B")
 
@@ -1597,8 +1612,49 @@ class TestStreamEventStreaming:
             )
 
         # Turn 1: "A" from stream event (assistant suppressed)
-        # Turn 2: "B" from assistant (no stream events → flag reset)
-        assert chunks == ["A", "B"]
+        # Turn 2: "B" NOT re-sent — streamed_text_in_turn stays True,
+        # preventing duplication from cumulative partial snapshots
+        assert chunks == ["A"]
+
+    async def test_no_text_duplication_with_partial_messages(self, agent, session):
+        """Cumulative partial assistant messages must not duplicate text in the stream."""
+        # Simulate --include-partial-messages: stream text, then partial
+        # assistant with [text], then partial with [text, tool_use]
+        evt = self._make_stream_event(
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Hello"},
+            }
+        )
+        partial1 = _make_assistant_message([_make_text_block("Hello")])
+        # Non-text stream event (tool input)
+        tool_evt = self._make_stream_event(
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "input_json_delta", "partial_json": "{}"},
+            }
+        )
+        partial2 = _make_assistant_message(
+            [_make_text_block("Hello"), _make_tool_use_block("Bash")]
+        )
+        result_msg = _make_result_message(result="Hello")
+
+        chunks = []
+
+        async def on_chunk(text):
+            chunks.append(text)
+
+        patcher, _ = _patch_sdk_client([evt, partial1, tool_evt, partial2, result_msg])
+        with patcher:
+            await agent._run_with_resume(
+                "prompt",
+                session,
+                agent._build_options(session, None),
+                on_text_chunk=on_chunk,
+            )
+
+        # "Hello" must appear exactly once (from StreamEvent), not duplicated
+        assert chunks == ["Hello"]
 
     def test_partial_messages_option_enabled(self, agent, session):
         """include_partial_messages should be True in built options."""

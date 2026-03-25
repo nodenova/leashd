@@ -82,20 +82,20 @@ class TestMessageContextAttachments:
 
 class TestBuildContentBlocks:
     def test_text_only_returns_single_block(self):
-        from leashd.agents.runtimes.claude_code import _build_content_blocks
+        from leashd.agents.runtimes._helpers import build_content_blocks
 
-        blocks = _build_content_blocks("hello", [], "/tmp")
+        blocks = build_content_blocks("hello", [], "/tmp")
         assert len(blocks) == 1
         assert blocks[0]["type"] == "text"
         assert blocks[0]["text"] == "hello"
 
     def test_image_attachment_adds_image_block(self):
-        from leashd.agents.runtimes.claude_code import _build_content_blocks
+        from leashd.agents.runtimes._helpers import build_content_blocks
 
         att = Attachment(
             filename="screenshot.png", media_type="image/png", data=b"\x89PNG"
         )
-        blocks = _build_content_blocks("improve this", [att], "/tmp")
+        blocks = build_content_blocks("improve this", [att], "/tmp")
         assert len(blocks) == 2
         assert blocks[0]["type"] == "text"
         assert blocks[1]["type"] == "image"
@@ -104,26 +104,27 @@ class TestBuildContentBlocks:
         assert blocks[1]["source"]["data"] == expected_b64
 
     def test_pdf_attachment_saves_file(self, tmp_path):
-        from leashd.agents.runtimes.claude_code import _build_content_blocks
+        from leashd.agents.runtimes._helpers import build_content_blocks
 
         att = Attachment(
             filename="doc.pdf", media_type="application/pdf", data=b"%PDF-1.4"
         )
-        blocks = _build_content_blocks("read this", [att], str(tmp_path))
+        blocks = build_content_blocks("read this", [att], str(tmp_path))
         assert len(blocks) == 1
         assert "PDF files uploaded" in blocks[0]["text"]
-        pdf_path = tmp_path / ".leashd" / "uploads" / "doc.pdf"
-        assert pdf_path.exists()
-        assert pdf_path.read_bytes() == b"%PDF-1.4"
+        uploads_dir = tmp_path / ".leashd" / "uploads"
+        pdf_files = list(uploads_dir.glob("*_doc.pdf"))
+        assert len(pdf_files) == 1
+        assert pdf_files[0].read_bytes() == b"%PDF-1.4"
 
     def test_mixed_attachments(self, tmp_path):
-        from leashd.agents.runtimes.claude_code import _build_content_blocks
+        from leashd.agents.runtimes._helpers import build_content_blocks
 
         img = Attachment(filename="ui.png", media_type="image/png", data=b"img")
         pdf = Attachment(
             filename="spec.pdf", media_type="application/pdf", data=b"%PDF"
         )
-        blocks = _build_content_blocks("implement", [img, pdf], str(tmp_path))
+        blocks = build_content_blocks("implement", [img, pdf], str(tmp_path))
         assert len(blocks) == 2
         assert blocks[0]["type"] == "text"
         assert blocks[1]["type"] == "image"

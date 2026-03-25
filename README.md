@@ -1,6 +1,6 @@
 # leashd
 
-**Safety-first agentic coding framework. Run AI coding agents as a background daemon — govern them with policy rules, approve actions from your browser or phone, or let them run fully autonomous with AI-driven approval, test-and-retry loops, and automatic PR creation. Ships with a built-in Web UI that works as a PWA — install it on your phone and get push notifications for approvals. Supports multiple runtimes: Claude Code, OpenAI Codex, and more.**
+**Safety-first agentic coding framework. Run AI coding agents as a background daemon — govern them with policy rules, approve actions from your browser or phone, or let them run fully autonomous with AI-driven approval, test-and-retry loops, and automatic PR creation. Ships with a built-in Web UI that works as a PWA — install it on your phone and get push notifications for approvals. Supports multiple runtimes: Claude CLI (native subprocess, no SDK), Claude Code (SDK), OpenAI Codex, and more.**
 
 [![PyPI](https://img.shields.io/pypi/v/leashd.svg)](https://pypi.org/project/leashd/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -151,17 +151,15 @@ Restart the daemon and both connectors run simultaneously — same engine, same 
 
 ---
 
-## What's New in 0.10.0
+## What's New in 0.11.0
 
-**Push notifications** — a layered notification system so you never miss an approval. Web Push via Service Worker delivers lock-screen alerts even when the browser is closed. In-page notifications use the Web Notification API with an audio chime and tab title flash. Optional Telegram cross-notification sends deep links to your phone when you're away from the browser.
+**`claude-cli` runtime** — run Claude Code without the Agent SDK. leashd now wraps the Claude CLI binary directly via its NDJSON subprocess protocol, with full tool gating, session resume, streaming, and MCP support. Switch with `leashd runtime set claude-cli`.
 
-**PWA support** — the Web UI is now installable as a Progressive Web App on iOS, Android, and desktop. Add it to your home screen for a standalone app experience with proper safe-area handling on notched devices.
+**100 new tests** — 61 Playwright E2E browser tests cover the entire WebUI (auth, chat, streaming, approvals, modals, settings, reconnection) and 39 Vitest unit tests cover WebUI utility functions. `make check` runs everything.
 
-**27 color themes** — pick from Dracula, Monokai, Catppuccin, Nord, Synthwave, Matrix, and more, each with dark and light variants. Selectable from the Settings page.
+**Engine hardening** — circuit breaker on post-plan retries (escalates after 2 failures), directory/workspace switch blocked during agent execution, concurrent agent cap (`LEASHD_MAX_CONCURRENT_AGENTS`), and streaming buffer fix for conversation history persistence.
 
-**Plugin management** — install, remove, enable, and disable Claude Code SDK-level plugins mid-session via `leashd plugin` CLI commands or the `/plugin` chat command. No daemon restart needed.
-
-**Seamless reconnection** — if your phone goes to sleep, your laptop lid closes, or the network blips, leashd now re-sends all pending approvals and questions on reconnect. A 120-second disconnect grace period keeps your session alive, and the Page Visibility API triggers instant reconnect when you unlock your phone.
+**Max turns** — default increased to 250, configurable via `leashd turns show/set` or WebUI Settings.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -172,18 +170,20 @@ See [CHANGELOG.md](CHANGELOG.md) for the full history.
 leashd supports pluggable agent runtimes. The same safety pipeline, approval flow, audit trail, and connector integration work identically regardless of which runtime you use.
 
 ```bash
-leashd runtime list        # list available runtimes
-leashd runtime show        # show active runtime and its capabilities
-leashd runtime set codex   # switch to Codex runtime
-leashd runtime set claude  # switch back to Claude Code
+leashd runtime list          # list available runtimes
+leashd runtime show          # show active runtime and its capabilities
+leashd runtime set codex     # switch to Codex runtime
+leashd runtime set claude-code   # switch to Claude Code (SDK)
+leashd runtime set claude-cli    # switch to Claude CLI (default)
 ```
 
-| Runtime | Backend | Session Resume | Autonomous Mode | Install |
-|---|---|---|---|---|
-| **claude** *(default)* | Claude Code CLI | SDK sessions | Full (task orchestrator, auto-approver) | `claude` CLI authenticated |
-| **codex** | Codex CLI | Thread IDs | Full (streaming + approval bridge) | `codex` CLI authenticated |
+| Runtime | Backend | Session Resume | Autonomous Mode | Install | Stability |
+|---|---|---|---|---|---|
+| **claude-cli** *(default)* | Claude CLI (native subprocess) | NDJSON session IDs | Full (task orchestrator, auto-approver) | `claude` CLI authenticated | beta |
+| **claude-code** | Claude Code CLI (SDK) | SDK sessions | Full (task orchestrator, auto-approver) | `claude` CLI + `claude-agent-sdk` | stable |
+| **codex** | Codex CLI | Thread IDs | Full (streaming + approval bridge) | `codex` CLI authenticated | beta |
 
-Both runtimes support interactive approval, streaming responses, and the full autonomous pipeline. Each runtime declares its capabilities via an agent capabilities model — leashd adapts features like session resume and approval routing automatically.
+All runtimes support interactive approval, streaming responses, and the full autonomous pipeline. Each runtime declares its capabilities via an agent capabilities model — leashd adapts features like session resume and approval routing automatically.
 
 **Adding custom runtimes** — extend the `SubprocessAgent` base class for any CLI-driven agent tool and register it with the runtime registry.
 
@@ -221,7 +221,7 @@ leashd autonomous disable  # disable autonomous mode
 ### Three Guarantees
 
 1. **Human-in-the-loop when it matters** — hard blocks (credentials, force push, `rm -rf`, `sudo`) can never be overridden by any approver. Plan reviews always route to the human. The AI approver only handles `require_approval` decisions, never `deny` decisions.
-2. **Fail-safe defaults** — the AutoApprover fails closed (denies on error), the AutonomousLoop escalates to the human when retries are exhausted, and circuit breakers cap both approval calls and plan revisions per session.
+2. **Fail-safe defaults** — the AutoApprover fails closed (denies on error), the AutonomousLoop escalates to the human when retries are exhausted, and circuit breakers cap both approval calls and plan revisions per session. Post-plan implementation retries are capped at 2 — after that, the agent escalates to the human instead of looping.
 3. **Full auditability** — every AI approval decision is logged with `approver_type` in the same append-only JSONL audit trail. No decision is invisible.
 
 ### Task Orchestrator vs Autonomous Loop
@@ -296,6 +296,15 @@ leashd browser clear-profile                           # remove profile
 leashd browser headless                                # toggle headless mode
 ```
 
+### Max turns
+
+```bash
+leashd turns show        # display current max turns setting
+leashd turns set <N>     # set max turns to N (positive integer)
+```
+
+Max turns can also be adjusted from the WebUI Settings page.
+
 ### Thinking effort
 
 ```bash
@@ -363,26 +372,7 @@ leashd uses a layered config system — each layer overrides the one before it:
 environment variables   ← highest priority
 ```
 
-### Advanced: environment variables
-
-All settings are environment variables prefixed with `LEASHD_`. Most are managed by the CLI commands above, but these are commonly set directly in `.env` or as env vars:
-
-| Variable | Default | Description |
-|---|---|---|
-| `LEASHD_WEB_ENABLED` | `false` | Enable the browser-based Web UI. Set to `true` during `leashd init` or `leashd webui enable`. |
-| `LEASHD_WEB_PORT` | `8080` | Port for the Web UI. |
-| `LEASHD_WEB_API_KEY` | — | API key required to access the Web UI. |
-| `LEASHD_TELEGRAM_BOT_TOKEN` | — | Bot token from @BotFather. Optional — adds mobile access. |
-| `LEASHD_ALLOWED_USER_IDS` | *(no restriction)* | Comma-separated Telegram user IDs that can use the bot. |
-| `LEASHD_RUNTIME` | `claude` | Active agent runtime: `"claude"` or `"codex"`. |
-| `LEASHD_SYSTEM_PROMPT` | — | Custom system prompt appended to the agent. |
-| `LEASHD_POLICY_FILES` | built-in `default.yaml` | Comma-separated paths to YAML policy files. |
-| `LEASHD_MAX_TURNS` | `150` | Max conversation turns per request. |
-| `LEASHD_APPROVAL_TIMEOUT_SECONDS` | `300` | Seconds to wait for approval before auto-denying. |
-| `LEASHD_MCP_SERVERS` | `{}` | JSON dict of MCP server configurations. |
-| `LEASHD_DEFAULT_MODE` | `default` | Default session mode: `"default"`, `"plan"`, or `"auto"`. |
-
-See [docs/configuration.md](docs/configuration.md) for the full environment variable reference (40+ settings).
+All settings are environment variables prefixed with `LEASHD_`. The CLI commands above manage most of them automatically. See [docs/configuration.md](docs/configuration.md) for the full environment variable reference (40+ settings).
 
 ---
 
@@ -450,7 +440,7 @@ These slash commands are available in both the Web UI and Telegram:
 | `/plan <text>` | Switch to plan mode and start — agent proposes, you approve before execution |
 | `/edit <text>` | Switch to edit mode and start — direct implementation |
 | `/default` | Switch back to balanced default mode |
-| `/dir` | Switch working directory (inline buttons) |
+| `/dir` | Switch working directory (inline buttons). Blocked while an agent is running. |
 | `/git <subcommand>` | Full git suite: status, branch, checkout, diff, log, add, commit, push, pull |
 | `/web <instruction>` | Autonomous web automation with content-level human approval |
 | `/test` | 9-phase agent-driven test workflow with browser automation |
@@ -459,7 +449,7 @@ These slash commands are available in both the Web UI and Telegram:
 | `/stop` | Stop all ongoing work (agent, task, loop) without resetting session |
 | `/cancel` | Cancel the active task in the current chat |
 | `/plugin` | Manage Claude Code plugins mid-session (install, remove, enable, disable) |
-| `/ws` | Manage workspaces inline |
+| `/ws` | Manage workspaces inline. Blocked while an agent is running. |
 | `/status` | Show current session, mode, and directory |
 | `/clear` | Clear conversation history, cancel active tasks, and start fresh |
 
@@ -498,11 +488,12 @@ Open `http://localhost:8080` and enter your API key. The Web UI provides:
 - **Inline approvals and interactions** — Approve / Reject prompts and question modals, same as Telegram
 - **Push notifications** — Web Push alerts on your lock screen when the browser is closed, in-page notifications with audio chime and tab title flash when the tab is in the background, and optional Telegram cross-notification with deep links
 - **Installable PWA** — add to home screen on iOS, Android, or desktop for a standalone app experience with proper safe-area handling on notched devices
-- **Seamless reconnection** — pending approvals and questions are re-sent after reconnect; 120-second grace period keeps sessions alive through sleep/wake cycles; instant reconnect on phone unlock
+- **Seamless reconnection** — pending approvals, questions, and in-progress drafts are preserved across reconnects; 120-second grace period keeps sessions alive through sleep/wake cycles; instant reconnect on phone unlock
+- **Mobile-friendly input** — on mobile, the Enter key inserts a newline; use the Send button to submit. Designed for composing multi-line prompts on a phone keyboard.
 - **27 color themes** — Dracula, Monokai, Catppuccin, Nord, Synthwave, Matrix, and more, each with dark and light variants, selectable from Settings
 - **Conversation history** — sidebar with past conversations, searchable
 - **Directory and workspace tabs** — switch working directory or workspace without slash commands
-- **Settings page** — configure runtime, effort, themes, and other settings from the browser
+- **Settings page** — configure runtime, effort, max turns, themes, and other settings from the browser
 - **Markdown rendering** — syntax-highlighted code blocks, tables, and formatting
 - **Mobile-responsive** — usable on phone browsers; pair with `leashd webui tunnel` for remote access
 - **File attachments** — drag-and-drop photos, screenshots, and PDFs
@@ -625,6 +616,7 @@ Telegram connector ──┘         │
                             Engine ──── EventBus ──── TaskOrchestrator
                                │                       AutonomousLoop
                           RuntimeRegistry
+                               ├─ Claude CLI
                                ├─ Claude Code
                                ├─ Codex
                                └─ (custom)
@@ -654,6 +646,32 @@ uv run pytest --cov=leashd tests/              # with coverage
 uv run ruff check .
 uv run ruff check --fix .
 uv run ruff format .
+
+# Full check (lint + format + mypy + all tests including E2E + JS)
+make check
+```
+
+### E2E browser tests
+
+The E2E tests use Playwright to drive a real browser against the WebUI. They require a one-time Chromium install:
+
+```bash
+uv run playwright install chromium
+
+# Run E2E tests only
+uv run pytest -m e2e -v
+```
+
+CI runs unit and E2E tests separately so Playwright setup issues don't block unit test results.
+
+### JS unit tests
+
+Unit tests for WebUI utility functions (`leashd/data/webui/utils.js`) use Vitest and require Node.js:
+
+```bash
+cd tests/js
+npm install
+npm test
 ```
 
 ---

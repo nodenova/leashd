@@ -77,9 +77,8 @@ class TestEngineInteractionRouting:
         result = await hook("ExitPlanMode", {}, None)
         await task
 
-        assert result.behavior == "allow"
-        # Auto-approve for Write/Edit is deferred to _exit_plan_mode (not set here);
-        # this prevents premature auto-approve while session is still in plan mode
+        assert result.behavior == "deny"
+        assert "plan approved" in result.message.lower()
 
     async def test_regular_tool_still_hits_gatekeeper(
         self, config, fake_agent, policy_engine, audit_logger, mock_connector, tmp_dir
@@ -193,9 +192,9 @@ class TestEngineInteractionRouting:
         result = await hook("ExitPlanMode", {}, None)
         await task
 
-        assert result.behavior == "allow"
+        assert result.behavior == "deny"
+        assert "plan approved" in result.message.lower()
         assert session.agent_resume_token is None
-        # Auto-approve for Write/Edit is deferred to _exit_plan_mode
 
 
 class TestCleanProceedAutoImplementation:
@@ -292,7 +291,8 @@ class TestCleanProceedAutoImplementation:
         result = await hook("ExitPlanMode", {}, None)
         await task
 
-        assert result.behavior == "allow"
+        assert result.behavior == "deny"
+        assert "plan approved" in result.message.lower()
 
     async def test_clean_proceed_deactivates_streaming(
         self, config, policy_engine, audit_logger
@@ -360,58 +360,6 @@ class TestCleanProceedAutoImplementation:
             m for m in connector.sent_messages if "after exit" in m.get("text", "")
         ]
         assert streaming_msgs == []
-
-    async def test_clean_proceed_cancels_agent(
-        self, config, policy_engine, audit_logger, mock_connector
-    ):
-        """After clean_edit, a background cancel is scheduled to stop the agent."""
-        coordinator = InteractionCoordinator(mock_connector, config)
-        cancel_calls: list[str] = []
-
-        class CancelAgent(BaseAgent):
-            def __init__(self):
-                self.last_can_use_tool = None
-
-            async def execute(self, prompt, session, *, can_use_tool=None, **kwargs):
-                self.last_can_use_tool = can_use_tool
-                if not prompt.startswith("Implement"):
-                    session.mode = "plan"
-
-                    async def click_clean():
-                        await asyncio.sleep(0.05)
-                        req = mock_connector.plan_review_requests[0]
-                        await coordinator.resolve_option(
-                            req["interaction_id"], "clean_edit"
-                        )
-
-                    task = asyncio.create_task(click_clean())
-                    await can_use_tool("ExitPlanMode", {}, None)
-                    await task
-                return AgentResponse(
-                    content=f"Done: {prompt}",
-                    session_id="sid-123",
-                    cost=0.01,
-                )
-
-            async def cancel(self, session_id):
-                cancel_calls.append(session_id)
-
-            async def shutdown(self):
-                pass
-
-        eng = Engine(
-            connector=mock_connector,
-            agent=CancelAgent(),
-            config=config,
-            session_manager=SessionManager(),
-            policy_engine=policy_engine,
-            audit=audit_logger,
-            interaction_coordinator=coordinator,
-        )
-        await eng.handle_message("user1", "Make a plan", "chat1")
-        await asyncio.sleep(0.3)
-
-        assert len(cancel_calls) == 1
 
     async def test_clean_proceed_suppresses_plan_agent_response(
         self, config, policy_engine, audit_logger, mock_connector

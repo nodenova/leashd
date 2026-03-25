@@ -36,9 +36,11 @@ Each layer overrides the one before it: `~/.leashd/config.yaml` → `.env` → e
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `LEASHD_MAX_TURNS` | `int` | `150` | Maximum agent turns per message (default for all modes) |
+| `LEASHD_RUNTIME` | `str` | `"claude-cli"` | Active agent runtime: `"claude-cli"`, `"claude-code"`, or `"codex"`. Also configurable via `leashd runtime set <name>`. |
+| `LEASHD_MAX_TURNS` | `int` | `250` | Maximum agent turns per message (default for all modes). Also configurable via `leashd turns set <N>`. |
 | `LEASHD_WEB_MAX_TURNS` | `int` | `300` | Maximum agent turns in `/web` mode. Falls back to `LEASHD_MAX_TURNS` if not set. |
 | `LEASHD_TEST_MAX_TURNS` | `int` | `200` | Maximum agent turns in `/test` mode. Falls back to `LEASHD_MAX_TURNS` if not set. |
+| `LEASHD_MAX_CONCURRENT_AGENTS` | `int` | `5` | Maximum parallel agent subprocesses. Prevents resource exhaustion from concurrent sessions. |
 | `LEASHD_AGENT_TIMEOUT_SECONDS` | `int` | `3600` | Agent execution timeout in seconds (60 minutes) |
 | `LEASHD_SYSTEM_PROMPT` | `str \| None` | `None` | Additional system prompt appended to the agent |
 | `LEASHD_ALLOWED_TOOLS` | `list[str]` | `[]` | Whitelist of tools the agent can use (empty = all) |
@@ -195,7 +197,7 @@ LEASHD_APPROVED_DIRECTORIES=/path/to/your/project
 LEASHD_APPROVED_DIRECTORIES=/path/to/your/project
 
 # Agent
-LEASHD_MAX_TURNS=150
+LEASHD_MAX_TURNS=250
 LEASHD_WEB_MAX_TURNS=300
 LEASHD_TEST_MAX_TURNS=200
 LEASHD_AGENT_TIMEOUT_SECONDS=3600

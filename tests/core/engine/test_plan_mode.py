@@ -4,8 +4,6 @@ import asyncio
 import time
 from unittest.mock import patch
 
-import pytest
-
 from leashd.agents.base import AgentResponse, BaseAgent
 from leashd.agents.types import PermissionDeny
 from leashd.core.config import LeashdConfig
@@ -2055,19 +2053,19 @@ class TestExitPlanModeDeniedAfterApproval:
         # Only one plan review should have been shown
         assert len(streaming_connector.plan_review_requests) == 1
 
-    async def test_clean_edit_cancels_agent_and_sets_clean_proceed(
+    async def test_clean_edit_denies_exit_and_sets_clean_proceed(
         self, config, policy_engine, audit_logger
     ):
-        """clean_edit approval schedules _cancel_agent and sets clean_proceed."""
+        """clean_edit approval returns PermissionDeny and sets clean_proceed."""
         from tests.conftest import MockConnector
 
         streaming_connector = MockConnector(support_streaming=True)
         coordinator = InteractionCoordinator(streaming_connector, config)
         config.streaming_enabled = True
 
-        cancel_called = asyncio.Event()
+        exit_results: list = []
 
-        class CancelTrackingAgent(BaseAgent):
+        class TrackingAgent(BaseAgent):
             async def execute(
                 self,
                 prompt,
@@ -2096,7 +2094,8 @@ class TestExitPlanModeDeniedAfterApproval:
                         )
 
                     task = asyncio.create_task(click_proceed())
-                    await can_use_tool("ExitPlanMode", {}, None)
+                    result = await can_use_tool("ExitPlanMode", {}, None)
+                    exit_results.append(result)
                     await task
 
                 return AgentResponse(
@@ -2104,14 +2103,14 @@ class TestExitPlanModeDeniedAfterApproval:
                 )
 
             async def cancel(self, session_id):
-                cancel_called.set()
+                pass
 
             async def shutdown(self):
                 pass
 
         eng = Engine(
             connector=streaming_connector,
-            agent=CancelTrackingAgent(),
+            agent=TrackingAgent(),
             config=config,
             session_manager=SessionManager(),
             policy_engine=policy_engine,
@@ -2121,25 +2120,20 @@ class TestExitPlanModeDeniedAfterApproval:
 
         await eng.handle_message("user1", "Plan something", "chat1")
 
-        # _cancel_agent fires after 100ms — wait up to 500ms
-        try:
-            await asyncio.wait_for(cancel_called.wait(), timeout=0.5)
-        except TimeoutError:
-            pytest.fail("_cancel_agent() was never called")
-
-        assert cancel_called.is_set()
+        assert len(exit_results) == 1
+        assert isinstance(exit_results[0], PermissionDeny)
+        assert "plan approved" in exit_results[0].message.lower()
 
     async def test_edit_approval_switches_session_mode(
         self, config, policy_engine, audit_logger
     ):
-        """edit approval cancels agent + restarts with fresh timeout, mode → 'auto'."""
+        """edit approval denies ExitPlanMode, agent finishes, mode → 'edit'."""
         from tests.conftest import MockConnector
 
         streaming_connector = MockConnector(support_streaming=True)
         coordinator = InteractionCoordinator(streaming_connector, config)
         config.streaming_enabled = True
 
-        cancel_called = asyncio.Event()
         prompts_seen: list[str] = []
 
         class EditApprovalAgent(BaseAgent):
@@ -2178,7 +2172,7 @@ class TestExitPlanModeDeniedAfterApproval:
                 )
 
             async def cancel(self, session_id):
-                cancel_called.set()
+                pass
 
             async def shutdown(self):
                 pass
@@ -2196,12 +2190,6 @@ class TestExitPlanModeDeniedAfterApproval:
 
         await eng.handle_message("user1", "Plan something", "chat1")
 
-        try:
-            await asyncio.wait_for(cancel_called.wait(), timeout=0.5)
-        except TimeoutError:
-            pytest.fail("cancel() was never called for edit approval")
-
-        assert cancel_called.is_set()
         assert len(prompts_seen) == 2
         assert prompts_seen[1].startswith("Implement")
         session = sm.get("user1", "chat1")
@@ -2210,13 +2198,13 @@ class TestExitPlanModeDeniedAfterApproval:
 
 class TestPlanApprovalBehavior:
     """Behavioral integration tests — verify Write/Edit actually succeed after
-    each approval type and that cancel fires when it should.  These close the
-    coverage gap that let the _cancel_agent() deletion slip through."""
+    each approval type and that the agent finishes its turn cleanly before the
+    engine transitions to implementation mode."""
 
     async def test_clean_edit_implementation_turn_write_allowed(
         self, config, policy_engine, audit_logger
     ):
-        """clean_edit: cancel fires → new implementation turn → Write ALLOW."""
+        """clean_edit: agent finishes → new implementation turn → Write ALLOW."""
         from leashd.agents.types import PermissionAllow
         from tests.conftest import MockConnector
 
@@ -2225,7 +2213,6 @@ class TestPlanApprovalBehavior:
         coordinator = InteractionCoordinator(streaming_connector, config)
         config.streaming_enabled = True
 
-        cancel_called = asyncio.Event()
         prompts_seen: list[str] = []
         write_results: list = []
 
@@ -2275,7 +2262,7 @@ class TestPlanApprovalBehavior:
                 return AgentResponse(content="Done.", session_id="sid", cost=0.01)
 
             async def cancel(self, session_id):
-                cancel_called.set()
+                pass
 
             async def shutdown(self):
                 pass
@@ -2292,13 +2279,6 @@ class TestPlanApprovalBehavior:
 
         await eng.handle_message("user1", "Plan something", "chat1")
 
-        # _cancel_agent fires after 100ms — wait up to 500ms
-        try:
-            await asyncio.wait_for(cancel_called.wait(), timeout=0.5)
-        except TimeoutError:
-            pytest.fail("_cancel_agent() was never called (regression guard)")
-
-        assert cancel_called.is_set()
         assert len(prompts_seen) == 2
         assert prompts_seen[1].startswith("Implement")
         assert len(write_results) == 1
@@ -2385,75 +2365,6 @@ class TestPlanApprovalBehavior:
         assert len(write_results) == 1
         assert isinstance(write_results[0], PermissionAllow)
 
-    async def test_edit_approval_cancels_agent(
-        self, config, policy_engine, audit_logger
-    ):
-        """edit (non-clean) approval fires cancel() on the agent."""
-        from tests.conftest import MockConnector
-
-        streaming_connector = MockConnector(support_streaming=True)
-        coordinator = InteractionCoordinator(streaming_connector, config)
-        config.streaming_enabled = True
-
-        cancel_called = asyncio.Event()
-
-        class CancelTrackingAgent(BaseAgent):
-            async def execute(
-                self,
-                prompt,
-                session,
-                *,
-                can_use_tool=None,
-                on_text_chunk=None,
-                **kwargs,
-            ):
-                if not prompt.startswith("Implement"):
-                    session.mode = "plan"
-                    await can_use_tool(
-                        "Write",
-                        {
-                            "file_path": "/tmp/project/.claude/plans/my.plan",
-                            "content": "Step 1: Do the thing",
-                        },
-                        None,
-                    )
-
-                    async def click():
-                        await asyncio.sleep(0.05)
-                        req = streaming_connector.plan_review_requests[0]
-                        await coordinator.resolve_option(req["interaction_id"], "edit")
-
-                    task = asyncio.create_task(click())
-                    await can_use_tool("ExitPlanMode", {}, None)
-                    await task
-
-                return AgentResponse(content="Done.", session_id="sid", cost=0.01)
-
-            async def cancel(self, session_id):
-                cancel_called.set()
-
-            async def shutdown(self):
-                pass
-
-        eng = Engine(
-            connector=streaming_connector,
-            agent=CancelTrackingAgent(),
-            config=config,
-            session_manager=SessionManager(),
-            policy_engine=policy_engine,
-            audit=audit_logger,
-            interaction_coordinator=coordinator,
-        )
-
-        await eng.handle_message("user1", "Plan something", "chat1")
-
-        try:
-            await asyncio.wait_for(cancel_called.wait(), timeout=0.5)
-        except TimeoutError:
-            pytest.fail("cancel() was never called for edit approval")
-
-        assert cancel_called.is_set()
-
     async def test_proceed_in_context_preserves_session_id(
         self, config, policy_engine, audit_logger
     ):
@@ -2527,7 +2438,7 @@ class TestPlanApprovalBehavior:
         self, config, policy_engine, audit_logger
     ):
         """default approval: mode → 'default', no Write/Edit auto-approve."""
-        from leashd.agents.types import PermissionAllow
+        from leashd.agents.types import PermissionDeny
         from tests.conftest import MockConnector
 
         approved_dir = str(config.approved_directories[0])
@@ -2593,7 +2504,8 @@ class TestPlanApprovalBehavior:
         await eng.handle_message("user1", "Plan something", "chat1")
 
         assert len(exit_results) == 1
-        assert isinstance(exit_results[0], PermissionAllow)
+        assert isinstance(exit_results[0], PermissionDeny)
+        assert "plan approved" in exit_results[0].message.lower()
         assert session_ref[0].mode == "default"
         # default approval must NOT auto-approve Write/Edit
         auto_tools = eng._gatekeeper._auto_approved_tools.get("chat1", set())
@@ -3072,7 +2984,7 @@ class TestPlanReviewDeadlinePause:
     async def test_plan_adjustment_restarts_with_fresh_timeout(
         self, config, policy_engine, audit_logger, mock_connector
     ):
-        """Plan adjustment cancels agent and restarts _execute_turn with feedback."""
+        """Plan adjustment denies ExitPlanMode and restarts _execute_turn with feedback."""
         coordinator = InteractionCoordinator(mock_connector, config)
         prompts_seen: list[str] = []
 
@@ -3120,3 +3032,105 @@ class TestPlanReviewDeadlinePause:
         await eng.handle_message("user1", "Plan it", "chat1")
 
         assert "Add more error handling" in prompts_seen
+
+
+class TestPlanPhaseBufferPreservedForPersistence:
+    async def test_streaming_buffer_saved_to_db_after_plan_approval(
+        self, config, policy_engine, audit_logger
+    ):
+        """After plan approval, the DB should store the full streaming buffer,
+        not the potentially truncated response.content."""
+        from unittest.mock import AsyncMock
+
+        from leashd.core.message_logger import MessageLogger
+        from tests.conftest import MockConnector
+
+        streaming_connector = MockConnector(support_streaming=True)
+        coordinator = InteractionCoordinator(streaming_connector, config)
+        config.streaming_enabled = True
+
+        store = AsyncMock()
+        ml = MessageLogger(store)
+
+        streamed_chunks = [
+            "I'll start by reading all the files.\n",
+            "Now verifying the codebase structure.\n",
+            "All files verified. Proceeding with the plan.\n",
+        ]
+        full_streamed = "".join(streamed_chunks)
+
+        class BufferTestAgent(BaseAgent):
+            async def execute(
+                self,
+                prompt,
+                session,
+                *,
+                can_use_tool=None,
+                on_text_chunk=None,
+                **kwargs,
+            ):
+                if not prompt.startswith("Implement"):
+                    session.mode = "plan"
+                    if on_text_chunk:
+                        for chunk in streamed_chunks:
+                            await on_text_chunk(chunk)
+
+                    await can_use_tool(
+                        "Write",
+                        {
+                            "file_path": "/tmp/proj/.claude/plans/test.plan",
+                            "content": "# Plan\n\n1. Do things",
+                        },
+                        None,
+                    )
+
+                    async def click():
+                        await asyncio.sleep(0.05)
+                        req = streaming_connector.plan_review_requests[0]
+                        await coordinator.resolve_option(
+                            req["interaction_id"], "clean_edit"
+                        )
+
+                    t = asyncio.create_task(click())
+                    await can_use_tool("ExitPlanMode", {}, None)
+                    await t
+
+                # Return deliberately short content to simulate the bug
+                return AgentResponse(
+                    content="last turn only",
+                    session_id="sid",
+                    cost=0.01,
+                )
+
+            async def cancel(self, session_id):
+                pass
+
+            async def shutdown(self):
+                pass
+
+        eng = Engine(
+            connector=streaming_connector,
+            agent=BufferTestAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            interaction_coordinator=coordinator,
+            message_logger=ml,
+        )
+
+        await eng.handle_message("user1", "Plan it", "chat1")
+
+        # Find the assistant message from the plan phase
+        assistant_calls = [
+            c
+            for c in store.save_message.await_args_list
+            if c.kwargs["role"] == "assistant"
+        ]
+        assert len(assistant_calls) >= 1
+        plan_phase_content = assistant_calls[0].kwargs["content"]
+
+        # The stored content must include the full streaming buffer,
+        # not just the truncated response.content
+        assert plan_phase_content == full_streamed
+        assert "last turn only" not in plan_phase_content

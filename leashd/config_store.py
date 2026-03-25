@@ -143,6 +143,10 @@ def inject_global_config_as_env(*, force: bool = False) -> None:
     if agent_runtime and (force or "LEASHD_AGENT_RUNTIME" not in os.environ):
         os.environ["LEASHD_AGENT_RUNTIME"] = str(agent_runtime)
 
+    max_turns = data.get("max_turns")
+    if max_turns and (force or "LEASHD_MAX_TURNS" not in os.environ):
+        os.environ["LEASHD_MAX_TURNS"] = str(max_turns)
+
     _inject_autonomous_config(data, force=force)
     _inject_browser_config(data, force=force)
     _inject_web_config(data, force=force)
@@ -430,6 +434,8 @@ def update_config_sections(updates: dict[str, Any]) -> None:
                     data["agent_runtime"] = value
                 elif key == "default_mode":
                     data["default_mode"] = value
+                elif key == "max_turns":
+                    data["max_turns"] = value
 
     if "autonomous" in updates:
         auto_update = updates["autonomous"]

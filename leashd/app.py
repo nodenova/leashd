@@ -166,7 +166,9 @@ def build_engine(
     # Resolve relative paths against the first approved directory
     project_base = config.approved_directories[0]
 
-    audit_is_pinned = config.audit_log_path.is_absolute()
+    # Always pin audit to the resolved absolute path so concurrent sessions
+    # don't race on AuditLogger._path via _switch_paths().
+    audit_is_pinned = True
 
     log_dir_is_pinned = config.log_dir is not None and config.log_dir.is_absolute()
 

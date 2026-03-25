@@ -74,6 +74,7 @@ phases:
         description: "Present a numbered list to user via AskUserQuestion with post author, brief summary, and relevance. Ask which post to comment on (number / skip to scroll / stop)"
         tool_hint: AskUserQuestion
         verify: false
+        notes: "Put the full numbered post list in the 'question' field of AskUserQuestion — that is the body text visible above the buttons. Option labels must be only the action words ('1', '2', 'skip', 'stop'). Do NOT put post summaries in option descriptions or markdown previews."
       - action: select
         description: "After user picks a post number, proceed to comment_on_post phase for that specific post. If user says 'skip', scroll down and repeat scan. If user says 'stop', end the workflow."
         verify: false
@@ -113,7 +114,7 @@ phases:
         description: "Draft a thoughtful comment following the COMMENT DRAFTING GUIDE. Present draft to user via AskUserQuestion (approve / edit / skip)"
         tool_hint: AskUserQuestion
         verify: false
-        notes: "Include post author, brief summary, and your draft. Wait for user response before proceeding."
+        notes: "In the 'question' field include: post author, a short excerpt of their post, and your FULL draft comment text. Option labels must be only 'approve', 'edit', 'skip'. Do NOT put the draft or post summary in option descriptions or markdown previews — all detail goes in the 'question' field above the buttons."
       - action: type
         description: "Type the approved comment into the comment editor"
         tool_hint: browser_type

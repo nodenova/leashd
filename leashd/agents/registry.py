@@ -45,11 +45,14 @@ def list_runtimes() -> list[dict[str, str]]:
 
 
 def _register_builtins() -> None:
+    from leashd.agents.runtimes.claude_cli import ClaudeCliAgent
     from leashd.agents.runtimes.claude_code import ClaudeCodeAgent
     from leashd.agents.runtimes.codex import CodexAgent
 
+    register_agent("claude-cli", lambda config: ClaudeCliAgent(config))
     register_agent("claude-code", lambda config: ClaudeCodeAgent(config))
     register_agent("codex", lambda config: CodexAgent(config))
+    _CAPABILITIES["claude-cli"] = {"stability": "beta"}
     _CAPABILITIES["claude-code"] = {"stability": "stable"}
     _CAPABILITIES["codex"] = {"stability": "beta"}
 

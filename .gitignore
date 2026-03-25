@@ -32,6 +32,9 @@ AGENTS.md
 # OS
 .DS_Store
 
+# JS test dependencies
+tests/js/node_modules/
+
 # Logs & sqlite3
 logs/
 *.db
