@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -20,8 +20,13 @@ from leashd.storage.sqlite import SqliteSessionStore
 
 
 def _patched_build_engine(**kwargs):
-    """Call build_engine with logging setup patched to avoid side effects."""
-    with patch("leashd.app._configure_logging"):
+    """Call build_engine with logging and agent creation patched to avoid side effects."""
+    mock_agent = MagicMock()
+    mock_agent.capabilities = MagicMock(supports_streaming=True)
+    with (
+        patch("leashd.app._configure_logging"),
+        patch("leashd.app.get_agent", return_value=mock_agent),
+    ):
         return build_engine(**kwargs)
 
 
