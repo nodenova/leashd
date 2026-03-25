@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.11.1] - 2026-03-25
+
+- **added**: `build_engine()` now accepts an optional `agent` parameter for dependency injection — embedders can provide a custom agent without modifying the registry
+- **fixed**: Plan mode stuck after multi-adjust-then-approve — stale adjustment feedback now cleared on approval, and Write/Edit tools unblocked after plan approval
+
 ## [0.11.0] - 2026-03-21
 
 - **added**: `claude-cli` runtime — wraps Claude Code CLI directly via NDJSON subprocess protocol with full tool gating, session resume, streaming, and MCP support; no `claude-agent-sdk` dependency required

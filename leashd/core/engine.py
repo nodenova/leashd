@@ -958,7 +958,9 @@ class Engine:
                 )
                 return ""
 
-            if tool_state.plan_adjustment_feedback:
+            if tool_state.plan_adjustment_feedback and not (
+                tool_state.clean_proceed or tool_state.proceed_in_context
+            ):
                 logger.info("plan_adjustment_restart", chat_id=chat_id)
                 return await self._execute_turn(
                     user_id,
@@ -1131,7 +1133,9 @@ class Engine:
                 session.agent_resume_token = None
                 await self.session_manager.save(session)
                 return ""
-            if tool_state.plan_adjustment_feedback:
+            if tool_state.plan_adjustment_feedback and not (
+                tool_state.clean_proceed or tool_state.proceed_in_context
+            ):
                 logger.info("plan_adjustment_restart", chat_id=chat_id)
                 return await self._execute_turn(
                     user_id,
@@ -2130,7 +2134,7 @@ class Engine:
                     state.plan_file_path = file_path
                     if tool_name == "Write":
                         state.plan_file_content = tool_input.get("content")
-                elif session.mode == "plan":
+                elif session.mode == "plan" and not state.plan_approved:
                     return PermissionDeny(
                         message="In plan mode — create a plan first, then call ExitPlanMode."
                     )
@@ -2231,6 +2235,7 @@ class Engine:
                         deadline.reset()
                 if isinstance(result, PlanReviewDecision):
                     state.plan_approved = True
+                    state.plan_adjustment_feedback = None
                     state.target_mode = result.target_mode
                     if responder:
                         await responder.delete_all_messages()

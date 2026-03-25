@@ -3134,3 +3134,174 @@ class TestPlanPhaseBufferPreservedForPersistence:
         # not just the truncated response.content
         assert plan_phase_content == full_streamed
         assert "last turn only" not in plan_phase_content
+
+
+class TestMultiAdjustThenApprove:
+    async def test_multi_adjust_then_approve_exits_plan_mode(
+        self, config, policy_engine, audit_logger, mock_connector
+    ):
+        """After adjust->adjust->clean_edit, plan mode should exit cleanly
+        instead of restarting with stale adjustment feedback."""
+        coordinator = InteractionCoordinator(mock_connector, config)
+        prompts_seen: list[str] = []
+        exit_plan_call_count = 0
+
+        class MultiAdjustAgent(BaseAgent):
+            async def execute(self, prompt, session, *, can_use_tool=None, **kwargs):
+                nonlocal exit_plan_call_count
+                prompts_seen.append(prompt)
+
+                if exit_plan_call_count == 0:
+                    session.mode = "plan"
+
+                    # 1st ExitPlanMode -> adjust
+                    async def click_adjust_1():
+                        await asyncio.sleep(0.05)
+                        req = mock_connector.plan_review_requests[-1]
+                        await coordinator.resolve_option(
+                            req["interaction_id"], "adjust"
+                        )
+                        await asyncio.sleep(0.05)
+                        await coordinator.resolve_text("chat1", "Add caching layer")
+
+                    task1 = asyncio.create_task(click_adjust_1())
+                    exit_plan_call_count += 1
+                    await can_use_tool("ExitPlanMode", {}, None)
+                    await task1
+
+                    # 2nd ExitPlanMode -> adjust
+                    async def click_adjust_2():
+                        await asyncio.sleep(0.05)
+                        req = mock_connector.plan_review_requests[-1]
+                        await coordinator.resolve_option(
+                            req["interaction_id"], "adjust"
+                        )
+                        await asyncio.sleep(0.05)
+                        await coordinator.resolve_text("chat1", "Also add retry logic")
+
+                    task2 = asyncio.create_task(click_adjust_2())
+                    exit_plan_call_count += 1
+                    await can_use_tool("ExitPlanMode", {}, None)
+                    await task2
+
+                    # 3rd ExitPlanMode -> clean_edit (approve)
+                    async def click_approve():
+                        await asyncio.sleep(0.05)
+                        req = mock_connector.plan_review_requests[-1]
+                        await coordinator.resolve_option(
+                            req["interaction_id"], "clean_edit"
+                        )
+
+                    task3 = asyncio.create_task(click_approve())
+                    exit_plan_call_count += 1
+                    await can_use_tool("ExitPlanMode", {}, None)
+                    await task3
+
+                    return AgentResponse(
+                        content="Plan done", session_id="sid", cost=0.01
+                    )
+
+                # Implementation turn after plan mode exit
+                return AgentResponse(
+                    content="Implemented", session_id="sid2", cost=0.02
+                )
+
+            async def cancel(self, session_id):
+                pass
+
+            async def shutdown(self):
+                pass
+
+        eng = Engine(
+            connector=mock_connector,
+            agent=MultiAdjustAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            interaction_coordinator=coordinator,
+        )
+
+        await eng.handle_message("user1", "Plan it", "chat1")
+
+        # The stale adjustment feedback should NOT have triggered a restart
+        # with "Add caching layer" or "Also add retry logic" as a prompt.
+        assert not any(p == "Add caching layer" for p in prompts_seen)
+        assert not any(p == "Also add retry logic" for p in prompts_seen)
+        # The implementation turn should have run (plan mode exited).
+        assert len(prompts_seen) >= 2
+
+    async def test_write_allowed_after_plan_approved(
+        self, config, policy_engine, audit_logger, mock_connector
+    ):
+        """After ExitPlanMode is approved, Write/Edit to non-plan files should
+        pass through to normal policy evaluation instead of being blanket-denied."""
+        coordinator = InteractionCoordinator(mock_connector, config)
+        write_results: list[object] = []
+
+        class WriteAfterApprovalAgent(BaseAgent):
+            async def execute(self, prompt, session, *, can_use_tool=None, **kwargs):
+                session.mode = "plan"
+
+                # Write to plan file should always work
+                await can_use_tool(
+                    "Write",
+                    {"file_path": "/tmp/.claude/plans/test.md", "content": "plan"},
+                    None,
+                )
+
+                # Write to non-plan file should be denied before approval
+                result_before = await can_use_tool(
+                    "Write",
+                    {"file_path": "/tmp/src/main.py", "content": "code"},
+                    None,
+                )
+                write_results.append(result_before)
+
+                # Approve the plan
+                async def click_approve():
+                    await asyncio.sleep(0.05)
+                    req = mock_connector.plan_review_requests[-1]
+                    await coordinator.resolve_option(
+                        req["interaction_id"], "clean_edit"
+                    )
+
+                task = asyncio.create_task(click_approve())
+                await can_use_tool("ExitPlanMode", {}, None)
+                await task
+
+                # Write to non-plan file should be allowed after approval
+                result_after = await can_use_tool(
+                    "Write",
+                    {"file_path": "/tmp/src/main.py", "content": "code"},
+                    None,
+                )
+                write_results.append(result_after)
+
+                return AgentResponse(content="Done", session_id="sid", cost=0.01)
+
+            async def cancel(self, session_id):
+                pass
+
+            async def shutdown(self):
+                pass
+
+        eng = Engine(
+            connector=mock_connector,
+            agent=WriteAfterApprovalAgent(),
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+            interaction_coordinator=coordinator,
+        )
+
+        await eng.handle_message("user1", "Plan it", "chat1")
+
+        # Before approval: Write to non-plan file should be denied
+        assert isinstance(write_results[0], PermissionDeny)
+        assert "plan mode" in write_results[0].message.lower()
+        # After approval: Write should NOT be denied by plan mode check
+        assert not isinstance(write_results[1], PermissionDeny) or (
+            "plan mode" not in write_results[1].message.lower()
+        )

@@ -32,6 +32,7 @@ from leashd.storage.memory import MemorySessionStore
 from leashd.storage.sqlite import SqliteSessionStore
 
 if TYPE_CHECKING:
+    from leashd.agents.base import BaseAgent
     from leashd.connectors.base import BaseConnector
     from leashd.plugins.base import LeashdPlugin
     from leashd.storage.base import MessageStore, SessionStore
@@ -159,6 +160,7 @@ def build_engine(
     connector: BaseConnector | None = None,
     plugins: list[LeashdPlugin] | None = None,
     message_store: MessageStore | None = None,
+    agent: BaseAgent | None = None,
 ) -> Engine:
     if config is None:
         config = LeashdConfig()  # type: ignore[call-arg]  # pydantic-settings loads from env
@@ -244,7 +246,7 @@ def build_engine(
     message_logger = MessageLogger(message_store)
 
     session_manager = SessionManager(store=session_store)
-    agent = get_agent(config.agent_runtime, config)
+    agent = agent or get_agent(config.agent_runtime, config)
     event_bus = EventBus()
 
     # Safety components
