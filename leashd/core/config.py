@@ -130,8 +130,12 @@ class LeashdConfig(BaseSettings):
 
     # Task orchestration
     task_orchestrator: bool = False
+    task_orchestrator_version: Literal["v1", "v2"] = "v2"
     task_max_retries: int = 3
     task_phase_timeout_seconds: int = 1800  # 30 minutes per phase
+    task_conductor_model: str | None = None
+    task_conductor_timeout: float = 45.0
+    task_memory_max_chars: int = 8000
 
     # Streaming
     streaming_enabled: bool = True

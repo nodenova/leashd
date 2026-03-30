@@ -10,7 +10,7 @@
 
 ---
 
-leashd runs as a **background daemon** on your dev machine. You send it natural-language coding instructions through the built-in **Web UI** in your browser — no account creation, no third-party services, just `localhost`. Each request passes through a **three-layer safety pipeline** — sandbox enforcement, YAML policy rules, and human-or-AI approval — before reaching the coding agent. In interactive mode, risky actions surface as **Approve / Reject** buttons in your chat. In **autonomous mode**, an AI approver evaluates tool calls, a task orchestrator drives multi-phase workflows (spec → explore → plan → implement → test → PR), and a test-and-retry loop ensures quality — all without you lifting a finger. Everything is logged to an append-only audit trail.
+leashd runs as a **background daemon** on your dev machine. You send it natural-language coding instructions through the built-in **Web UI** in your browser — no account creation, no third-party services, just `localhost`. Each request passes through a **three-layer safety pipeline** — sandbox enforcement, YAML policy rules, and human-or-AI approval — before reaching the coding agent. In interactive mode, risky actions surface as **Approve / Reject** buttons in your chat. In **autonomous mode**, an AI approver evaluates tool calls, a task orchestrator drives adaptive workflows via a think-act-observe loop, and a test-and-retry loop ensures quality — all without you lifting a finger. Everything is logged to an append-only audit trail.
 
 The Web UI is a **Progressive Web App** — install it on your phone's home screen and get **push notifications** for approvals and escalations, even when the browser is closed. Run `leashd webui tunnel` to expose it via ngrok, Cloudflare, or Tailscale — same interface, same features, accessible anywhere. Or add the optional **Telegram** connector if you prefer a native chat app.
 
@@ -46,16 +46,12 @@ Your phone (Telegram) ──┘        │
 /task "Add health check endpoint"  (Web UI or Telegram)
         │
         ▼
-   Task Orchestrator
+   Task Orchestrator (v2 — LLM-driven conductor)
         │
-        ├─ spec          ← analyzes task, writes specification
-        ├─ explore        ← reads codebase structure and conventions
-        ├─ validate       ← checks spec against codebase findings
-        ├─ plan           ← creates implementation plan (forwarded to human review)
-        ├─ implement      ← writes code (file writes auto-approved)
-        ├─ test           ← runs test suite via TestRunnerPlugin
-        ├─ retry (×3)     ← fixes failures with exponential backoff
-        └─ pr             ← creates PR via gh CLI
+        ├─ think    ← conductor assesses progress, decides next action
+        ├─ act      ← executes chosen action (explore, plan, implement, test, verify, fix, review, pr)
+        ├─ observe  ← evaluates result, updates task memory
+        └─ loop     ← repeats until task is complete or escalates to human
                 │
                 ▼
    You get a PR link — or an escalation message if the agent gets stuck
@@ -151,15 +147,15 @@ Restart the daemon and both connectors run simultaneously — same engine, same 
 
 ---
 
-## What's New in 0.11.0
+## What's New in 0.12.0
 
-**`claude-cli` runtime** — run Claude Code without the Agent SDK. leashd now wraps the Claude CLI binary directly via its NDJSON subprocess protocol, with full tool gating, session resume, streaming, and MCP support. Switch with `leashd runtime set claude-cli`.
+**Agentic task orchestrator v2** — the task orchestrator now uses an LLM-driven think-act-observe loop instead of a fixed phase pipeline. A conductor evaluates progress after each step and dynamically chooses the next action — explore, plan, implement, test, verify, fix, review, or create a PR. Simple tasks skip straight to implementation; complex ones get full exploration and planning. The conductor escalates to the human after 3 consecutive parse failures or CLI errors instead of looping.
 
-**100 new tests** — 61 Playwright E2E browser tests cover the entire WebUI (auth, chat, streaming, approvals, modals, settings, reconnection) and 39 Vitest unit tests cover WebUI utility functions. `make check` runs everything.
+**Task memory** — each task maintains persistent working memory (up to 8K chars) that carries context across steps and survives daemon restarts. The conductor reads and updates this memory at each think step, so the agent doesn't lose track of what it's already done or learned about the codebase.
 
-**Engine hardening** — circuit breaker on post-plan retries (escalates after 2 failures), directory/workspace switch blocked during agent execution, concurrent agent cap (`LEASHD_MAX_CONCURRENT_AGENTS`), and streaming buffer fix for conversation history persistence.
+**Browser-based verification and self-review** — autonomous tasks can now verify their own output by launching a browser and checking the result visually, and perform a self-review step before creating a PR.
 
-**Max turns** — default increased to 250, configurable via `leashd turns show/set` or WebUI Settings.
+**Context management** — git-backed checkpointing captures codebase state between actions, observation masking keeps the conductor's context window focused on what matters, and phase summarization compresses earlier observations so long-running tasks don't blow the context budget.
 
 See [CHANGELOG.md](CHANGELOG.md) for the full history.
 
@@ -209,7 +205,7 @@ Logs go to `~/.leashd/logs/app.log` by default. Set `LEASHD_LOG_DIR` to change t
 
 ## Autonomous Mode
 
-Autonomous mode replaces manual approval taps with AI evaluation, adds a post-task test-and-retry loop, and drives multi-phase autonomous tasks through the task orchestrator. Plan reviews are always forwarded to the human — the AI approver handles routine tool calls, not plans. Send `/task <description>` from the Web UI or Telegram and come back to a PR — or an escalation message if the agent gets stuck.
+Autonomous mode replaces manual approval taps with AI evaluation, adds a post-task test-and-retry loop, and drives adaptive autonomous tasks through the task orchestrator. Plan reviews are always forwarded to the human — the AI approver handles routine tool calls, not plans. Send `/task <description>` from the Web UI or Telegram and come back to a PR — or an escalation message if the agent gets stuck.
 
 ```bash
 leashd autonomous          # show current autonomous settings
@@ -221,18 +217,19 @@ leashd autonomous disable  # disable autonomous mode
 ### Three Guarantees
 
 1. **Human-in-the-loop when it matters** — hard blocks (credentials, force push, `rm -rf`, `sudo`) can never be overridden by any approver. Plan reviews always route to the human. The AI approver only handles `require_approval` decisions, never `deny` decisions.
-2. **Fail-safe defaults** — the AutoApprover fails closed (denies on error), the AutonomousLoop escalates to the human when retries are exhausted, and circuit breakers cap both approval calls and plan revisions per session. Post-plan implementation retries are capped at 2 — after that, the agent escalates to the human instead of looping.
-3. **Full auditability** — every AI approval decision is logged with `approver_type` in the same append-only JSONL audit trail. No decision is invisible.
+2. **Fail-safe defaults** — the AutoApprover fails closed (denies on error), the AutonomousLoop escalates to the human when retries are exhausted, and circuit breakers cap both approval calls and plan revisions per session. The conductor escalates after 3 consecutive parse failures or CLI errors instead of looping indefinitely.
+3. **Full auditability** — every AI approval decision is logged with `approver_type` in the same append-only JSONL audit trail. Task memory contents are persisted and recoverable. No decision is invisible.
 
 ### Task Orchestrator vs Autonomous Loop
 
 | Aspect | `/task` (Task Orchestrator) | `/edit` (Autonomous Loop) |
 |---|---|---|
 | **Use when** | Starting from scratch — "build feature X" | You know what to change — "fix the login bug" |
-| **Phases** | spec → explore → validate → plan → implement → test → PR | Single-shot: implement → test → retry |
-| **Planning** | Automatic spec and plan generation with human review | No planning — goes straight to implementation |
-| **Crash recovery** | Full — resumes from current phase after restart | None — starts over |
-| **Cost tracking** | Per-phase breakdown and total | Session-level only |
+| **How it works** | LLM-driven think-act-observe loop — conductor assesses complexity and dynamically chooses actions (explore, plan, implement, test, verify, fix, review, pr) | Single-shot: implement → test → retry |
+| **Planning** | Adaptive — simple tasks skip planning; complex ones get exploration and spec first | No planning — goes straight to implementation |
+| **Task memory** | Persistent working memory (8K chars) across steps and daemon restarts | None — starts over |
+| **Crash recovery** | Full — task memory and git-backed checkpoints survive daemon restarts | None — starts over |
+| **Cost tracking** | Per-action breakdown and total | Session-level only |
 
 See the [Autonomous Setup Guide](docs/autonomous-setup-guide.md) for a full walkthrough and the [Autonomous Mode Reference](docs/autonomous-mode.md) for the technical details.
 
@@ -444,7 +441,7 @@ These slash commands are available in both the Web UI and Telegram:
 | `/git <subcommand>` | Full git suite: status, branch, checkout, diff, log, add, commit, push, pull |
 | `/web <instruction>` | Autonomous web automation with content-level human approval |
 | `/test` | 9-phase agent-driven test workflow with browser automation |
-| `/task <description>` | Autonomous multi-phase task: spec → explore → plan → implement → test → PR |
+| `/task <description>` | Autonomous adaptive task: think-act-observe loop → PR |
 | `/tasks` | List active and recent tasks for the current chat |
 | `/stop` | Stop all ongoing work (agent, task, loop) without resetting session |
 | `/cancel` | Cancel the active task in the current chat |
@@ -605,7 +602,7 @@ request_completed
 
 ## Architecture
 
-leashd's core is the **Engine**, which receives messages from connectors, runs them through middleware (auth, rate limiting), delegates to the active agent runtime, and sends responses back. The **MultiConnector** manages simultaneous connectors (Web UI, Telegram) with chat_id-based routing — both share the same Engine, so sessions, approvals, and task state are unified. The **RuntimeRegistry** manages pluggable agent backends — each runtime registers its capabilities (streaming, session resume, tool approval, autonomous support) and the Engine adapts accordingly. Every tool call the agent makes is intercepted by the **Gatekeeper**, which orchestrates the three-layer safety pipeline. An **EventBus** decouples subsystems — plugins subscribe to events like `tool.allowed`, `tool.denied`, `approval.requested`, and `task.submitted`. Storage is centralized in `messages.db` to prevent race conditions across concurrent connector sessions. The **TaskOrchestrator** and **AutonomousLoop** plug into the event bus as autonomous execution plugins.
+leashd's core is the **Engine**, which receives messages from connectors, runs them through middleware (auth, rate limiting), delegates to the active agent runtime, and sends responses back. The **MultiConnector** manages simultaneous connectors (Web UI, Telegram) with chat_id-based routing — both share the same Engine, so sessions, approvals, and task state are unified. The **RuntimeRegistry** manages pluggable agent backends — each runtime registers its capabilities (streaming, session resume, tool approval, autonomous support) and the Engine adapts accordingly. Every tool call the agent makes is intercepted by the **Gatekeeper**, which orchestrates the three-layer safety pipeline. An **EventBus** decouples subsystems — plugins subscribe to events like `tool.allowed`, `tool.denied`, `approval.requested`, and `task.submitted`. Storage is centralized in `messages.db` to prevent race conditions across concurrent connector sessions. The **TaskOrchestrator** runs an LLM-driven think-act-observe loop with persistent task memory, and the **AutonomousLoop** handles post-task test-and-retry — both plug into the event bus.
 
 ```
 Web UI connector ────┐
@@ -613,9 +610,9 @@ Web UI connector ────┐
 Telegram connector ──┘         │
                           Middleware (auth, rate limit)
                                │
-                            Engine ──── EventBus ──── TaskOrchestrator
+                            Engine ──── EventBus ──── TaskOrchestrator (think-act-observe)
                                │                       AutonomousLoop
-                          RuntimeRegistry
+                          RuntimeRegistry               TaskMemory
                                ├─ Claude CLI
                                ├─ Claude Code
                                ├─ Codex

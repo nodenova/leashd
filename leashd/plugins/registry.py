@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from leashd.core.config import LeashdConfig
     from leashd.core.safety.audit import AuditLogger
     from leashd.plugins.base import LeashdPlugin, PluginContext
+    from leashd.plugins.builtin.agentic_orchestrator import AgenticOrchestrator
     from leashd.plugins.builtin.auto_approver import AutoApprover
     from leashd.plugins.builtin.auto_plan_reviewer import AutoPlanReviewer
     from leashd.plugins.builtin.autonomous_loop import AutonomousLoop
@@ -76,7 +77,7 @@ class BuiltinPlugins(BaseModel):
     auto_approver: AutoApprover | None
     auto_plan_reviewer: AutoPlanReviewer | None
     autonomous_loop: AutonomousLoop | None
-    task_orchestrator: TaskOrchestrator | None
+    task_orchestrator: TaskOrchestrator | AgenticOrchestrator | None
 
 
 def create_builtin_plugins(
@@ -88,6 +89,7 @@ def create_builtin_plugins(
     extra_plugins: list[LeashdPlugin] | None = None,
 ) -> BuiltinPlugins:
     """Instantiate and register all builtin plugins in one shot."""
+    from leashd.plugins.builtin.agentic_orchestrator import AgenticOrchestrator
     from leashd.plugins.builtin.audit_plugin import AuditPlugin
     from leashd.plugins.builtin.auto_approver import AutoApprover
     from leashd.plugins.builtin.auto_plan_reviewer import AutoPlanReviewer
@@ -151,21 +153,39 @@ def create_builtin_plugins(
             auto_pr=config.auto_pr,
         )
 
-    task_orchestrator = None
+    task_orchestrator: TaskOrchestrator | AgenticOrchestrator | None = None
     if config.task_orchestrator:
-        task_orchestrator = TaskOrchestrator(
-            connector=connector,
-            db_path=session_db_path,
-            max_retries=config.task_max_retries,
-            auto_pr=config.auto_pr,
-            auto_pr_base_branch=config.auto_pr_base_branch,
-        )
+        if config.task_orchestrator_version == "v2":
+            task_orchestrator = AgenticOrchestrator(
+                connector=connector,
+                db_path=session_db_path,
+                max_retries=config.task_max_retries,
+                auto_pr=config.auto_pr,
+                auto_pr_base_branch=config.auto_pr_base_branch,
+                conductor_model=config.task_conductor_model,
+                conductor_timeout=config.task_conductor_timeout,
+                memory_max_chars=config.task_memory_max_chars,
+            )
+            logger.info(
+                "agentic_orchestrator_v2_enabled",
+                max_retries=config.task_max_retries,
+                auto_pr=config.auto_pr,
+                conductor_model=config.task_conductor_model or "(default)",
+            )
+        else:
+            task_orchestrator = TaskOrchestrator(
+                connector=connector,
+                db_path=session_db_path,
+                max_retries=config.task_max_retries,
+                auto_pr=config.auto_pr,
+                auto_pr_base_branch=config.auto_pr_base_branch,
+            )
+            logger.info(
+                "task_orchestrator_enabled",
+                max_retries=config.task_max_retries,
+                auto_pr=config.auto_pr,
+            )
         registry.register(task_orchestrator)
-        logger.info(
-            "task_orchestrator_enabled",
-            max_retries=config.task_max_retries,
-            auto_pr=config.auto_pr,
-        )
 
     for plugin in extra_plugins or []:
         registry.register(plugin)

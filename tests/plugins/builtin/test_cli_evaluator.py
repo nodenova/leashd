@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from leashd.plugins.builtin._cli_evaluator import (
     PhaseDecision,
     evaluate_phase_outcome,
+    evaluate_via_cli,
     sanitize_for_prompt,
 )
 
@@ -112,6 +113,47 @@ class TestPhaseDecision:
         d = PhaseDecision(action="advance")
         assert d.reason == ""
         assert d.method == "evaluator"
+
+
+def _mock_process(returncode: int, stdout: bytes, stderr: bytes):
+    proc = AsyncMock()
+    proc.communicate = AsyncMock(return_value=(stdout, stderr))
+    proc.returncode = returncode
+    proc.kill = AsyncMock()
+    proc.wait = AsyncMock()
+    return proc
+
+
+class TestEvaluateViaCli:
+    async def test_error_includes_stderr(self):
+        proc = _mock_process(1, b"", b"rate limit exceeded")
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="rate limit exceeded"),
+        ):
+            await evaluate_via_cli("sys", "user")
+
+    async def test_error_falls_back_to_stdout_when_stderr_empty(self):
+        proc = _mock_process(1, b"error: API key invalid", b"")
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match="API key invalid"),
+        ):
+            await evaluate_via_cli("sys", "user")
+
+    async def test_error_shows_no_output_when_both_empty(self):
+        proc = _mock_process(1, b"", b"")
+        with (
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            pytest.raises(RuntimeError, match=r"\(no output\)"),
+        ):
+            await evaluate_via_cli("sys", "user")
+
+    async def test_success_returns_stdout(self):
+        proc = _mock_process(0, b"hello world", b"")
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            result = await evaluate_via_cli("sys", "user")
+            assert result == "hello world"
 
 
 class TestSanitizeEdgeCases:

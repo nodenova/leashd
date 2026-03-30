@@ -1899,12 +1899,7 @@ class Engine:
         if not task_orch:
             return "Task orchestrator is not enabled."
 
-        from leashd.plugins.builtin.task_orchestrator import TaskOrchestrator
-
-        if not isinstance(task_orch, TaskOrchestrator):
-            return "Task orchestrator is not available."
-
-        store = task_orch._store
+        store = getattr(task_orch, "_store", None)
         if not store:
             return "Task store is not initialized."
 
@@ -1921,6 +1916,9 @@ class Engine:
             "validate_plan": "✅",
             "implement": "🔨",
             "test": "🧪",
+            "fix": "🛠️",
+            "verify": "🔎",
+            "review": "📖",
             "retry": "🔄",
             "pr": "🚀",
             "completed": "✅",

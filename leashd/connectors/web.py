@@ -140,8 +140,9 @@ class WebConnector(BaseConnector):
         if self._server:
             self._server.should_exit = True
         if self._serve_task:
-            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
-                await asyncio.wait_for(self._serve_task, timeout=5.0)
+            self._serve_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._serve_task
             self._serve_task = None
         logger.info("webui_stopped")
 
@@ -368,17 +369,28 @@ class WebConnector(BaseConnector):
         phase: str,
         status: str,
         description: str,
+        *,
+        complexity: str | None = None,
+        reason: str | None = None,
+        retry_count: int | None = None,
+        previous_phase: str | None = None,
     ) -> None:
+        payload: dict[str, str | int | None] = {
+            "phase": phase,
+            "status": status,
+            "description": description,
+        }
+        if complexity is not None:
+            payload["complexity"] = complexity
+        if reason is not None:
+            payload["reason"] = reason
+        if retry_count is not None:
+            payload["retry_count"] = retry_count
+        if previous_phase is not None:
+            payload["previous_phase"] = previous_phase
         await self._ws_handler.send_to(
             chat_id,
-            ServerMessage(
-                type="task_update",
-                payload={
-                    "phase": phase,
-                    "status": status,
-                    "description": description,
-                },
-            ),
+            ServerMessage(type="task_update", payload=payload),
         )
         if status in ("completed", "failed", "escalated"):
             await self._send_push(

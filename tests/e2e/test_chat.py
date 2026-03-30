@@ -8,6 +8,7 @@ from playwright.async_api import Page
 from tests.e2e.conftest import SimpleNamespace, inject, wait_for
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestChatMessages:
     async def test_send_message_appears_in_chat(

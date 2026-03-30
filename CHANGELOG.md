@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.0] - 2026-03-28
+
+- **added**: Agentic task orchestrator v2 — LLM-driven think-act-observe loop replaces the fixed phase pipeline; conductor assesses complexity, chooses actions dynamically (explore, plan, implement, test, verify, fix, review, pr)
+- **added**: Task memory system — persistent per-task working memory (8K chars) for cross-step context and daemon restart recovery
+- **added**: Browser-based verification and self-review actions for autonomous tasks
+- **added**: Context management — git-backed checkpointing, observation masking, and phase summarization
+- **fixed**: Conductor circuit breakers — escalates to human after 3 consecutive parse failures or CLI errors instead of looping
+
 ## [0.11.1] - 2026-03-25
 
 - **added**: `build_engine()` now accepts an optional `agent` parameter for dependency injection — embedders can provide a custom agent without modifying the registry

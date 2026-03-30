@@ -260,6 +260,11 @@ class BaseConnector(ABC):
         phase: str,
         status: str,
         description: str,
+        *,
+        complexity: str | None = None,
+        reason: str | None = None,
+        retry_count: int | None = None,
+        previous_phase: str | None = None,
     ) -> None:
         """Send a task progress update to the client. Default: no-op."""
 

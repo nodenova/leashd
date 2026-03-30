@@ -247,6 +247,29 @@ class TestTaskUpdate:
         assert msg.payload["phase"] == "implement"
         assert msg.payload["status"] == "in_progress"
         assert msg.payload["description"] == "Writing code"
+        assert "complexity" not in msg.payload
+        assert "reason" not in msg.payload
+
+    async def test_send_task_update_with_v2_fields(self, connector):
+        connector._ws_handler.send_to = AsyncMock()
+        await connector.send_task_update(
+            "web:1",
+            "implement",
+            "running",
+            "Writing code",
+            complexity="moderate",
+            reason="Need to implement the feature",
+            retry_count=0,
+            previous_phase="plan",
+        )
+
+        msg = connector._ws_handler.send_to.call_args[0][1]
+        assert msg.type == "task_update"
+        assert msg.payload["phase"] == "implement"
+        assert msg.payload["complexity"] == "moderate"
+        assert msg.payload["reason"] == "Need to implement the feature"
+        assert msg.payload["retry_count"] == 0
+        assert msg.payload["previous_phase"] == "plan"
 
 
 class TestSendFile:

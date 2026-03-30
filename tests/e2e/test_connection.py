@@ -6,6 +6,7 @@ from playwright.async_api import Page
 from tests.e2e.conftest import SimpleNamespace, inject
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestConnectionIndicator:
     async def test_connection_dot_shows_connected(

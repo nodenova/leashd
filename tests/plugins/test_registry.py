@@ -293,9 +293,15 @@ class TestCreateBuiltinPlugins:
         assert result.auto_approver is not None
         assert result.registry.get("auto_approver") is result.auto_approver
 
-    def test_task_orchestrator_when_enabled(self, tmp_path):
+    def test_task_orchestrator_v1_when_enabled(self, tmp_path):
+        from leashd.plugins.builtin.task_orchestrator import TaskOrchestrator
+
         audit = AuditLogger(tmp_path / "audit.jsonl")
-        config = LeashdConfig(approved_directories=[tmp_path], task_orchestrator=True)
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            task_orchestrator=True,
+            task_orchestrator_version="v1",
+        )
         result = create_builtin_plugins(
             audit=audit,
             config=config,
@@ -303,6 +309,25 @@ class TestCreateBuiltinPlugins:
             session_db_path=str(tmp_path / "s.db"),
         )
         assert result.task_orchestrator is not None
+        assert isinstance(result.task_orchestrator, TaskOrchestrator)
+        assert result.registry.get("task_orchestrator") is result.task_orchestrator
+
+    def test_task_orchestrator_v2_default(self, tmp_path):
+        from leashd.plugins.builtin.agentic_orchestrator import AgenticOrchestrator
+
+        audit = AuditLogger(tmp_path / "audit.jsonl")
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            task_orchestrator=True,
+        )
+        result = create_builtin_plugins(
+            audit=audit,
+            config=config,
+            connector=None,
+            session_db_path=str(tmp_path / "s.db"),
+        )
+        assert result.task_orchestrator is not None
+        assert isinstance(result.task_orchestrator, AgenticOrchestrator)
         assert result.registry.get("task_orchestrator") is result.task_orchestrator
 
     def test_autonomous_loop_when_enabled(self, tmp_path):

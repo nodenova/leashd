@@ -44,6 +44,7 @@ flowchart LR
 | [Interactions](interactions.md) | Question flow, plan review flow, asyncio bridge |
 | [Testing Setup](testing-setup.md) | Three-tier setup guide for e2e testing with /test and Playwright |
 | [Autonomous Mode](autonomous-mode.md) | AI approval, AI plan review, test-and-retry loop, task orchestrator, autonomous policy |
+| [Agentic Task Orchestrator](task-orchestrator-v2.md) | v2 conductor-driven task orchestrator — dynamic action loop, working memory, context management |
 | [Autonomous Setup Guide](autonomous-setup-guide.md) | Step-by-step guide to configure a fully autonomous coding agent |
 
 ## Quick Start

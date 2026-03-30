@@ -3240,7 +3240,16 @@ class TestMultiAdjustThenApprove:
         write_results: list[object] = []
 
         class WriteAfterApprovalAgent(BaseAgent):
+            _ran_plan = False
+
             async def execute(self, prompt, session, *, can_use_tool=None, **kwargs):
+                # On the implementation turn (after plan approval) just return
+                if self._ran_plan:
+                    return AgentResponse(
+                        content="Implemented", session_id="sid", cost=0.01
+                    )
+                self._ran_plan = True
+
                 session.mode = "plan"
 
                 # Write to plan file should always work

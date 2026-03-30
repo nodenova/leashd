@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -20,8 +20,14 @@ from leashd.core.events import (
 )
 from leashd.core.test_output import detect_test_failure
 from leashd.plugins.base import PluginContext
+from leashd.plugins.builtin._cli_evaluator import PhaseDecision
 from leashd.plugins.builtin.autonomous_loop import AutonomousLoop, _LoopState
 from tests.conftest import MockConnector
+
+_EVAL_TARGET = "leashd.plugins.builtin.autonomous_loop.evaluate_phase_outcome"
+_BACKOFF_TARGET = (
+    "leashd.plugins.builtin.autonomous_loop.AutonomousLoop._compute_backoff_delay"
+)
 
 
 @pytest.fixture
@@ -183,12 +189,16 @@ class TestTestResultEvaluation:
             user_id="user-1",
         )
 
-        await loop_plugin._evaluate_test_results(
-            chat_id="chat-1",
-            session_id="sess-1",
-            user_id="user-1",
-            response_content="All tests pass. Build succeeded.",
-        )
+        with patch(
+            _EVAL_TARGET,
+            return_value=PhaseDecision(action="advance", reason="pass"),
+        ):
+            await loop_plugin._evaluate_test_results(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="All tests pass. Build succeeded.",
+            )
         assert "chat-1" not in loop_plugin.session_states
         assert len(mock_connector.sent_messages) == 0
 
@@ -202,12 +212,16 @@ class TestTestResultEvaluation:
             user_id="user-1",
         )
 
-        await loop_plugin._evaluate_test_results(
-            chat_id="chat-1",
-            session_id="sess-1",
-            user_id="user-1",
-            response_content="All tests pass after fixes.",
-        )
+        with patch(
+            _EVAL_TARGET,
+            return_value=PhaseDecision(action="advance", reason="pass"),
+        ):
+            await loop_plugin._evaluate_test_results(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="All tests pass after fixes.",
+            )
         assert "chat-1" not in loop_plugin.session_states
         assert len(mock_connector.sent_messages) == 1
         assert "tests pass after" in mock_connector.sent_messages[0]["text"].lower()
@@ -222,12 +236,19 @@ class TestTestResultEvaluation:
             user_id="user-1",
         )
 
-        await loop_plugin._evaluate_test_results(
-            chat_id="chat-1",
-            session_id="sess-1",
-            user_id="user-1",
-            response_content="FAILED: test_login - AssertionError",
-        )
+        with (
+            patch(
+                _EVAL_TARGET,
+                return_value=PhaseDecision(action="retry", reason="failures"),
+            ),
+            patch(_BACKOFF_TARGET, return_value=0.0),
+        ):
+            await loop_plugin._evaluate_test_results(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="FAILED: test_login - AssertionError",
+            )
 
         mock_engine.handle_message.assert_called_once()
         call_args = mock_engine.handle_message.call_args
@@ -250,12 +271,16 @@ class TestEscalation:
             user_id="user-1",
         )
 
-        await loop_plugin._evaluate_test_results(
-            chat_id="chat-1",
-            session_id="sess-1",
-            user_id="user-1",
-            response_content="FAILED: test_login - still broken",
-        )
+        with patch(
+            _EVAL_TARGET,
+            return_value=PhaseDecision(action="escalate", reason="persistent failure"),
+        ):
+            await loop_plugin._evaluate_test_results(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="FAILED: test_login - still broken",
+            )
         assert len(mock_connector.sent_messages) == 1
         assert "stuck" in mock_connector.sent_messages[0]["text"].lower()
         assert "chat-1" not in loop_plugin.session_states
@@ -361,13 +386,14 @@ class TestEventEmission:
 
         event_bus.subscribe(SESSION_RETRY, handler)
 
-        await loop_plugin._retry(
-            chat_id="chat-1",
-            session_id="sess-1",
-            user_id="user-1",
-            response_content="FAILED",
-            attempt=0,
-        )
+        with patch(_BACKOFF_TARGET, return_value=0.0):
+            await loop_plugin._retry(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="FAILED",
+                attempt=0,
+            )
 
         assert len(captured) == 1
         assert captured[0].data["attempt"] == 1
@@ -411,13 +437,14 @@ class TestEngineExceptionHandling:
             user_id="user-1",
         )
 
-        await loop_plugin._retry(
-            chat_id="chat-1",
-            session_id="sess-1",
-            user_id="user-1",
-            response_content="FAILED",
-            attempt=0,
-        )
+        with patch(_BACKOFF_TARGET, return_value=0.0):
+            await loop_plugin._retry(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="FAILED",
+                attempt=0,
+            )
 
         assert len(mock_connector.sent_messages) == 1
         assert (
@@ -436,7 +463,10 @@ class TestEngineExceptionHandling:
             user_id="user-1",
         )
 
-        with pytest.raises(asyncio.CancelledError):
+        with (
+            pytest.raises(asyncio.CancelledError),
+            patch(_BACKOFF_TARGET, return_value=0.0),
+        ):
             await loop_plugin._retry(
                 chat_id="chat-1",
                 session_id="sess-1",
@@ -754,10 +784,6 @@ class TestEvaluatorIntegration:
 
     async def test_evaluator_retry_takes_retry_path(self, loop_plugin, mock_engine):
         """When evaluator returns RETRY, loop triggers retry."""
-        from unittest.mock import patch
-
-        from leashd.plugins.builtin._cli_evaluator import PhaseDecision
-
         loop_plugin._session_states["chat-1"] = _LoopState(
             phase="testing",
             retry_count=0,
@@ -766,10 +792,13 @@ class TestEvaluatorIntegration:
             user_id="user-1",
         )
 
-        with patch(
-            "leashd.plugins.builtin.autonomous_loop.evaluate_phase_outcome",
-            new_callable=AsyncMock,
-            return_value=PhaseDecision(action="retry", reason="3 tests failed"),
+        with (
+            patch(
+                _EVAL_TARGET,
+                new_callable=AsyncMock,
+                return_value=PhaseDecision(action="retry", reason="3 tests failed"),
+            ),
+            patch(_BACKOFF_TARGET, return_value=0.0),
         ):
             await loop_plugin._evaluate_test_results(
                 chat_id="chat-1",

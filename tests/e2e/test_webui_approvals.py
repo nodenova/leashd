@@ -16,6 +16,7 @@ def _approval_payload(request_id: str = "ap-1") -> dict:
     }
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestApprovalCards:
     async def test_approval_card_renders(

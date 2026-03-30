@@ -1,8 +1,8 @@
 """Shared fixtures for WebUI end-to-end tests.
 
-Each test gets a fresh server instance on a unique port and a fresh Playwright
-browser page. Use ``authed_page`` for tests that need an authenticated session,
-``page`` for the bare page (auth flow tests).
+Each test module gets ONE server + ONE browser (module-scoped).
+Each test gets a fresh page + context (function-scoped).
+This avoids re-launching Chromium and uvicorn for every single test.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import pytest_asyncio
 import uvicorn
 
 playwright_async_api = pytest.importorskip(
@@ -21,6 +22,7 @@ playwright_async_api = pytest.importorskip(
     reason="Playwright not installed — skip e2e tests",
 )
 Page = playwright_async_api.Page
+Browser = playwright_async_api.Browser
 async_playwright = playwright_async_api.async_playwright
 
 from leashd.core.config import LeashdConfig  # noqa: E402
@@ -41,9 +43,9 @@ async def _wait_for_server(server: uvicorn.Server, timeout: float = 5.0) -> int:
     raise RuntimeError(f"Server did not start within {timeout}s")
 
 
-@pytest.fixture
-async def test_server(tmp_path) -> AsyncGenerator[SimpleNamespace, None]:  # type: ignore[type-arg]
-    """Start a real leashd WebUI server on a free port with a mock message handler.
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def test_server(tmp_path_factory) -> AsyncGenerator[SimpleNamespace, None]:  # type: ignore[type-arg]
+    """Start a real leashd WebUI server on a free port (once per module).
 
     Yields a SimpleNamespace with:
       - url: str — base HTTP URL
@@ -52,6 +54,7 @@ async def test_server(tmp_path) -> AsyncGenerator[SimpleNamespace, None]:  # typ
       - chat_ids: list[str] — populated with chat_id on each WebSocket auth
       - received: list[dict] — messages received from the browser
     """
+    tmp_path = tmp_path_factory.mktemp("e2e")
     config = LeashdConfig(
         approved_directories=[tmp_path],
         web_enabled=True,
@@ -100,19 +103,34 @@ async def test_server(tmp_path) -> AsyncGenerator[SimpleNamespace, None]:  # typ
     await asyncio.wait_for(task, timeout=5.0)
 
 
-@pytest.fixture
-async def page(test_server) -> AsyncGenerator[Page, None]:
-    """Bare Playwright page pointed at the test server (not yet authenticated)."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(base_url=test_server.url)
-        pg = await ctx.new_page()
-        yield pg
-        await ctx.close()
-        await browser.close()
+@pytest_asyncio.fixture(scope="module", loop_scope="module")
+async def _browser() -> AsyncGenerator[Browser, None]:
+    """Launch Chromium once per module (expensive operation)."""
+    pw = await async_playwright().start()
+    browser = await pw.chromium.launch(headless=True)
+    yield browser
+    await browser.close()
+    await pw.stop()
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
+def _reset_server_state(test_server: SimpleNamespace) -> None:
+    """Clear accumulated state before each test to prevent cross-contamination."""
+    test_server.received.clear()
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def page(
+    test_server: SimpleNamespace, _browser: Browser
+) -> AsyncGenerator[Page, None]:
+    """Fresh Playwright page pointed at the test server (not yet authenticated)."""
+    ctx = await _browser.new_context(base_url=test_server.url)
+    pg = await ctx.new_page()
+    yield pg
+    await ctx.close()
+
+
+@pytest_asyncio.fixture(loop_scope="module")
 async def authed_page(page: Page, test_server: SimpleNamespace) -> Page:
     """Playwright page fixture already authenticated and showing the chat screen."""
     await page.goto(test_server.url)
@@ -123,7 +141,7 @@ async def authed_page(page: Page, test_server: SimpleNamespace) -> Page:
     return page
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(loop_scope="module")
 async def chat_id(authed_page: Page, test_server: SimpleNamespace) -> str:
     """Return the WebSocket chat_id for the authenticated session.
 
@@ -136,7 +154,7 @@ async def chat_id(authed_page: Page, test_server: SimpleNamespace) -> str:
     raise RuntimeError("on_connect callback never fired — chat_id unavailable")
 
 
-@pytest.fixture
+@pytest_asyncio.fixture(loop_scope="module")
 async def capture(test_server: SimpleNamespace) -> dict[str, list[dict[str, Any]]]:
     """Register capturing resolvers on the WS handler.
 

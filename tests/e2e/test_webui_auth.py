@@ -8,6 +8,7 @@ from playwright.async_api import Page
 from tests.e2e.conftest import SimpleNamespace
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestAuthFlow:
     async def test_valid_key_shows_chat_screen(

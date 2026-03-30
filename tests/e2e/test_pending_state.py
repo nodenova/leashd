@@ -8,6 +8,7 @@ from playwright.async_api import Page
 from tests.e2e.conftest import SimpleNamespace, inject
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestPendingState:
     async def test_pending_state_restores_approval(

@@ -56,9 +56,12 @@ async def evaluate_via_cli(
         await proc.wait()
         raise
     if proc.returncode != 0:
-        raise RuntimeError(
-            f"claude CLI error (exit {proc.returncode}): {stderr.decode()[:200]}"
-        )
+        err_text = stderr.decode().strip()
+        if not err_text:
+            err_text = stdout.decode().strip()[:200] or "(no output)"
+        else:
+            err_text = err_text[:200]
+        raise RuntimeError(f"claude CLI error (exit {proc.returncode}): {err_text}")
     return stdout.decode().strip()
 
 

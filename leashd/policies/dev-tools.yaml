@@ -5,6 +5,8 @@ rules:
     tool: Bash
     command_patterns:
       - "^(pytest|ruff|jest|vitest|mypy|black|flake8|eslint|prettier)\\b"
+      # python/python3 -m variants
+      - "^python3?\\s+-m\\s+(pytest|ruff|mypy|black|flake8)\\b"
     action: allow
     description: "Standalone linters, formatters, and test runners"
 
@@ -13,8 +15,10 @@ rules:
     command_patterns:
       # JS package managers — local-only subcommands
       - "^(npm|yarn|pnpm|bun)\\s+(install|ci|test|run|ls|outdated|audit|add|remove|uninstall|info|list|why|dedupe|prune|cache)\\b"
-      # pip — safe subcommands
-      - "^pip\\s+(install|list|show|freeze|check|uninstall)\\b"
+      # pip/pip3 — safe subcommands
+      - "^pip3?\\s+(install|list|show|freeze|check|uninstall)\\b"
+      # python/python3 -m pip — safe subcommands
+      - "^python3?\\s+-m\\s+pip\\s+(install|list|show|freeze|check|uninstall)\\b"
       # uv — safe subcommands + only known-safe runners
       - "^uv\\s+(sync|lock|add|remove|pip|venv|tool)\\b"
       - "^uv\\s+run\\s+(pytest|ruff|mypy|black|flake8)\\b"

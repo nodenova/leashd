@@ -133,9 +133,21 @@ class MultiConnector(BaseConnector):
         phase: str,
         status: str,
         description: str,
+        *,
+        complexity: str | None = None,
+        reason: str | None = None,
+        retry_count: int | None = None,
+        previous_phase: str | None = None,
     ) -> None:
         await self._get_connector(chat_id).send_task_update(
-            chat_id, phase, status, description
+            chat_id,
+            phase,
+            status,
+            description,
+            complexity=complexity,
+            reason=reason,
+            retry_count=retry_count,
+            previous_phase=previous_phase,
         )
 
     async def notify_completion(self, chat_id: str) -> None:

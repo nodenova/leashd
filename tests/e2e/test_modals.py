@@ -10,6 +10,7 @@ from playwright.async_api import Page
 from tests.e2e.conftest import SimpleNamespace, inject, wait_for
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestQuestionCards:
     async def test_question_card_renders_in_messages(
@@ -190,6 +191,7 @@ class TestQuestionCards:
         assert len(capture["interactions"]) == 1
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestPlanReview:
     async def test_plan_review_renders_with_accept_buttons(
@@ -303,6 +305,7 @@ class TestPlanReview:
             assert is_disabled, f"Button {i} should be disabled after click"
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestInterruptBanner:
     async def test_interrupt_prompt_shows_banner(

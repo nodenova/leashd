@@ -161,6 +161,10 @@ _AUTONOMOUS_FIELD_MAP: dict[str, str] = {
     "auto_pr_base_branch": "LEASHD_AUTO_PR_BASE_BRANCH",
     "autonomous_loop": "LEASHD_AUTONOMOUS_LOOP",
     "task_max_retries": "LEASHD_TASK_MAX_RETRIES",
+    "task_orchestrator_version": "LEASHD_TASK_ORCHESTRATOR_VERSION",
+    "task_conductor_model": "LEASHD_TASK_CONDUCTOR_MODEL",
+    "task_conductor_timeout": "LEASHD_TASK_CONDUCTOR_TIMEOUT",
+    "task_memory_max_chars": "LEASHD_TASK_MEMORY_MAX_CHARS",
 }
 
 

@@ -6,6 +6,7 @@ from playwright.async_api import Page
 from tests.e2e.conftest import SimpleNamespace
 
 
+@pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.e2e
 class TestSettingsPage:
     async def test_settings_button_opens_settings(

@@ -27,6 +27,9 @@ TaskPhase = Literal[
     "validate_plan",
     "implement",
     "test",
+    "fix",
+    "verify",
+    "review",
     "retry",
     "pr",
     "completed",
@@ -76,6 +79,10 @@ class TaskRun(BaseModel):
 
     phase_pipeline: list[TaskPhase] = Field(default_factory=list)
 
+    # v2 orchestrator fields
+    complexity: str | None = None
+    memory_file_path: str | None = None
+
     def is_terminal(self) -> bool:
         return self.phase in _TERMINAL_PHASES
 
@@ -114,7 +121,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
     total_cost REAL DEFAULT 0.0,
     phase_costs TEXT DEFAULT '{}',
     working_directory TEXT NOT NULL,
-    phase_pipeline TEXT DEFAULT '[]'
+    phase_pipeline TEXT DEFAULT '[]',
+    complexity TEXT,
+    memory_file_path TEXT
 )
 """
 
@@ -143,12 +152,18 @@ class TaskStore:
         await self._db.execute(_CREATE_TASK_RUNS_CHAT_INDEX)
         await self._db.execute(_CREATE_TASK_RUNS_USER_INDEX)
 
-        # Migration: add phase_pipeline column for existing databases
+        # Migrations: add columns for existing databases
         cursor = await self._db.execute("PRAGMA table_info(task_runs)")
         columns = {row[1] for row in await cursor.fetchall()}
         if "phase_pipeline" not in columns:
             await self._db.execute(
                 "ALTER TABLE task_runs ADD COLUMN phase_pipeline TEXT DEFAULT '[]'"
+            )
+        if "complexity" not in columns:
+            await self._db.execute("ALTER TABLE task_runs ADD COLUMN complexity TEXT")
+        if "memory_file_path" not in columns:
+            await self._db.execute(
+                "ALTER TABLE task_runs ADD COLUMN memory_file_path TEXT"
             )
 
         await self._db.commit()
@@ -163,8 +178,8 @@ class TaskStore:
                 retry_count, max_retries, phase_context,
                 created_at, started_at, phase_started_at, completed_at,
                 last_updated, total_cost, phase_costs, working_directory,
-                phase_pipeline)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                phase_pipeline, complexity, memory_file_path)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.run_id,
                 task.user_id,
@@ -188,6 +203,8 @@ class TaskStore:
                 json.dumps(task.phase_costs),
                 task.working_directory,
                 json.dumps(task.phase_pipeline),
+                task.complexity,
+                task.memory_file_path,
             ),
         )
         await self._db.commit()
@@ -281,6 +298,13 @@ class TaskStore:
             except (json.JSONDecodeError, TypeError):
                 return []
 
+        def _safe_get(key: str) -> str | None:
+            try:
+                result: str | None = row[key]
+                return result
+            except (IndexError, KeyError):
+                return None
+
         return TaskRun(
             run_id=row["run_id"],
             user_id=row["user_id"],
@@ -304,6 +328,8 @@ class TaskStore:
             phase_costs=_parse_json(row["phase_costs"]),
             working_directory=row["working_directory"],
             phase_pipeline=_parse_list(row["phase_pipeline"]),
+            complexity=_safe_get("complexity"),
+            memory_file_path=_safe_get("memory_file_path"),
         )
 
     @staticmethod
