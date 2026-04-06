@@ -147,6 +147,12 @@ def inject_global_config_as_env(*, force: bool = False) -> None:
     if max_turns and (force or "LEASHD_MAX_TURNS" not in os.environ):
         os.environ["LEASHD_MAX_TURNS"] = str(max_turns)
 
+    max_tool_calls = data.get("max_tool_calls")
+    if max_tool_calls is not None and (
+        force or "LEASHD_MAX_TOOL_CALLS" not in os.environ
+    ):
+        os.environ["LEASHD_MAX_TOOL_CALLS"] = str(max_tool_calls)
+
     _inject_autonomous_config(data, force=force)
     _inject_browser_config(data, force=force)
     _inject_web_config(data, force=force)
@@ -440,6 +446,8 @@ def update_config_sections(updates: dict[str, Any]) -> None:
                     data["default_mode"] = value
                 elif key == "max_turns":
                     data["max_turns"] = value
+                elif key == "max_tool_calls":
+                    data["max_tool_calls"] = value
 
     if "autonomous" in updates:
         auto_update = updates["autonomous"]

@@ -94,6 +94,8 @@ BROWSER_TOOL_SETS: dict[str, BrowserToolSet] = {
     ),
 }
 
+SCREENSHOT_SAVE_DIR = ".leashd"
+
 
 def is_browser_tool(tool_name: str) -> bool:
     """Check if a tool is a browser tool, normalizing MCP prefixes."""

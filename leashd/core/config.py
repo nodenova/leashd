@@ -64,6 +64,7 @@ class LeashdConfig(BaseSettings):
     # Agent settings
     agent_runtime: str = "claude-cli"
     max_turns: int = 250
+    max_tool_calls: int = -1  # -1 = unlimited
     web_max_turns: int = 300
     test_max_turns: int = 200
     max_concurrent_agents: int = 5

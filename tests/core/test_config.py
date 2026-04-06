@@ -188,6 +188,18 @@ class TestConfigValidationEdgeCases:
         config = LeashdConfig(approved_directories=[tmp_path], max_turns=-1)
         assert config.max_turns == -1
 
+    def test_max_tool_calls_default(self, tmp_path):
+        config = LeashdConfig(approved_directories=[tmp_path])
+        assert config.max_tool_calls == -1
+
+    def test_max_tool_calls_custom(self, tmp_path):
+        config = LeashdConfig(approved_directories=[tmp_path], max_tool_calls=100)
+        assert config.max_tool_calls == 100
+
+    def test_max_tool_calls_unlimited(self, tmp_path):
+        config = LeashdConfig(approved_directories=[tmp_path], max_tool_calls=-1)
+        assert config.max_tool_calls == -1
+
     def test_very_long_system_prompt(self, tmp_path):
         long_prompt = "x" * 100_000
         config = LeashdConfig(

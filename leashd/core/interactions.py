@@ -35,9 +35,13 @@ _PLAN_DECISIONS: frozenset[str] = frozenset({"clean_edit", "edit", "default", "a
 _PLAN_ANSWER_MAP: dict[str, PlanDecision] = {
     "yes": "clean_edit",
     "accept": "clean_edit",
+    "proceed": "clean_edit",
     "no": "adjust",
-    "reject": "adjust",
 }
+# "reject" is handled specially in resolve_option as a terminal deny that
+# does not wait for user feedback — used by non-interactive callers
+# (timeout, headless API clients) to cleanly close a plan_review.
+_TERMINAL_REJECT_ANSWERS: frozenset[str] = frozenset({"reject", "timeout"})
 
 
 class PendingInteraction(BaseModel):
@@ -319,6 +323,15 @@ class InteractionCoordinator:
             return False
 
         if pending.kind == "plan_review":
+            if answer.lower() in _TERMINAL_REJECT_ANSWERS:
+                pending.decision = "adjust"
+                pending.feedback = (
+                    "Plan rejected by caller"
+                    if answer.lower() == "reject"
+                    else "Plan review timed out"
+                )
+                pending.event.set()
+                return True
             if answer not in _PLAN_DECISIONS:
                 mapped = _PLAN_ANSWER_MAP.get(answer.lower())
                 if mapped:

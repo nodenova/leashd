@@ -165,6 +165,12 @@ def _print_resolved_config(config: LeashdConfig, yaml_data: dict[str, Any]) -> N
     turns_hint = _source_hint("max_turns", yaml_data)
     print(f"Max turns: {config.max_turns}{turns_hint}")
 
+    tc_hint = _source_hint("max_tool_calls", yaml_data)
+    tc_label = (
+        "unlimited" if config.max_tool_calls == -1 else str(config.max_tool_calls)
+    )
+    print(f"Max tool calls: {tc_label}{tc_hint}")
+
     autonomous = get_autonomous_config(yaml_data)
     if autonomous.get("enabled"):
         print("\nAutonomous mode: ENABLED")
@@ -725,6 +731,40 @@ def _handle_turns_set(value: int) -> None:
     save_global_config(data)
     inject_global_config_as_env(force=True)
     print(f"\u2713 Max turns set to {value}")
+    _notify_daemon_reload()
+
+
+def _handle_tool_calls(args: argparse.Namespace) -> None:
+    """Route tool-calls subcommands."""
+    sub = getattr(args, "tool_calls_command", None)
+    if sub is None or sub == "show":
+        _handle_tool_calls_show()
+    elif sub == "set":
+        _handle_tool_calls_set(args.value)
+
+
+def _handle_tool_calls_show() -> None:
+    """Display current max tool calls setting."""
+    data = load_global_config()
+    value = data.get("max_tool_calls", -1)
+    label = "unlimited" if value == -1 else str(value)
+    print(f"Max tool calls: {label}")
+
+
+def _handle_tool_calls_set(value: int) -> None:
+    """Set the max tool calls per execution."""
+    if value != -1 and value < 1:
+        print(
+            "Error: max tool calls must be -1 (unlimited) or a positive integer",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    data = load_global_config()
+    data["max_tool_calls"] = value
+    save_global_config(data)
+    inject_global_config_as_env(force=True)
+    label = "unlimited" if value == -1 else str(value)
+    print(f"✓ Max tool calls set to {label}")
     _notify_daemon_reload()
 
 
@@ -1486,6 +1526,15 @@ def main() -> None:
     turns_set = turns_sub.add_parser("set", help="Set max turns per request")
     turns_set.add_argument("value", type=int, help="Max turns (positive integer)")
 
+    # Max tool calls
+    tc_parser = subparsers.add_parser(
+        "tool-calls", help="Manage max tool calls per execution"
+    )
+    tc_sub = tc_parser.add_subparsers(dest="tool_calls_command")
+    tc_sub.add_parser("show", help="Show current max tool calls (default)")
+    tc_set = tc_sub.add_parser("set", help="Set max tool calls per execution")
+    tc_set.add_argument("value", type=int, help="Max tool calls (-1 for unlimited)")
+
     # Agent runtime
     runtime_parser = subparsers.add_parser("runtime", help="Manage agent runtime")
     runtime_sub = runtime_parser.add_subparsers(dest="runtime_command")
@@ -1606,6 +1655,8 @@ def main() -> None:
         _handle_effort(args)
     elif args.command == "turns":
         _handle_turns(args)
+    elif args.command == "tool-calls":
+        _handle_tool_calls(args)
     elif args.command == "runtime":
         _handle_runtime(args)
     elif args.command == "workflow":

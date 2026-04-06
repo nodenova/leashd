@@ -399,3 +399,83 @@ class TestDefaultButtonSessionMode:
         await eng.handle_message("user1", "Plan it", "chat1")
         session = eng.session_manager.get("user1", "chat1")
         assert session.mode == "edit"
+
+
+class TestToolCallLimit:
+    """Verify max_tool_calls enforcement in can_use_tool callback."""
+
+    async def test_unlimited_allows_many_calls(self, engine, fake_agent, tmp_dir):
+        """With max_tool_calls=-1 (default), tool calls are never limited."""
+        await engine.handle_message("user1", "hello", "chat1")
+        hook = fake_agent.last_can_use_tool
+        for _ in range(100):
+            result = await hook("Read", {"file_path": str(tmp_dir / "foo.py")}, None)
+            assert result.behavior == "allow"
+
+    async def test_limit_enforced(
+        self, config, fake_agent, policy_engine, audit_logger, tmp_dir
+    ):
+        """After max_tool_calls, subsequent calls are denied."""
+        from leashd.core.config import LeashdConfig
+
+        limited_config = LeashdConfig(
+            approved_directories=[tmp_dir],
+            max_turns=5,
+            max_tool_calls=3,
+            audit_log_path=tmp_dir / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=None,
+            agent=fake_agent,
+            config=limited_config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+        await eng.handle_message("user1", "hello", "chat1")
+        hook = fake_agent.last_can_use_tool
+
+        for _ in range(3):
+            result = await hook("Read", {"file_path": str(tmp_dir / "foo.py")}, None)
+            assert result.behavior == "allow"
+
+        result = await hook("Read", {"file_path": str(tmp_dir / "foo.py")}, None)
+        assert result.behavior == "deny"
+        assert "limit reached" in result.message.lower()
+
+    async def test_excluded_tools_dont_count(
+        self, fake_agent, policy_engine, audit_logger, tmp_dir
+    ):
+        """AskUserQuestion and mode tools don't increment the counter."""
+        from leashd.core.config import LeashdConfig
+
+        limited_config = LeashdConfig(
+            approved_directories=[tmp_dir],
+            max_turns=5,
+            max_tool_calls=1,
+            audit_log_path=tmp_dir / "audit.jsonl",
+        )
+        eng = Engine(
+            connector=None,
+            agent=fake_agent,
+            config=limited_config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+        await eng.handle_message("user1", "hello", "chat1")
+        hook = fake_agent.last_can_use_tool
+
+        # Excluded tools should not count toward limit
+        for tool in ("AskUserQuestion", "ExitPlanMode", "EnterPlanMode"):
+            result = await hook(tool, {}, None)
+            # These may be denied for other reasons, but not for tool call limit
+
+        # First real tool call should still be allowed (limit=1)
+        result = await hook("Read", {"file_path": str(tmp_dir / "foo.py")}, None)
+        assert result.behavior == "allow"
+
+        # Second real tool call should be denied
+        result = await hook("Read", {"file_path": str(tmp_dir / "foo.py")}, None)
+        assert result.behavior == "deny"
+        assert "limit reached" in result.message.lower()

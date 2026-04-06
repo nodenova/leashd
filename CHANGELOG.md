@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.1] - 2026-04-06
+
+- **added**: Configurable `max_tool_calls` limit (`leashd tool-calls set <N>`) — cap tool calls per agent execution or set to -1 for unlimited; enforced across all runtimes; also configurable via WebUI settings and REST API
+- **added**: Conductor timeout escalation — agentic orchestrator tracks LLM timeouts separately from CLI errors and escalates after 3 consecutive timeouts
+- **added**: Plan-review terminal states — "proceed" maps to clean edit mode; "reject" and "timeout" cleanly terminate without awaiting further feedback
+- **fixed**: AutoApprover circuit-breaker counter now resets correctly per session — `SESSION_COMPLETED` includes `session_id` so the 50-call budget actually resets
+- **fixed**: User-configured auto-approve state no longer wiped by `/task` — state saved at task start and restored on completion
+- **fixed**: Agent-browser screenshots save directly to `.leashd/` instead of requiring a temp-directory copy
+- **fixed**: Autonomous loop escalation retried 3× on connector errors with exponential backoff; audit event always emitted
+
 ## [0.12.0] - 2026-03-28
 
 - **added**: Agentic task orchestrator v2 — LLM-driven think-act-observe loop replaces the fixed phase pipeline; conductor assesses complexity, chooses actions dynamically (explore, plan, implement, test, verify, fix, review, pr)

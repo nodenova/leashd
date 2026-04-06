@@ -129,8 +129,8 @@ agent-browser --session variant-a open "https://app.com?variant=a"
 agent-browser --session variant-b open "https://app.com?variant=b"
 
 # Compare
-agent-browser --session variant-a screenshot /tmp/variant-a.png
-agent-browser --session variant-b screenshot /tmp/variant-b.png
+agent-browser --session variant-a screenshot .leashd/variant-a.png
+agent-browser --session variant-b screenshot .leashd/variant-b.png
 ```
 
 ## Default Session

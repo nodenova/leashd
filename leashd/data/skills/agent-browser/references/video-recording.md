@@ -152,10 +152,10 @@ agent-browser record start ./automation.webm
 agent-browser record start ./flow.webm
 
 agent-browser open https://example.com
-agent-browser screenshot ./screenshots/step1-homepage.png
+agent-browser screenshot .leashd/step1-homepage.png
 
 agent-browser click @e1
-agent-browser screenshot ./screenshots/step2-after-click.png
+agent-browser screenshot .leashd/step2-after-click.png
 
 agent-browser record stop
 ```

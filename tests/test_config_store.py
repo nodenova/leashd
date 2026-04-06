@@ -566,6 +566,38 @@ class TestInjectEffortConfig:
         assert "LEASHD_EFFORT" not in os.environ
 
 
+class TestInjectMaxToolCallsConfig:
+    def test_bridges_yaml_to_env(self, fake_config_dir, monkeypatch):
+        save_global_config({"max_tool_calls": 42})
+        monkeypatch.delenv("LEASHD_MAX_TOOL_CALLS", raising=False)
+        inject_global_config_as_env()
+        assert os.environ["LEASHD_MAX_TOOL_CALLS"] == "42"
+
+    def test_bridges_negative_one(self, fake_config_dir, monkeypatch):
+        save_global_config({"max_tool_calls": -1})
+        monkeypatch.delenv("LEASHD_MAX_TOOL_CALLS", raising=False)
+        inject_global_config_as_env()
+        assert os.environ["LEASHD_MAX_TOOL_CALLS"] == "-1"
+
+    def test_skips_existing_env(self, fake_config_dir, monkeypatch):
+        save_global_config({"max_tool_calls": 42})
+        monkeypatch.setenv("LEASHD_MAX_TOOL_CALLS", "100")
+        inject_global_config_as_env()
+        assert os.environ["LEASHD_MAX_TOOL_CALLS"] == "100"
+
+    def test_force_overwrites_existing(self, fake_config_dir, monkeypatch):
+        save_global_config({"max_tool_calls": 42})
+        monkeypatch.setenv("LEASHD_MAX_TOOL_CALLS", "100")
+        inject_global_config_as_env(force=True)
+        assert os.environ["LEASHD_MAX_TOOL_CALLS"] == "42"
+
+    def test_missing_not_injected(self, fake_config_dir, monkeypatch):
+        save_global_config({"approved_directories": ["/tmp/a"]})
+        monkeypatch.delenv("LEASHD_MAX_TOOL_CALLS", raising=False)
+        inject_global_config_as_env()
+        assert "LEASHD_MAX_TOOL_CALLS" not in os.environ
+
+
 class TestInjectAgentRuntimeConfig:
     def test_bridges_yaml_to_env(self, fake_config_dir, monkeypatch):
         save_global_config({"agent_runtime": "codex"})

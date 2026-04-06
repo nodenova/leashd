@@ -398,6 +398,60 @@ class TestPlanReviewHandling:
         result = await interaction_coordinator.resolve_option("test-id", "bogus")
         assert result is False
 
+    async def test_proceed_maps_to_clean_edit(
+        self, interaction_coordinator, mock_connector
+    ):
+        from leashd.core.interactions import PlanReviewDecision
+
+        async def click_proceed():
+            await asyncio.sleep(0.05)
+            req = mock_connector.plan_review_requests[0]
+            await interaction_coordinator.resolve_option(
+                req["interaction_id"], "proceed"
+            )
+
+        task = asyncio.create_task(click_proceed())
+        result = await interaction_coordinator.handle_plan_review("chat1", {})
+        await task
+
+        assert isinstance(result, PlanReviewDecision)
+        assert result.permission.behavior == "allow"
+        assert result.clear_context is True
+
+    async def test_reject_terminally_denies_without_feedback(
+        self, interaction_coordinator, mock_connector
+    ):
+        async def click_reject():
+            await asyncio.sleep(0.05)
+            req = mock_connector.plan_review_requests[0]
+            await interaction_coordinator.resolve_option(
+                req["interaction_id"], "reject"
+            )
+
+        task = asyncio.create_task(click_reject())
+        result = await interaction_coordinator.handle_plan_review("chat1", {})
+        await task
+
+        assert result.behavior == "deny"
+        assert "rejected" in result.message.lower()
+
+    async def test_timeout_sentinel_terminally_denies(
+        self, interaction_coordinator, mock_connector
+    ):
+        async def send_timeout():
+            await asyncio.sleep(0.05)
+            req = mock_connector.plan_review_requests[0]
+            await interaction_coordinator.resolve_option(
+                req["interaction_id"], "timeout"
+            )
+
+        task = asyncio.create_task(send_timeout())
+        result = await interaction_coordinator.handle_plan_review("chat1", {})
+        await task
+
+        assert result.behavior == "deny"
+        assert "timed out" in result.message.lower()
+
 
 class TestTextRouting:
     async def test_has_pending_true(self, interaction_coordinator, mock_connector):

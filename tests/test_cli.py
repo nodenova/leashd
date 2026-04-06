@@ -1475,6 +1475,58 @@ class TestEffort:
         assert exc_info.value.code == 1
 
 
+class TestToolCalls:
+    def test_tool_calls_show_default(self, fake_config_dir, capsys):
+        from leashd.cli import _handle_tool_calls_show
+
+        _handle_tool_calls_show()
+        captured = capsys.readouterr()
+        assert "unlimited" in captured.out
+
+    def test_tool_calls_show_custom(self, fake_config_dir, capsys):
+        from leashd.cli import _handle_tool_calls_show
+
+        save_global_config({"max_tool_calls": 50})
+        _handle_tool_calls_show()
+        captured = capsys.readouterr()
+        assert "50" in captured.out
+
+    def test_tool_calls_set_valid(self, fake_config_dir, capsys):
+        from leashd.cli import _handle_tool_calls_set
+
+        with patch("leashd.cli._notify_daemon_reload"):
+            _handle_tool_calls_set(100)
+        captured = capsys.readouterr()
+        assert "✓" in captured.out
+        assert "100" in captured.out
+        from leashd.config_store import load_global_config
+
+        data = load_global_config()
+        assert data["max_tool_calls"] == 100
+
+    def test_tool_calls_set_unlimited(self, fake_config_dir, capsys):
+        from leashd.cli import _handle_tool_calls_set
+
+        with patch("leashd.cli._notify_daemon_reload"):
+            _handle_tool_calls_set(-1)
+        captured = capsys.readouterr()
+        assert "unlimited" in captured.out
+
+    def test_tool_calls_set_zero_rejected(self, fake_config_dir):
+        from leashd.cli import _handle_tool_calls_set
+
+        with pytest.raises(SystemExit) as exc_info:
+            _handle_tool_calls_set(0)
+        assert exc_info.value.code == 1
+
+    def test_tool_calls_set_negative_rejected(self, fake_config_dir):
+        from leashd.cli import _handle_tool_calls_set
+
+        with pytest.raises(SystemExit) as exc_info:
+            _handle_tool_calls_set(-5)
+        assert exc_info.value.code == 1
+
+
 class TestRuntime:
     def test_runtime_show_default(self, fake_config_dir, capsys):
         from leashd.cli import _handle_runtime_show

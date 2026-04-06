@@ -2922,6 +2922,12 @@ const SettingsManager = {
           <option value="auto" ${mode === 'auto' ? 'selected' : ''}>Auto</option>
         </select>
       </div>
+      <div class="setting-row">
+        <div><div class="setting-label">Max Tool Calls</div>
+          <div class="setting-sublabel">-1 = unlimited</div></div>
+        <input type="number" class="number-input" data-setting="agent.max_tool_calls"
+          value="${agent.max_tool_calls != null ? agent.max_tool_calls : -1}" min="-1">
+      </div>
     </div>`;
   },
 
@@ -3099,6 +3105,8 @@ const SettingsManager = {
     if (runtimeSel) agent.runtime = runtimeSel.value;
     const modeSel = settingsBody.querySelector('[data-setting="agent.default_mode"]');
     if (modeSel) agent.default_mode = modeSel.value;
+    const tcInput = settingsBody.querySelector('[data-setting="agent.max_tool_calls"]');
+    if (tcInput) agent.max_tool_calls = parseInt(tcInput.value, 10);
     if (Object.keys(agent).length) updates.agent = agent;
 
     // Collect autonomous settings

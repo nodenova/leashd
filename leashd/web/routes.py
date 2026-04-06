@@ -233,6 +233,7 @@ def create_rest_router(
                     "runtime": raw.get("agent_runtime", "claude-code"),
                     "default_mode": raw.get("default_mode", "default"),
                     "max_turns": raw.get("max_turns", 250),
+                    "max_tool_calls": raw.get("max_tool_calls", -1),
                 },
                 "autonomous": {
                     "enabled": autonomous.get("enabled", False),
@@ -370,6 +371,10 @@ def _validate_config_update(body: dict[str, Any]) -> str | None:
             mt = agent["max_turns"]
             if not isinstance(mt, int) or mt < 1:
                 return "max_turns must be a positive integer"
+        if "max_tool_calls" in agent:
+            mtc = agent["max_tool_calls"]
+            if not isinstance(mtc, int) or (mtc != -1 and mtc < 1):
+                return "max_tool_calls must be -1 (unlimited) or a positive integer"
 
     if "autonomous" in body:
         auto = body["autonomous"]

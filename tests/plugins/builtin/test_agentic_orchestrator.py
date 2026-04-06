@@ -69,8 +69,16 @@ class _MockEngine:
     def enable_tool_auto_approve(self, chat_id, tool_name):
         self._auto_approvals.setdefault(chat_id, set()).add(tool_name)
 
+    def enable_auto_approve(self, chat_id):
+        self._auto_approvals.setdefault(chat_id, set()).add("*")
+
     def disable_auto_approve(self, chat_id):
         self._auto_approvals.pop(chat_id, None)
+
+    def get_auto_approve_status(self, chat_id):
+        tools = self._auto_approvals.get(chat_id, set())
+        blanket = "*" in tools
+        return blanket, tools - {"*"}
 
     def get_executing_session_id(self, chat_id):
         return None

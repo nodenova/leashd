@@ -219,12 +219,18 @@ async def decide_next_action(
         )
     except (TimeoutError, RuntimeError) as exc:
         exc_detail = str(exc) or f"{type(exc).__name__} (no details)"
-        logger.warning("conductor_call_failed", error=exc_detail)
+        is_timeout = isinstance(exc, TimeoutError)
+        logger.warning(
+            "conductor_call_failed",
+            error=exc_detail,
+            kind="timeout" if is_timeout else "cli_error",
+        )
         # Fail-forward: if we haven't started, explore; otherwise implement
         fallback_action: ConductorAction = "explore" if is_first_call else "implement"
+        reason_prefix = "conductor timed out" if is_timeout else "conductor call failed"
         return ConductorDecision(
             action=fallback_action,
-            reason=f"conductor call failed: {exc_detail}",
+            reason=f"{reason_prefix}: {exc_detail}",
             instruction="Proceed with the task based on available context.",
         )
 

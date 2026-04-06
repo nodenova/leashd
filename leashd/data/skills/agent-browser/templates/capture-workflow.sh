@@ -14,7 +14,7 @@
 set -euo pipefail
 
 TARGET_URL="${1:?Usage: $0 <url> [output-dir]}"
-OUTPUT_DIR="${2:-.}"
+OUTPUT_DIR="${2:-.leashd}"
 
 echo "Capturing: $TARGET_URL"
 mkdir -p "$OUTPUT_DIR"

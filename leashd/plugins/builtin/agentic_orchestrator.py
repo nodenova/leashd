@@ -94,7 +94,11 @@ if TYPE_CHECKING:
 
         def enable_tool_auto_approve(self, chat_id: str, tool_name: str) -> None: ...
 
+        def enable_auto_approve(self, chat_id: str) -> None: ...
+
         def disable_auto_approve(self, chat_id: str) -> None: ...
+
+        def get_auto_approve_status(self, chat_id: str) -> tuple[bool, set[str]]: ...
 
         def get_executing_session_id(self, chat_id: str) -> str | None: ...
 
@@ -203,9 +207,12 @@ _ACTION_SUFFIXES: dict[str, str] = {
     "pr": (
         "All tests pass. Create a pull request for the changes:\n"
         "1. Check `git status` and `git diff`\n"
-        "2. Create a new branch from HEAD if not already on a feature branch\n"
-        "3. Stage and commit all changes with a descriptive commit message\n"
-        "4. Push the branch to origin\n"
+        "2. If a feature branch was auto-created (see FEATURE BRANCH above), "
+        "you are already on it — skip branch creation. Otherwise, create a "
+        "new branch from HEAD if not already on a feature branch\n"
+        "3. Stage and commit any remaining changes with a descriptive "
+        "commit message\n"
+        "4. Push (or re-push) the branch to origin\n"
         "5. Create a PR using `gh pr create`\n\n"
         "Keep the PR title short and the body concise.\n\n"
         "BEFORE YOU FINISH this action, update the task memory file:\n"
@@ -227,7 +234,7 @@ def _verify_suffix(browser_backend: str) -> str:
             "3. Take snapshots with `agent-browser snapshot -i` to inspect the "
             "accessibility tree\n"
             "4. Check `agent-browser console` for JavaScript errors\n"
-            "5. Take screenshots with `agent-browser screenshot` if useful\n"
+            "5. Take screenshots with `agent-browser screenshot .leashd/verify-screenshot.png` if useful\n"
             "6. Verify the UI renders correctly, forms work, API responds as "
             "expected\n"
             "7. Check error states and edge cases in the browser\n\n"
@@ -261,10 +268,19 @@ def _build_action_prompt(
         f"AUTONOMOUS TASK — Action: {decision.action}",
         f"TASK: {task.task}",
         f"WORKING DIRECTORY: {task.working_directory}",
-        "",
-        f"INSTRUCTION: {decision.instruction}",
-        "",
     ]
+    feature_branch = task.phase_context.get("feature_branch")
+    if feature_branch:
+        lines.append(
+            f"FEATURE BRANCH: {feature_branch} (auto-created, pushed to origin)"
+        )
+    lines.extend(
+        [
+            "",
+            f"INSTRUCTION: {decision.instruction}",
+            "",
+        ]
+    )
 
     if memory_content:
         lines.append(
@@ -597,10 +613,14 @@ class AgenticOrchestrator(LeashdPlugin):
             complexity=decision.complexity,
         )
 
-        # Track consecutive conductor failures to avoid infinite loops
+        # Track consecutive conductor failures to avoid infinite loops.
+        # Each failure type resets the other counters so "consecutive"
+        # is accurate — a different failure kind breaks the streak.
         if "unparseable" in decision.reason:
             failures = task.phase_context.get("_conductor_parse_failures", 0) + 1
             task.phase_context["_conductor_parse_failures"] = failures
+            task.phase_context.pop("_conductor_timeout_failures", None)
+            task.phase_context.pop("_conductor_cli_failures", None)
             if failures >= 3:
                 logger.warning(
                     "conductor_parse_failures_exhausted",
@@ -614,9 +634,30 @@ class AgenticOrchestrator(LeashdPlugin):
                 await self.store.save(task)
                 await self._handle_terminal(task)
                 return
+        elif "conductor timed out" in decision.reason:
+            timeouts = task.phase_context.get("_conductor_timeout_failures", 0) + 1
+            task.phase_context["_conductor_timeout_failures"] = timeouts
+            task.phase_context.pop("_conductor_parse_failures", None)
+            task.phase_context.pop("_conductor_cli_failures", None)
+            if timeouts >= 3:
+                logger.warning(
+                    "conductor_timeout_failures_exhausted",
+                    run_id=task.run_id,
+                    count=timeouts,
+                )
+                task.transition_to("escalated")
+                task.error_message = (
+                    f"Conductor timed out {timeouts} consecutive times "
+                    "— LLM is hanging or unreachable"
+                )
+                await self.store.save(task)
+                await self._handle_terminal(task)
+                return
         elif "conductor call failed" in decision.reason:
             cli_failures = task.phase_context.get("_conductor_cli_failures", 0) + 1
             task.phase_context["_conductor_cli_failures"] = cli_failures
+            task.phase_context.pop("_conductor_parse_failures", None)
+            task.phase_context.pop("_conductor_timeout_failures", None)
             if cli_failures >= 3:
                 logger.warning(
                     "conductor_cli_failures_exhausted",
@@ -634,6 +675,7 @@ class AgenticOrchestrator(LeashdPlugin):
         else:
             task.phase_context.pop("_conductor_parse_failures", None)
             task.phase_context.pop("_conductor_cli_failures", None)
+            task.phase_context.pop("_conductor_timeout_failures", None)
 
         # Handle terminal decisions
         if decision.action == "complete":
@@ -690,7 +732,11 @@ class AgenticOrchestrator(LeashdPlugin):
         if self._connector:
             complexity_str = f" [{task.complexity}]" if task.complexity else ""
             display_reason = decision.reason
-            if "conductor call failed" in decision.reason:
+            if "conductor timed out" in decision.reason:
+                display_reason = (
+                    "AI orchestrator timed out — proceeding with best-effort action"
+                )
+            elif "conductor call failed" in decision.reason:
                 display_reason = (
                     "AI orchestrator temporarily unavailable "
                     "— proceeding with best-effort action"
@@ -727,6 +773,16 @@ class AgenticOrchestrator(LeashdPlugin):
             await self._handle_terminal(task)
             return
 
+        # Preserve any user-configured auto-approvals for this chat so
+        # we can restore them when the task ends. Without this, starting
+        # a /task wipes the user's "approve all Bash" style preferences
+        # and never puts them back.
+        if "_saved_auto_approve" not in task.phase_context:
+            blanket, per_tool = self._engine.get_auto_approve_status(task.chat_id)
+            task.phase_context["_saved_auto_approve"] = {
+                "blanket": blanket,
+                "per_tool": sorted(per_tool),
+            }
         self._engine.disable_auto_approve(task.chat_id)
 
         mode = _ACTION_TO_MODE.get(decision.action, "auto")
@@ -969,6 +1025,12 @@ class AgenticOrchestrator(LeashdPlugin):
                 session.plan_origin = None
                 await self._engine.session_manager.save(session)
             self._engine.disable_auto_approve(task.chat_id)
+            saved = task.phase_context.pop("_saved_auto_approve", None)
+            if saved:
+                if saved.get("blanket"):
+                    self._engine.enable_auto_approve(task.chat_id)
+                for tool_name in saved.get("per_tool", []):
+                    self._engine.enable_tool_auto_approve(task.chat_id, tool_name)
 
         if task.phase == "completed":
             msg = self._completed_message(task)

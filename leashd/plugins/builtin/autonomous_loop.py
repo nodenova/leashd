@@ -358,8 +358,31 @@ class AutonomousLoop(LeashdPlugin):
             "Session is paused. Reply to this message to take over."
         )
 
+        # Retry the escalation message a few times — a transient network
+        # hiccup shouldn't silently drop an escalation. The event bus
+        # emission below always runs so the audit trail is preserved even
+        # if the connector send ultimately fails.
+        delivered = False
         if self._connector:
-            await self._connector.send_message(chat_id, message)
+            for attempt_idx in range(3):
+                try:
+                    await self._connector.send_message(chat_id, message)
+                    delivered = True
+                    break
+                except Exception:
+                    logger.warning(
+                        "escalation_send_failed",
+                        chat_id=chat_id,
+                        attempt_idx=attempt_idx + 1,
+                    )
+                    if attempt_idx < 2:
+                        await asyncio.sleep(0.5 * (2**attempt_idx))
+            if not delivered:
+                logger.error(
+                    "escalation_send_abandoned",
+                    session_id=session_id,
+                    chat_id=chat_id,
+                )
 
         if self._event_bus:
             await self._event_bus.emit(
@@ -369,6 +392,7 @@ class AutonomousLoop(LeashdPlugin):
                         "session_id": session_id,
                         "chat_id": chat_id,
                         "attempt": attempt,
+                        "delivered": delivered,
                     },
                 )
             )
@@ -380,6 +404,7 @@ class AutonomousLoop(LeashdPlugin):
             session_id=session_id,
             chat_id=chat_id,
             attempt=attempt,
+            delivered=delivered,
         )
 
     async def _handle_success(self, chat_id: str, state: _LoopState) -> None:

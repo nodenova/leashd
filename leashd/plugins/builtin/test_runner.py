@@ -355,7 +355,7 @@ def build_test_instruction(
             f"for JavaScript errors\n"
             f"- Check {_b(bb, 'browser_network_requests', 'agent-browser network')} "
             f"for failed requests (4xx/5xx)\n"
-            f"- Take {_b(bb, 'browser_take_screenshot', 'agent-browser screenshot')} "
+            f"- Take {_b(bb, 'browser_take_screenshot', 'agent-browser screenshot .leashd/smoke-baseline.png')} "
             f"as the visual baseline\n"
             "- If the page fails to load, stop here and report the blocker"
         )
@@ -505,6 +505,13 @@ def build_test_instruction(
         "(transient timing issues are common)\n"
         "- If a browser tool call fails, report the specific error — NEVER silently "
         "fall back to non-browser testing or claim tools are unavailable"
+        + (
+            "\n- When saving screenshots, always specify .leashd/ as the output "
+            "directory (e.g. `agent-browser screenshot .leashd/screenshot.png`). "
+            "Never call screenshot commands without an explicit output path"
+            if browser_backend == "agent-browser"
+            else ""
+        )
     )
 
     return "\n\n".join(sections)

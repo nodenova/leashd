@@ -39,7 +39,7 @@ agent-browser open https://example.com && agent-browser wait --load networkidle 
 agent-browser fill @e1 "user@example.com" && agent-browser fill @e2 "password123" && agent-browser click @e3
 
 # Navigate and capture
-agent-browser open https://example.com && agent-browser wait --load networkidle && agent-browser screenshot page.png
+agent-browser open https://example.com && agent-browser wait --load networkidle && agent-browser screenshot .leashd/page.png
 ```
 
 **When to chain:** Use `&&` when you don't need to read the output of an intermediate command before proceeding (e.g., open + wait + screenshot). Run commands separately when you need to parse the output first (e.g., snapshot to discover refs, then interact using those refs).
@@ -229,20 +229,20 @@ agent-browser set media dark
 ```bash
 # Set a custom viewport size (default is 1280x720)
 agent-browser set viewport 1920 1080
-agent-browser screenshot desktop.png
+agent-browser screenshot .leashd/desktop.png
 
 # Test mobile-width layout
 agent-browser set viewport 375 812
-agent-browser screenshot mobile.png
+agent-browser screenshot .leashd/mobile.png
 
 # Retina/HiDPI: same CSS layout at 2x pixel density
 # Screenshots stay at logical viewport size, but content renders at higher DPI
 agent-browser set viewport 1920 1080 2
-agent-browser screenshot retina.png
+agent-browser screenshot .leashd/retina.png
 
 # Device emulation (sets viewport + user agent in one step)
 agent-browser set device "iPhone 14"
-agent-browser screenshot device.png
+agent-browser screenshot .leashd/device.png
 ```
 
 The `scale` parameter (3rd argument) sets `window.devicePixelRatio` without changing CSS layout. Use it when testing retina rendering or capturing higher-resolution screenshots.
@@ -265,7 +265,7 @@ Use `AGENT_BROWSER_HEADED=1` to enable headed mode via environment variable. Bro
 # Open local files with file:// URLs
 agent-browser --allow-file-access open file:///path/to/document.pdf
 agent-browser --allow-file-access open file:///path/to/page.html
-agent-browser screenshot output.png
+agent-browser screenshot .leashd/output.png
 ```
 
 ### iOS Simulator (Mobile Safari)
@@ -284,7 +284,7 @@ agent-browser -p ios fill @e2 "text"
 agent-browser -p ios swipe up         # Mobile-specific gesture
 
 # Take screenshot
-agent-browser -p ios screenshot mobile.png
+agent-browser -p ios screenshot .leashd/mobile.png
 
 # Close session (shuts down simulator)
 agent-browser -p ios close
@@ -359,9 +359,9 @@ For visual regression testing or monitoring:
 
 ```bash
 # Save a baseline screenshot, then compare later
-agent-browser screenshot baseline.png
+agent-browser screenshot .leashd/baseline.png
 # ... time passes or changes are made ...
-agent-browser diff screenshot --baseline baseline.png
+agent-browser diff screenshot --baseline .leashd/baseline.png
 
 # Compare staging vs production
 agent-browser diff url https://staging.example.com https://prod.example.com --screenshot
@@ -434,7 +434,7 @@ agent-browser click @e1              # Use new refs
 Use `--annotate` to take a screenshot with numbered labels overlaid on interactive elements. Each label `[N]` maps to ref `@eN`. This also caches refs, so you can interact with elements immediately without a separate snapshot.
 
 ```bash
-agent-browser screenshot --annotate
+agent-browser screenshot --annotate .leashd/annotated.png
 # Output includes the image path and a legend:
 #   [1] @e1 button "Submit"
 #   [2] @e2 link "Home"

@@ -119,7 +119,7 @@ class TestDecideNextAction:
                 is_first_call=True,
             )
             assert result.action == "explore"
-            assert "failed" in result.reason
+            assert "timed out" in result.reason
 
     async def test_falls_back_on_runtime_error(self):
         with patch(

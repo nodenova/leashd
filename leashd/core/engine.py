@@ -97,6 +97,11 @@ class AgentDeadline:
         return self.remaining <= 0
 
 
+_TOOLS_EXCLUDED_FROM_LIMIT = frozenset(
+    {"AskUserQuestion", "ExitPlanMode", "EnterPlanMode"}
+)
+
+
 class _ToolCallbackState:
     __slots__ = (
         "_bg_tasks",
@@ -109,6 +114,7 @@ class _ToolCallbackState:
         "plan_review_shown",
         "proceed_in_context",
         "target_mode",
+        "tool_call_count",
     )
 
     def __init__(self) -> None:
@@ -122,6 +128,7 @@ class _ToolCallbackState:
         self.plan_file_content: str | None = None
         self.plan_file_path: str | None = None
         self.target_mode: str = "edit"
+        self.tool_call_count: int = 0
 
 
 class _StreamingResponder:
@@ -492,9 +499,17 @@ class Engine:
         """Enable auto-approve for a specific tool on a chat (plugin-facing API)."""
         self._gatekeeper.enable_tool_auto_approve(chat_id, tool_name)
 
+    def enable_auto_approve(self, chat_id: str) -> None:
+        """Enable blanket auto-approve for a chat (plugin-facing API)."""
+        self._gatekeeper.enable_auto_approve(chat_id)
+
     def disable_auto_approve(self, chat_id: str) -> None:
         """Disable all auto-approve rules for a chat (plugin-facing API)."""
         self._gatekeeper.disable_auto_approve(chat_id)
+
+    def get_auto_approve_status(self, chat_id: str) -> tuple[bool, set[str]]:
+        """Return (blanket, per_tool) auto-approve state for a chat."""
+        return self._gatekeeper.get_auto_approve_status(chat_id)
 
     def get_executing_session_id(self, chat_id: str) -> str | None:
         """Return the session_id currently executing for *chat_id*, or None."""
@@ -1031,6 +1046,7 @@ class Engine:
                     name=SESSION_COMPLETED,
                     data={
                         "session": session,
+                        "session_id": session.session_id,
                         "chat_id": chat_id,
                         "user_id": user_id,
                         "response_content": response.content,
@@ -2096,11 +2112,18 @@ class Engine:
             )
 
             async def _noop_can_use_tool(
-                _tool_name: str,
-                _tool_input: dict[str, Any],
+                tool_name: str,
+                tool_input: dict[str, Any],
                 _context: Any,
-            ) -> PermissionAllow:
-                return PermissionAllow(updated_input=_tool_input)
+            ) -> PermissionAllow | PermissionDeny:
+                max_tc = self.config.max_tool_calls
+                if max_tc > 0 and tool_name not in _TOOLS_EXCLUDED_FROM_LIMIT:
+                    state.tool_call_count += 1
+                    if state.tool_call_count > max_tc:
+                        return PermissionDeny(
+                            message=f"Tool call limit reached ({max_tc}). Wrap up your response."
+                        )
+                return PermissionAllow(updated_input=tool_input)
 
             return _noop_can_use_tool, state
 
@@ -2262,6 +2285,20 @@ class Engine:
                     message="You are in accept-edits mode. Implement changes directly "
                     "— do not enter plan mode."
                 )
+
+            max_tc = self.config.max_tool_calls
+            if max_tc > 0 and tool_name not in _TOOLS_EXCLUDED_FROM_LIMIT:
+                state.tool_call_count += 1
+                if state.tool_call_count > max_tc:
+                    logger.info(
+                        "tool_call_limit_reached",
+                        session_id=session.session_id,
+                        limit=max_tc,
+                        tool_name=tool_name,
+                    )
+                    return PermissionDeny(
+                        message=f"Tool call limit reached ({max_tc}). Wrap up your response."
+                    )
 
             if deadline:
                 deadline.pause()

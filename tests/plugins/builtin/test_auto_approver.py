@@ -172,6 +172,30 @@ class TestAutoApproverCircuitBreaker:
         auto_approver.reset_session("sess-reset")
         assert "sess-reset" not in auto_approver.session_call_counts
 
+    async def test_session_completed_event_resets_counter(self, auto_approver):
+        """Counter must reset when engine emits SESSION_COMPLETED with session_id.
+
+        Regression: the engine used to emit only the Session object under
+        key 'session', but the handler looked up 'session_id' — so the
+        reset never happened and the 50-call budget exhausted permanently.
+        """
+        from leashd.core.events import SESSION_COMPLETED, Event
+
+        proc = mock_cli_process("APPROVE: ok")
+        with patch(_PATCH_SUBPROCESS, return_value=proc):
+            await auto_approver.evaluate(
+                tool_name="Write",
+                tool_input={"file_path": "/project/f.py"},
+                session_id="sess-evt",
+                chat_id="chat-1",
+            )
+        assert auto_approver.session_call_counts["sess-evt"] == 1
+
+        await auto_approver._on_session_completed(
+            Event(name=SESSION_COMPLETED, data={"session_id": "sess-evt"})
+        )
+        assert "sess-evt" not in auto_approver.session_call_counts
+
 
 class TestAutoApproverAuditLogging:
     async def test_approval_logged_with_type(self, auto_approver, tmp_path):

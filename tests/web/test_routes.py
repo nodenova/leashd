@@ -618,3 +618,46 @@ class TestConfigPutEndpoint:
         data = resp.json()
         assert data["success"] is False
         assert "unknown config sections" in data["reason"]
+
+    def test_updates_max_tool_calls(self, client):
+        with (
+            patch("leashd.web.routes.update_config_sections") as mock_update,
+            patch("leashd.web.routes.signal_reload"),
+        ):
+            resp = client.put(
+                "/api/config",
+                headers={**_AUTH_HEADER, "Content-Type": "application/json"},
+                json={"agent": {"max_tool_calls": 50}},
+            )
+            assert resp.status_code == 200
+            mock_update.assert_called_once_with({"agent": {"max_tool_calls": 50}})
+
+    def test_updates_max_tool_calls_unlimited(self, client):
+        with (
+            patch("leashd.web.routes.update_config_sections"),
+            patch("leashd.web.routes.signal_reload"),
+        ):
+            resp = client.put(
+                "/api/config",
+                headers=_AUTH_HEADER,
+                json={"agent": {"max_tool_calls": -1}},
+            )
+            assert resp.status_code == 200
+
+    def test_rejects_invalid_max_tool_calls_zero(self, client):
+        resp = client.put(
+            "/api/config",
+            headers=_AUTH_HEADER,
+            json={"agent": {"max_tool_calls": 0}},
+        )
+        assert resp.status_code == 400
+        assert "max_tool_calls" in resp.json()["reason"]
+
+    def test_rejects_invalid_max_tool_calls_negative(self, client):
+        resp = client.put(
+            "/api/config",
+            headers=_AUTH_HEADER,
+            json={"agent": {"max_tool_calls": -5}},
+        )
+        assert resp.status_code == 400
+        assert "max_tool_calls" in resp.json()["reason"]
