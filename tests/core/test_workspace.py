@@ -177,6 +177,60 @@ class TestLoadWorkspaces:
         result = load_workspaces(tmp_path)
         assert result == {}
 
+    def test_oserror_on_yaml_read_returns_empty(self, tmp_path, monkeypatch):
+        """YAML file exists but unreadable (permissions, NFS mount lost)."""
+        leashd_dir = tmp_path / ".leashd"
+        leashd_dir.mkdir()
+        ws_file = leashd_dir / "workspaces.yaml"
+        ws_file.write_text(yaml.dump({"workspaces": {}}))
+
+        original_read_text = Path.read_text
+
+        def _failing_read(self, *args, **kwargs):
+            if "workspaces" in str(self):
+                raise OSError("Permission denied")
+            return original_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _failing_read)
+        result = load_workspaces(tmp_path)
+        assert result == {}
+
+    def test_non_dict_yaml_content_returns_empty(self, tmp_path):
+        """User writes a bare string in workspaces.yaml instead of a YAML mapping."""
+        leashd_dir = tmp_path / ".leashd"
+        leashd_dir.mkdir()
+        (leashd_dir / "workspaces.yaml").write_text('"just a bare string"')
+        result = load_workspaces(tmp_path)
+        assert result == {}
+
+    def test_null_workspaces_key_returns_empty(self, tmp_path):
+        """User writes 'workspaces:' with no value — YAML null."""
+        leashd_dir = tmp_path / ".leashd"
+        leashd_dir.mkdir()
+        (leashd_dir / "workspaces.yaml").write_text(yaml.dump({"workspaces": None}))
+        result = load_workspaces(tmp_path)
+        assert result == {}
+
+    def test_workspace_entry_as_string_is_skipped(self, tmp_path):
+        """User writes 'myws: /path' instead of proper dict structure."""
+        valid_dir = tmp_path / "good-repo"
+        valid_dir.mkdir()
+        leashd_dir = tmp_path / ".leashd"
+        leashd_dir.mkdir()
+        (leashd_dir / "workspaces.yaml").write_text(
+            yaml.dump(
+                {
+                    "workspaces": {
+                        "bad": "/some/path",
+                        "good": {"directories": [str(valid_dir)]},
+                    }
+                }
+            )
+        )
+        result = load_workspaces(tmp_path)
+        assert "bad" not in result
+        assert "good" in result
+
     def test_tilde_expansion(self, tmp_path):
         dir_a = tmp_path / "repo"
         dir_a.mkdir()

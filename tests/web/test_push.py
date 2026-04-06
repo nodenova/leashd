@@ -85,6 +85,39 @@ class TestEnsureVapidKeys:
 
         assert result == expected
 
+    def test_regenerates_when_file_missing_public_key(self, tmp_path, monkeypatch):
+        """Upgrade from older version that only saved private_key."""
+        keys_path = tmp_path / "vapid_keys.json"
+        keys_path.write_text(json.dumps({"private_key": "only-private"}))
+        monkeypatch.setattr("leashd.web.push._VAPID_KEYS_PATH", keys_path)
+        monkeypatch.setattr("leashd.web.push._LEASHD_DIR", tmp_path)
+
+        result = _ensure_vapid_keys()
+
+        assert "private_key" in result
+        assert "public_key" in result
+        # File should be rewritten with both keys
+        stored = json.loads(keys_path.read_text())
+        assert "public_key" in stored
+
+    def test_cleanup_on_write_failure(self, tmp_path, monkeypatch):
+        """Disk full mid-write — temp file must be cleaned up."""
+        keys_path = tmp_path / "vapid_keys.json"
+        monkeypatch.setattr("leashd.web.push._VAPID_KEYS_PATH", keys_path)
+        monkeypatch.setattr("leashd.web.push._LEASHD_DIR", tmp_path)
+
+        def _failing_write(fd, data):
+            raise OSError("No space left on device")
+
+        monkeypatch.setattr("os.write", _failing_write)
+
+        with pytest.raises(OSError, match="No space"):
+            _ensure_vapid_keys()
+
+        # No leftover temp files
+        temps = list(tmp_path.glob("*.tmp"))
+        assert temps == []
+
     def test_regenerates_on_corrupt_keys(self, tmp_path, monkeypatch):
         keys_path = tmp_path / "vapid_keys.json"
         keys_path.write_text("not-json")
@@ -312,6 +345,21 @@ class TestPushService:
 
         assert result is False
         assert not push_service.has_subscription("web:expired")
+
+    def test_corrupt_subscriptions_file_loads_empty(self, tmp_path, monkeypatch):
+        """Subscriptions file corrupted (partial write on crash) — start fresh."""
+        keys_path = tmp_path / "vapid_keys.json"
+        keys_path.write_text(json.dumps({"private_key": "p", "public_key": "k"}))
+        subs_path = tmp_path / "push_subscriptions.json"
+        subs_path.write_text("{{not valid json at all")
+        monkeypatch.setattr("leashd.web.push._VAPID_KEYS_PATH", keys_path)
+        monkeypatch.setattr("leashd.web.push._SUBSCRIPTIONS_PATH", subs_path)
+        monkeypatch.setattr("leashd.web.push._LEASHD_DIR", tmp_path)
+
+        with patch("leashd.web.push.Vapid") as mock_vapid_cls:
+            mock_vapid_cls.from_pem.return_value = MagicMock()
+            svc = PushService()
+        assert not svc.has_subscription("any-chat")
 
     def test_loads_subscriptions_from_disk(self, tmp_path, monkeypatch):
         keys_path = tmp_path / "vapid_keys.json"

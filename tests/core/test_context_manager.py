@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from leashd.core.context_manager import (
     git_checkpoint,
@@ -207,6 +208,90 @@ class TestGitCheckpoint:
             text=True,
         )
         assert "custom checkpoint message" in proc.stdout
+
+    async def test_nothing_to_commit_after_staging_returns_none(self, tmp_path):
+        """Race condition: changes staged but already committed by another process."""
+        _init_git_repo(tmp_path)
+        (tmp_path / "app.py").write_text("print('hello')")
+
+        call_count = 0
+        real_create = asyncio.create_subprocess_exec
+
+        async def _mock_exec(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 3:  # git commit
+                proc = MagicMock()
+                proc.communicate = AsyncMock(
+                    return_value=(b"", b"nothing to commit, working tree clean")
+                )
+                proc.returncode = 1
+                return proc
+            return await real_create(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_mock_exec):
+            result = await git_checkpoint(str(tmp_path), "abc", "test")
+
+        assert result is None
+
+    async def test_commit_failure_returns_none(self, tmp_path):
+        """Git commit failure (corrupted index, hook error) must not crash the task."""
+        _init_git_repo(tmp_path)
+        (tmp_path / "app.py").write_text("print('hello')")
+
+        call_count = 0
+        real_create = asyncio.create_subprocess_exec
+
+        async def _mock_exec(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 3:  # the git commit call
+                proc = MagicMock()
+                proc.communicate = AsyncMock(
+                    return_value=(b"", b"error: could not write commit object")
+                )
+                proc.returncode = 128
+                return proc
+            return await real_create(*args, **kwargs)
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_mock_exec):
+            result = await git_checkpoint(str(tmp_path), "abc123", "implement")
+
+        assert result is None
+
+    async def test_timeout_during_large_repo(self, tmp_path):
+        """Git hanging on a large repo must not block the task loop."""
+        _init_git_repo(tmp_path)
+        (tmp_path / "big.txt").write_text("x" * 1000)
+
+        real_create = asyncio.create_subprocess_exec
+
+        async def _mock_exec(*args, **kwargs):
+            proc = await real_create(*args, **kwargs)
+
+            async def _slow_communicate(*a, **kw):
+                raise TimeoutError("git timed out")
+
+            proc.communicate = _slow_communicate
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", side_effect=_mock_exec):
+            result = await git_checkpoint(str(tmp_path), "abc", "test")
+
+        assert result is None
+
+    async def test_git_not_installed_returns_none(self, tmp_path):
+        """Missing git binary (containerized agent) must not crash."""
+        _init_git_repo(tmp_path)
+        (tmp_path / "file.py").write_text("x = 1")
+
+        with patch(
+            "asyncio.create_subprocess_exec",
+            side_effect=OSError("No such file or directory: 'git'"),
+        ):
+            result = await git_checkpoint(str(tmp_path), "abc", "implement")
+
+        assert result is None
 
 
 class TestOrchestratorIntegration:

@@ -508,6 +508,10 @@ class TestPluginLifecycle:
     async def test_meta(self, loop_plugin):
         assert loop_plugin.meta.name == "autonomous_loop"
 
+    async def test_start_is_noop(self, loop_plugin):
+        """start() completes without error (no-op by design)."""
+        await loop_plugin.start()
+
     async def test_stop_cancels_tasks(self, loop_plugin):
         async def slow_work():
             await asyncio.sleep(100)
@@ -655,6 +659,26 @@ class TestAutoPR:
 
 class TestGuardClauses:
     """Tests for no-engine and no-state guard clauses."""
+
+    async def test_retry_no_engine_returns_safely(self, mock_connector):
+        """Engine lost between test and retry (daemon restart) — don't crash."""
+        loop = AutonomousLoop(mock_connector, max_retries=2)
+        # engine intentionally not set
+        loop._session_states["chat-1"] = _LoopState(
+            phase="testing",
+            retry_count=0,
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+        )
+
+        await loop._retry(
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+            response_content="FAILED",
+            attempt=0,
+        )
 
     async def test_submit_test_no_engine_returns_safely(self, mock_connector):
         """_submit_test with engine=None must not crash."""
@@ -1031,8 +1055,56 @@ class TestConnectorNonePaths:
         await loop._handle_success("chat-1", state)
         assert "chat-1" not in loop.session_states
 
+    async def test_creating_pr_completion_no_event_bus_no_connector(
+        self,
+        mock_engine,
+    ):
+        """PR completes but event_bus/connector are None — no crash."""
+        loop = AutonomousLoop(None, max_retries=2, auto_pr=True)
+        loop.set_engine(mock_engine)
+        loop._event_bus = None
+        loop._session_states["chat-1"] = _LoopState(
+            phase="creating_pr",
+            retry_count=0,
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+        )
+
+        session = _make_session(mode="auto")
+        event = Event(
+            name=SESSION_COMPLETED,
+            data={
+                "session": session,
+                "chat_id": "chat-1",
+                "response_content": "PR created",
+            },
+        )
+        await loop._on_session_completed(event)
+        assert "chat-1" not in loop.session_states
+
+    async def test_retry_without_tracking_state(self, mock_engine):
+        """Retry for a chat that lost its state (race condition)."""
+        connector = MockConnector()
+        loop = AutonomousLoop(connector, max_retries=2)
+        loop.set_engine(mock_engine)
+        # No state set for chat-1
+
+        with patch(_BACKOFF_TARGET, return_value=0.0):
+            await loop._retry(
+                chat_id="chat-1",
+                session_id="sess-1",
+                user_id="user-1",
+                response_content="FAILED",
+                attempt=0,
+            )
+
+        mock_engine.handle_message.assert_called_once()
+
     async def test_pr_error_no_connector_no_crash(self, mock_engine):
-        mock_engine.handle_message = AsyncMock(side_effect=RuntimeError("gh failed"))
+        mock_engine.handle_message = AsyncMock(
+            side_effect=RuntimeError("gh failed"),
+        )
         loop = AutonomousLoop(None, max_retries=2, auto_pr=True)
         loop.set_engine(mock_engine)
 
@@ -1077,6 +1149,189 @@ class TestEventDataValidation:
 
         event = Event(name=MESSAGE_IN, data={})
         await loop_plugin._on_user_message(event)
+
+
+class TestTestRunnerCompletionFlow:
+    """Event-driven flow: test session completes → loop evaluates results."""
+
+    async def test_test_runner_completion_triggers_evaluation(
+        self, loop_plugin, mock_engine, mock_connector, event_bus, tmp_path
+    ):
+        """After /test finishes (mode=test), the loop evaluates and retries on failure."""
+        config = LeashdConfig(approved_directories=[tmp_path])
+        ctx = PluginContext(event_bus=event_bus, config=config)
+        await loop_plugin.initialize(ctx)
+
+        # Simulate: auto-mode already submitted /test, state is "testing"
+        loop_plugin._session_states["chat-1"] = _LoopState(
+            phase="testing",
+            retry_count=0,
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+        )
+
+        session = _make_session(mode="test")
+        event = Event(
+            name=SESSION_COMPLETED,
+            data={
+                "session": session,
+                "chat_id": "chat-1",
+                "response_content": "FAILED: test_login - AssertionError",
+            },
+        )
+
+        with (
+            patch(
+                _EVAL_TARGET,
+                return_value=PhaseDecision(action="retry", reason="test failures"),
+            ),
+            patch(_BACKOFF_TARGET, return_value=0.0),
+        ):
+            await loop_plugin._on_session_completed(event)
+            await asyncio.sleep(0.05)
+
+        # Should have transitioned to retrying via the event handler
+        mock_engine.handle_message.assert_called_once()
+        state = loop_plugin.session_states.get("chat-1")
+        assert state is not None
+        assert state.phase == "retrying"
+        assert state.retry_count == 1
+
+
+class TestEscalationDeliveryResilience:
+    """Escalation messages are critical — must retry on transient failures."""
+
+    async def test_retries_on_transient_network_failure(
+        self, mock_engine, event_bus, tmp_path
+    ):
+        """Connector fails twice then succeeds — message must be delivered."""
+        call_count = 0
+
+        class FlakeyConnector(MockConnector):
+            async def send_message(self, chat_id, text, buttons=None):
+                nonlocal call_count
+                call_count += 1
+                if call_count <= 2:
+                    raise ConnectionError("Network unreachable")
+                await super().send_message(chat_id, text, buttons)
+
+        connector = FlakeyConnector()
+        loop = AutonomousLoop(connector, max_retries=2)
+        loop.set_engine(mock_engine)
+        config = LeashdConfig(approved_directories=[tmp_path])
+        ctx = PluginContext(event_bus=event_bus, config=config)
+        await loop.initialize(ctx)
+
+        captured = []
+
+        async def handler(event):
+            captured.append(event)
+
+        event_bus.subscribe(SESSION_ESCALATED, handler)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await loop._escalate(
+                chat_id="chat-1",
+                session_id="sess-1",
+                response_content="FAILED: persistent test failures",
+                attempt=2,
+            )
+
+        assert call_count == 3
+        assert len(connector.sent_messages) == 1
+        assert captured[0].data["delivered"] is True
+
+    async def test_marks_undelivered_when_connector_permanently_down(
+        self, mock_engine, event_bus, tmp_path
+    ):
+        """All 3 delivery attempts fail — event must show delivered=False."""
+        connector = MockConnector()
+        connector.send_message = AsyncMock(side_effect=ConnectionError("Network down"))
+        loop = AutonomousLoop(connector, max_retries=2)
+        loop.set_engine(mock_engine)
+        config = LeashdConfig(approved_directories=[tmp_path])
+        ctx = PluginContext(event_bus=event_bus, config=config)
+        await loop.initialize(ctx)
+
+        captured = []
+
+        async def handler(event):
+            captured.append(event)
+
+        event_bus.subscribe(SESSION_ESCALATED, handler)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            await loop._escalate(
+                chat_id="chat-1",
+                session_id="sess-1",
+                response_content="FAILED",
+                attempt=2,
+            )
+
+        assert connector.send_message.call_count == 3
+        assert captured[0].data["delivered"] is False
+
+
+class TestSubmitTestCrashResilience:
+    """Engine crashes during /test must not leave the loop in a stuck state."""
+
+    async def test_engine_crash_clears_state(self, loop_plugin, mock_engine):
+        """CLI segfault during /test — state must be cleaned up."""
+        mock_engine.handle_command = AsyncMock(
+            side_effect=RuntimeError("Segmentation fault")
+        )
+
+        await loop_plugin._submit_test("chat-1", "sess-1", "user-1")
+
+        assert "chat-1" not in loop_plugin.session_states
+
+    async def test_cancellation_propagates(self, loop_plugin, mock_engine):
+        """User /stop during test — CancelledError must re-raise for cleanup."""
+        mock_engine.handle_command = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await loop_plugin._submit_test("chat-1", "sess-1", "user-1")
+
+
+class TestPRCreationLifecycle:
+    """PR creation edge cases — engine loss, user cancellation."""
+
+    async def test_no_engine_cleans_up_state(self, mock_connector):
+        """Engine reference lost after success (daemon restart) — don't crash."""
+        loop = AutonomousLoop(mock_connector, max_retries=2, auto_pr=True)
+        # engine intentionally not set
+
+        state = _LoopState(
+            phase="testing",
+            retry_count=0,
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+        )
+        loop._session_states["chat-1"] = state
+
+        await loop._submit_pr_creation("chat-1", state)
+
+        assert "chat-1" not in loop.session_states
+
+    async def test_cancelled_by_user_propagates(self, mock_connector, mock_engine):
+        """User sends /cancel during PR creation — must propagate."""
+        mock_engine.handle_message = AsyncMock(side_effect=asyncio.CancelledError())
+        loop = AutonomousLoop(mock_connector, max_retries=2, auto_pr=True)
+        loop.set_engine(mock_engine)
+
+        state = _LoopState(
+            phase="creating_pr",
+            retry_count=0,
+            chat_id="chat-1",
+            session_id="sess-1",
+            user_id="user-1",
+        )
+        loop._session_states["chat-1"] = state
+
+        with pytest.raises(asyncio.CancelledError):
+            await loop._submit_pr_creation("chat-1", state)
 
 
 class TestBackoffEdgeCases:

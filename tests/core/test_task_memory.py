@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from leashd.core import task_memory
 
 
@@ -35,6 +37,12 @@ class TestPathAndExists:
         p = task_memory.path("abc", str(tmp_path))
         assert p.name == "abc.md"
         assert ".leashd/tasks" in str(p)
+
+    def test_path_rejects_path_traversal_in_run_id(self, tmp_path):
+        """Run IDs with path separators or '..' could escape .leashd/tasks/."""
+        for bad_id in ["../../../etc/passwd", "foo/bar", "foo\\bar", "a..b"]:
+            with pytest.raises(ValueError, match="Invalid run_id"):
+                task_memory.path(bad_id, str(tmp_path))
 
     def test_exists_false_before_seed(self, tmp_path):
         assert not task_memory.exists("nope", str(tmp_path))
@@ -71,6 +79,37 @@ class TestRead:
         # Truncation marker present
         assert "[...middle truncated...]" in result
 
+    def test_returns_none_when_file_unreadable(self, tmp_path):
+        """File permissions lost mid-task (NFS mount drop, chmod by agent)."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        fp.chmod(0o000)
+        try:
+            result = task_memory.read("r1", str(tmp_path))
+            assert result is None
+        finally:
+            fp.chmod(0o644)
+
+    def test_read_truncation_snaps_to_newline_when_no_progress_boundary(self, tmp_path):
+        """Large Assessment pushes Progress deep — head must snap to newline."""
+        task_memory.seed("r1", "implement feature", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        # Replace assessment with a large block so Progress starts beyond head_budget
+        big_assessment = "Assessment line\n" * 100  # ~1600 chars
+        content = content.replace(
+            "(pending — the orchestrator will assess complexity on the first action)",
+            big_assessment,
+        )
+        fp.write_text(content, encoding="utf-8")
+
+        result = task_memory.read("r1", str(tmp_path), max_chars=800)
+        assert result is not None
+        assert "[...middle truncated...]" in result
+        head_part = result.split("[...middle truncated...]")[0]
+        # Head should end at a newline boundary (not mid-line)
+        assert head_part.rstrip().endswith("\n") or head_part.endswith("\n")
+
     def test_head_preserves_plan_section(self, tmp_path):
         task_memory.seed("r1", "implement feature", str(tmp_path))
         fp = task_memory.path("r1", str(tmp_path))
@@ -91,12 +130,36 @@ class TestGetCheckpoint:
     def test_returns_empty_dict_if_missing(self, tmp_path):
         assert task_memory.get_checkpoint("missing", str(tmp_path)) == {}
 
+    def test_returns_empty_dict_when_checkpoint_heading_removed(self, tmp_path):
+        """File exists but agent removed the ## Checkpoint heading entirely."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        content = content.replace("## Checkpoint", "## Removed")
+        fp.write_text(content, encoding="utf-8")
+        cp = task_memory.get_checkpoint("r1", str(tmp_path))
+        assert cp == {}
+
     def test_parses_default_checkpoint(self, tmp_path):
         task_memory.seed("r1", "task", str(tmp_path))
         cp = task_memory.get_checkpoint("r1", str(tmp_path))
         assert cp["next"] == "pending"
         assert cp["retries"] == "0"
         assert cp["blocked"] == "none"
+
+    def test_empty_checkpoint_body_returns_empty_dict(self, tmp_path):
+        """Agent cleared checkpoint content but left the heading — don't crash."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        # Replace the checkpoint line with only blank lines
+        content = content.replace(
+            "Next: pending | Retries: 0 | Blocked: none",
+            "\n\n",
+        )
+        fp.write_text(content, encoding="utf-8")
+        cp = task_memory.get_checkpoint("r1", str(tmp_path))
+        assert cp == {}
 
     def test_parses_custom_checkpoint(self, tmp_path):
         task_memory.seed("r1", "task", str(tmp_path))
@@ -146,6 +209,19 @@ class TestAppendProgressRow:
         assert content is not None
         assert "..." in content
 
+    def test_returns_false_when_file_unreadable(self, tmp_path):
+        """File exists but becomes unreadable mid-task (permissions, NFS mount lost)."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        fp.chmod(0o000)
+        try:
+            ok = task_memory.append_progress_row(
+                "r1", str(tmp_path), action="test", result="ok", elapsed="5s"
+            )
+            assert ok is False
+        finally:
+            fp.chmod(0o644)
+
     def test_returns_false_for_missing_file(self, tmp_path):
         ok = task_memory.append_progress_row(
             "missing", str(tmp_path), action="test", result="ok", elapsed="1s"
@@ -161,6 +237,41 @@ class TestAppendProgressRow:
         assert content is not None
         assert "## Changes" in content
         assert "## Checkpoint" in content
+
+    def test_returns_false_when_progress_section_missing(self, tmp_path):
+        """Agent accidentally removed the ## Progress heading — must not crash."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        content = content.replace("## Progress", "## ProgressDeleted")
+        fp.write_text(content, encoding="utf-8")
+        ok = task_memory.append_progress_row(
+            "r1", str(tmp_path), action="test", result="ok", elapsed="5s"
+        )
+        assert ok is False
+
+    def test_appends_when_progress_is_last_section(self, tmp_path):
+        """Agent deleted all sections after Progress — row inserts at end of file."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        # Remove everything after the Progress table header
+        progress_idx = content.find("## Progress")
+        table_end = content.find("\n\n## ", progress_idx + 1)
+        if table_end != -1:
+            content = content[:table_end] + "\n"
+        fp.write_text(content, encoding="utf-8")
+
+        ok = task_memory.append_progress_row(
+            "r1",
+            str(tmp_path),
+            action="explore",
+            result="mapped codebase",
+            elapsed="15s",
+        )
+        assert ok is True
+        result = fp.read_text(encoding="utf-8")
+        assert "| 1 | explore | mapped codebase | 15s |" in result
 
     def test_does_not_duplicate_with_agent_rows(self, tmp_path):
         """Orchestrator rows coexist with rows the agent wrote."""
@@ -214,6 +325,46 @@ class TestUpdateCheckpoint:
     def test_returns_false_for_missing_file(self, tmp_path):
         ok = task_memory.update_checkpoint("missing", str(tmp_path), next_phase="test")
         assert ok is False
+
+    def test_returns_false_when_file_unreadable(self, tmp_path):
+        """Permissions lost on the memory file during task execution."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        fp.chmod(0o000)
+        try:
+            ok = task_memory.update_checkpoint("r1", str(tmp_path), next_phase="test")
+            assert ok is False
+        finally:
+            fp.chmod(0o644)
+
+    def test_returns_false_when_checkpoint_section_missing(self, tmp_path):
+        """Corrupted file without ## Checkpoint heading — orchestrator must know."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        content = content.replace("## Checkpoint", "## Deleted")
+        fp.write_text(content, encoding="utf-8")
+        ok = task_memory.update_checkpoint("r1", str(tmp_path), next_phase="test")
+        assert ok is False
+
+    def test_inserts_line_when_checkpoint_body_is_empty(self, tmp_path):
+        """Empty section body — insert new checkpoint instead of silently skipping."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        # Make the checkpoint section empty (heading with only whitespace after)
+        content = content.replace(
+            "Next: pending | Retries: 0 | Blocked: none",
+            "   \n   ",
+        )
+        fp.write_text(content, encoding="utf-8")
+        ok = task_memory.update_checkpoint(
+            "r1", str(tmp_path), next_phase="implement", retries=1
+        )
+        assert ok is True
+        cp = task_memory.get_checkpoint("r1", str(tmp_path))
+        assert cp["next"] == "implement"
+        assert cp["retries"] == "1"
 
     def test_preserves_blocked_field(self, tmp_path):
         task_memory.seed("r1", "task", str(tmp_path))
