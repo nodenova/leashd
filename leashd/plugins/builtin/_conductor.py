@@ -62,16 +62,18 @@ Complexity levels (assess on first call only):
 - CRITICAL: Security fix, data migration, breaking change
 
 Typical flows (guidelines, not rules):
-- TRIVIAL: implement → complete
-- SIMPLE: plan → implement → test → complete
-- MODERATE: plan → implement → test → review → complete
+- TRIVIAL: implement → test → complete
+- SIMPLE: plan → implement → test → verify → complete
+- MODERATE: plan → implement → test → verify → review → complete
 - COMPLEX: explore → plan → implement → test → verify → fix → review → pr → complete
 
 Rules:
 - TEST is mandatory before COMPLETE for any task that modifies code (only TRIVIAL \
 config tweaks or queries may skip it)
-- VERIFY (browser) is for visual/UI smoke checks that TEST did not cover. Skip if \
-TEST output already shows browser/E2E tests passed (Playwright, screenshots, etc.).
+- VERIFY (browser) is MANDATORY after TEST for any task that modifies code. \
+Use agent-browser to smoke-check the running application end-to-end. \
+Never skip VERIFY — even if unit/integration tests pass, browser verification \
+catches rendering bugs, broken routes, and UX regressions that automated tests miss.
 - Always REVIEW before COMPLETE on non-trivial tasks
 - If tests/verification failed 3+ times for the same reason → ESCALATE
 - If the memory file shows prior work, continue from the checkpoint — don't restart

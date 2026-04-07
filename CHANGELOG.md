@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.13.2] - 2026-04-07
+
+- **fixed**: Disable tools (`--tools ""`) in conductor CLI evaluator to prevent Claude CLI from consuming the single allowed turn on tool use, which caused "AI orchestrator temporarily unavailable" fallback
+- **changed**: Browser verification (agent-browser) is now mandatory for every `/task` that modifies code — conductor can no longer skip the VERIFY phase
+
 ## [0.13.1] - 2026-04-07
 - **fixed**: Conductor response parser now handles nested braces in instruction fields (e.g., JSX/dict literals) and catches `ACTION: reason` lines even when preceded by LLM preamble text
 - **changed**: VERIFY action description updated to include Docker build/start and agent-browser verification

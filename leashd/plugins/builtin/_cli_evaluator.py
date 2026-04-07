@@ -41,7 +41,17 @@ async def evaluate_via_cli(
 ) -> str:
     """Run a one-shot evaluation via ``claude -p``."""
     prompt = f"{system_prompt}\n\n{user_message}"
-    cmd = ["claude", "-p", prompt, "--output-format", "text", "--max-turns", "1"]
+    cmd = [
+        "claude",
+        "-p",
+        prompt,
+        "--output-format",
+        "text",
+        "--max-turns",
+        "1",
+        "--tools",
+        "",
+    ]
     if model:
         cmd.extend(["--model", model])
     proc = await asyncio.create_subprocess_exec(
