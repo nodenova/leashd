@@ -231,7 +231,7 @@ def build_test_instruction(
     *,
     project_config: ProjectTestConfig | None = None,
     api_specs: list[tuple[str, str]] | None = None,
-    browser_backend: str = "playwright",
+    browser_backend: str = "agent-browser",
 ) -> str:
     """Generate a multi-phase system prompt based on test config."""
     sections: list[str] = []

@@ -747,8 +747,12 @@ class TestAgenticE2EInstructions:
         instruction = build_test_instruction(TestConfig())
         assert "You ARE the test executor" in instruction
 
-    def test_browser_tools_mentioned(self):
+    def test_browser_tools_mentioned_agent_browser(self):
         instruction = build_test_instruction(TestConfig())
+        assert "agent-browser" in instruction
+
+    def test_browser_tools_mentioned_playwright(self):
+        instruction = build_test_instruction(TestConfig(), browser_backend="playwright")
         for tool in (
             "browser_snapshot",
             "browser_navigate",
@@ -782,9 +786,12 @@ class TestAgenticE2EInstructions:
     def test_rules_include_agentic_guidance(self):
         instruction = build_test_instruction(TestConfig())
         assert "you ARE the test executor" in instruction
-        assert "browser_snapshot before AND after" in instruction
         assert "PASS/FAIL/SKIP" in instruction
         assert "retry the flow once" in instruction
+
+    def test_rules_include_playwright_guidance(self):
+        instruction = build_test_instruction(TestConfig(), browser_backend="playwright")
+        assert "browser_snapshot before AND after" in instruction
 
     def test_rules_forbid_npx_playwright_test(self):
         instruction = build_test_instruction(TestConfig())
@@ -797,6 +804,10 @@ class TestAgenticE2EInstructions:
 
     def test_preamble_declares_browser_tools(self):
         instruction = build_test_instruction(TestConfig())
+        assert "agent-browser CLI" in instruction
+
+    def test_preamble_declares_playwright_tools(self):
+        instruction = build_test_instruction(TestConfig(), browser_backend="playwright")
         assert "browser MCP tools available" in instruction
         assert "pre-configured and ready to use" in instruction
 
@@ -1118,8 +1129,12 @@ class TestAllPhasesDisabledReset:
 
 
 class TestBuildTestInstructionBackend:
-    def test_default_playwright_mentions_mcp(self):
+    def test_default_agent_browser_mentions_cli(self):
         instruction = build_test_instruction(TestConfig())
+        assert "agent-browser CLI" in instruction
+
+    def test_playwright_mentions_mcp(self):
+        instruction = build_test_instruction(TestConfig(), browser_backend="playwright")
         assert "browser MCP tools" in instruction
 
     def test_agent_browser_mentions_cli(self):

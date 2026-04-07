@@ -77,7 +77,7 @@ class WebCheckpoint(BaseModel):
     session_id: str
     recipe_name: str | None = None
     platform: str = ""
-    browser_backend: str = "playwright"
+    browser_backend: str = "agent-browser"
     auth_status: str = "unknown"
     auth_user: str | None = None
     current_url: str | None = None

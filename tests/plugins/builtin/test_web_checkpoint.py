@@ -288,7 +288,7 @@ class TestCheckpointModels:
     def test_checkpoint_defaults(self):
         cp = _make_checkpoint()
         assert cp.platform == ""
-        assert cp.browser_backend == "playwright"
+        assert cp.browser_backend == "agent-browser"
         assert cp.auth_status == "unknown"
         assert cp.posts_scanned == []
         assert cp.progress_summary == ""

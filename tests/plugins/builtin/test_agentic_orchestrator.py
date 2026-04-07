@@ -408,14 +408,13 @@ class TestVerifySuffix:
 
 
 class TestBuildActionPromptBrowserBackend:
-    def test_verify_uses_playwright_by_default(self):
+    def test_verify_uses_agent_browser_by_default(self):
         task = _make_task()
         decision = ConductorDecision(
             action="verify", reason="check UI", instruction="verify the form"
         )
         prompt = _build_action_prompt(task, decision, None)
-        assert "browser_navigate" in prompt
-        assert "agent-browser" not in prompt
+        assert "agent-browser" in prompt
 
     def test_verify_uses_agent_browser_when_specified(self):
         task = _make_task()
@@ -475,7 +474,7 @@ class TestActionSuffixContent:
 class TestAgenticOrchestratorConfigReload:
     async def test_initialize_captures_browser_backend(self, tmp_path):
         orch = AgenticOrchestrator(db_path=str(tmp_path / "test.db"))
-        assert orch._browser_backend == "playwright"  # default
+        assert orch._browser_backend == "agent-browser"  # default
 
         event_bus = EventBus()
         ctx = MagicMock()

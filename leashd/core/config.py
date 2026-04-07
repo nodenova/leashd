@@ -114,9 +114,9 @@ class LeashdConfig(BaseSettings):
     default_mode: Literal["default", "plan", "auto"] = "default"
 
     # Browser
-    browser_backend: Literal["playwright", "agent-browser"] = "playwright"
+    browser_backend: Literal["playwright", "agent-browser"] = "agent-browser"
     browser_user_data_dir: str | None = None
-    browser_headless: bool = False
+    browser_headless: bool = True
 
     # Autonomous mode
     auto_approver: bool = False
@@ -137,6 +137,8 @@ class LeashdConfig(BaseSettings):
     task_conductor_model: str | None = None
     task_conductor_timeout: float = 45.0
     task_memory_max_chars: int = 8000
+    task_profile: str = "standalone"
+    task_conductor_instructions: str = ""
 
     # Streaming
     streaming_enabled: bool = True

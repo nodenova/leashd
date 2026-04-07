@@ -175,14 +175,22 @@ class TestBuildEngine:
         rule_names = [r.name for r in engine.policy_engine.rules]
         assert "credential-files" in rule_names
 
-    def test_default_mcp_servers_loaded(self, tmp_path):
+    def test_default_mcp_servers_no_playwright(self, tmp_path):
         config = LeashdConfig(approved_directories=[tmp_path])
+        _patched_build_engine(config=config)
+        assert "playwright" not in config.mcp_servers
+
+    def test_playwright_mcp_servers_loaded(self, tmp_path):
+        config = LeashdConfig(
+            approved_directories=[tmp_path], browser_backend="playwright"
+        )
         _patched_build_engine(config=config)
         assert "playwright" in config.mcp_servers
 
     def test_headless_baked_into_mcp_at_startup(self, tmp_path):
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_headless=True,
         )
         _patched_build_engine(config=config)
@@ -191,6 +199,7 @@ class TestBuildEngine:
     def test_headless_false_strips_from_mcp(self, tmp_path):
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_headless=False,
             mcp_servers={
                 "playwright": {
@@ -205,6 +214,7 @@ class TestBuildEngine:
     def test_headless_no_duplicates(self, tmp_path):
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_headless=True,
             mcp_servers={
                 "playwright": {

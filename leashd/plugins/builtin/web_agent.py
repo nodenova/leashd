@@ -225,7 +225,7 @@ def build_web_instruction(
     recipe: WebRecipe | None,
     playbook: Playbook | None = None,
     *,
-    browser_backend: str = "playwright",
+    browser_backend: str = "agent-browser",
     resume: bool = False,
 ) -> str:
     """Generate the system prompt for web automation."""

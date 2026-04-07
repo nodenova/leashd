@@ -333,7 +333,7 @@ class TestClaudeCodeAgent:
             working_directory=str(tmp_path),
         )
         opts = agent._build_options(session, can_use_tool=None)
-        assert opts.disallowed_tools == ["Bash"]
+        assert "Bash" in opts.disallowed_tools
 
     def test_no_resume_without_agent_resume_token(self, agent, session):
         session.agent_resume_token = None
@@ -567,7 +567,6 @@ class TestClaudeCodeAgent:
         agent._build_options(session, can_use_tool=None)
         captured = capsys.readouterr()
         assert "agent_mcp_servers" in captured.out
-        assert "playwright" in captured.out
         assert "custom-tool" in captured.out
 
     def test_build_options_web_mode_injects_user_data_dir(self, tmp_path):
@@ -585,6 +584,7 @@ class TestClaudeCodeAgent:
         )
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_user_data_dir="~/browser-profile",
         )
         agent = ClaudeCodeAgent(config)
@@ -616,6 +616,7 @@ class TestClaudeCodeAgent:
         )
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_user_data_dir="~/browser-profile",
         )
         agent = ClaudeCodeAgent(config)
@@ -645,6 +646,7 @@ class TestClaudeCodeAgent:
         )
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_user_data_dir="~/browser-profile",
         )
         agent = ClaudeCodeAgent(config)
@@ -673,6 +675,7 @@ class TestClaudeCodeAgent:
         )
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_user_data_dir="~/browser-profile",
         )
         agent = ClaudeCodeAgent(config)
@@ -701,7 +704,10 @@ class TestClaudeCodeAgent:
                 }
             )
         )
-        config = LeashdConfig(approved_directories=[tmp_path])
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            browser_backend="playwright",
+        )
         agent = ClaudeCodeAgent(config)
         session = Session(
             session_id="s1",
@@ -779,7 +785,10 @@ class TestClaudeCodeAgent:
                 }
             )
         )
-        config = LeashdConfig(approved_directories=[tmp_path])
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            browser_backend="playwright",
+        )
         agent = ClaudeCodeAgent(config)
 
         for mode in ("default", "web", "test", "plan", "auto"):
@@ -819,6 +828,7 @@ class TestClaudeCodeAgent:
         """Headless is baked into config.mcp_servers at startup, not injected at runtime."""
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_headless=True,
             mcp_servers={
                 "playwright": {
@@ -854,6 +864,7 @@ class TestClaudeCodeAgent:
         )
         config = LeashdConfig(
             approved_directories=[tmp_path],
+            browser_backend="playwright",
             browser_headless=True,
         )
         agent = ClaudeCodeAgent(config)

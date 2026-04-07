@@ -755,23 +755,23 @@ class TestGatekeeperNegativeAutoApproval:
             },
         )
         await event_bus.emit(event)
-        assert session.browser_backend == "playwright"
+        assert session.browser_backend == "agent-browser"
 
     async def test_config_reload_updates_backend(self, config, event_bus):
         plugin = WebAgentPlugin()
         ctx = PluginContext(event_bus=event_bus, config=config)
         await plugin.initialize(ctx)
-        assert plugin._browser_backend == "playwright"
+        assert plugin._browser_backend == "agent-browser"
 
         from leashd.core.events import CONFIG_RELOADED
 
         await event_bus.emit(
             Event(
                 name=CONFIG_RELOADED,
-                data={"browser_backend": "agent-browser"},
+                data={"browser_backend": "playwright"},
             )
         )
-        assert plugin._browser_backend == "agent-browser"
+        assert plugin._browser_backend == "playwright"
 
     async def test_config_reload_noop_for_same_backend(self, config, event_bus):
         plugin = WebAgentPlugin()
@@ -1030,7 +1030,8 @@ class TestDomExplorationRules:
         )
         config = WebConfig(recipe_name="linkedin_comment")
         instruction = build_web_instruction(config, LINKEDIN_COMMENTING, playbook)
-        assert "Do NOT use browser_evaluate to explore DOM structure" in instruction
+        assert "Do NOT use" in instruction
+        assert "to explore DOM structure" in instruction
         assert "Max 2 retries per script" in instruction
 
     def test_no_dom_prohibition_without_scripts(self):
@@ -1158,20 +1159,17 @@ class TestPluginLoadsPlaybook:
 
 
 class TestBuildWebInstructionBackend:
-    def test_default_playwright_mentions_mcp(self):
+    def test_default_agent_browser_mentions_cli(self):
         config = WebConfig()
         instruction = build_web_instruction(config, None)
-        assert "browser MCP tools" in instruction
-        assert "Playwright MCP" in instruction
-
-    def test_agent_browser_mentions_cli(self):
-        config = WebConfig()
-        instruction = build_web_instruction(
-            config, None, browser_backend="agent-browser"
-        )
         assert "agent-browser CLI" in instruction
         assert "agent-browser open" in instruction
-        assert "Playwright MCP" not in instruction
+
+    def test_playwright_mentions_mcp(self):
+        config = WebConfig()
+        instruction = build_web_instruction(config, None, browser_backend="playwright")
+        assert "browser MCP tools" in instruction
+        assert "Playwright MCP" in instruction
 
     def test_agent_browser_includes_close_instruction(self):
         config = WebConfig()

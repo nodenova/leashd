@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from leashd.plugins.builtin._conductor import (
     ConductorDecision,
+    _build_system_prompt,
     _parse_response,
     decide_next_action,
 )
@@ -200,3 +201,121 @@ class TestConductorDecisionModel:
         assert d.reason == ""
         assert d.instruction == ""
         assert d.complexity is None
+
+
+class TestBuildSystemPrompt:
+    def test_default_includes_all_actions(self):
+        prompt = _build_system_prompt()
+        assert "EXPLORE" in prompt
+        assert "VERIFY" in prompt
+        assert "PR" in prompt
+
+    def test_filtered_actions_excludes_disabled(self):
+        prompt = _build_system_prompt(
+            enabled_actions=frozenset(
+                {"plan", "implement", "test", "complete", "escalate"}
+            )
+        )
+        # Available actions section should list PLAN but not EXPLORE as an action
+        actions_section = prompt.split("Available actions:")[1].split("Complexity")[0]
+        assert "- PLAN:" in actions_section
+        assert "- IMPLEMENT:" in actions_section
+        assert "- EXPLORE:" not in actions_section
+        # EXPLORE should be in the FORBIDDEN list
+        assert "FORBIDDEN" in prompt
+
+    def test_extra_instructions_appended(self):
+        prompt = _build_system_prompt(extra_instructions="Always write tests first.")
+        assert "Always write tests first." in prompt
+
+    def test_docker_compose_hint(self):
+        prompt = _build_system_prompt(docker_compose_available=True)
+        assert "docker-compose" in prompt.lower() or "docker compose" in prompt.lower()
+
+    def test_complete_and_escalate_always_included(self):
+        prompt = _build_system_prompt(enabled_actions=frozenset({"implement"}))
+        assert "COMPLETE" in prompt
+        assert "ESCALATE" in prompt
+
+    def test_combined_options(self):
+        prompt = _build_system_prompt(
+            enabled_actions=frozenset(
+                {"plan", "implement", "test", "complete", "escalate"}
+            ),
+            extra_instructions="Platform mode active.",
+            docker_compose_available=True,
+        )
+        assert "Platform mode active." in prompt
+        assert "docker" in prompt.lower()
+        assert "FORBIDDEN" in prompt
+
+
+class TestDecideNextActionWithProfile:
+    async def test_passes_enabled_actions_to_prompt(self):
+        captured_system = {}
+
+        async def mock_eval(system: str, user: str, **kw):
+            captured_system["prompt"] = system
+            return '{"action": "plan", "reason": "start", "instruction": "go"}'
+
+        with patch(
+            "leashd.plugins.builtin._conductor.evaluate_via_cli",
+            new_callable=AsyncMock,
+            side_effect=mock_eval,
+        ):
+            result = await decide_next_action(
+                task_description="test",
+                memory_content=None,
+                last_output="",
+                current_phase="pending",
+                is_first_call=True,
+                enabled_actions=frozenset(
+                    {"plan", "implement", "test", "complete", "escalate"}
+                ),
+            )
+            assert result.action == "plan"
+            # EXPLORE should not be in the available actions section
+            prompt = captured_system["prompt"]
+            assert "FORBIDDEN" in prompt
+
+    async def test_extra_instructions_in_prompt(self):
+        captured_system = {}
+
+        async def mock_eval(system: str, user: str, **kw):
+            captured_system["prompt"] = system
+            return '{"action": "implement", "reason": "go", "instruction": "code"}'
+
+        with patch(
+            "leashd.plugins.builtin._conductor.evaluate_via_cli",
+            new_callable=AsyncMock,
+            side_effect=mock_eval,
+        ):
+            await decide_next_action(
+                task_description="test",
+                memory_content=None,
+                last_output="",
+                current_phase="pending",
+                extra_instructions="Skip verification.",
+            )
+            assert "Skip verification." in captured_system["prompt"]
+
+    async def test_docker_compose_in_prompt(self):
+        captured_system = {}
+
+        async def mock_eval(system: str, user: str, **kw):
+            captured_system["prompt"] = system
+            return '{"action": "test", "reason": "run", "instruction": "test"}'
+
+        with patch(
+            "leashd.plugins.builtin._conductor.evaluate_via_cli",
+            new_callable=AsyncMock,
+            side_effect=mock_eval,
+        ):
+            await decide_next_action(
+                task_description="test",
+                memory_content=None,
+                last_output="",
+                current_phase="implement",
+                docker_compose_available=True,
+            )
+            assert "docker compose" in captured_system["prompt"].lower()

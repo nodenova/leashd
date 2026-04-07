@@ -46,25 +46,13 @@ class ConductorDecision(BaseModel):
     complexity: ConductorComplexity | None = None
 
 
-_CONDUCTOR_SYSTEM_PROMPT = """\
+_CONDUCTOR_SYSTEM_PROMPT_TEMPLATE = """\
 You are the orchestrator for an autonomous coding agent. You receive the task \
 description, the agent's working memory file, and the output of the last action. \
 Your job is to decide the SINGLE NEXT ACTION the coding agent should take.
 
 Available actions:
-- EXPLORE: Read codebase to understand architecture, conventions, and context.
-- PLAN: Create a detailed implementation plan for complex changes.
-- IMPLEMENT: Write code changes following the plan or task description.
-- TEST: Run automated test suites (pytest, jest, vitest, etc.).
-- VERIFY: Browser-based verification — start dev server, navigate to pages/endpoints, \
-confirm UI renders correctly or API responds as expected. Use for FE/BE work. \
-The coding agent has pre-configured browser tools (Playwright MCP or agent-browser CLI) \
-for this action.
-- FIX: Fix specific issues found in testing or verification.
-- REVIEW: Self-review all changes via git diff. Read-only — no modifications.
-- PR: Create a pull request (branch, commit, push, gh pr create).
-- COMPLETE: Task is fully done and verified.
-- ESCALATE: Human intervention needed — stuck, ambiguous, or beyond agent capability.
+{available_actions}
 
 Complexity levels (assess on first call only):
 - TRIVIAL: Single-line fix, simple query, config tweak
@@ -75,31 +63,88 @@ Complexity levels (assess on first call only):
 
 Typical flows (guidelines, not rules):
 - TRIVIAL: implement → complete
-- SIMPLE: explore → implement → test → complete
-- MODERATE: explore → plan → implement → test → verify → review → complete
+- SIMPLE: plan → implement → test → complete
+- MODERATE: plan → implement → test → review → complete
 - COMPLEX: explore → plan → implement → test → verify → fix → review → pr → complete
 
 Rules:
 - TEST is mandatory before COMPLETE for any task that modifies code (only TRIVIAL \
 config tweaks or queries may skip it)
-- VERIFY (browser) is mandatory for any task involving UI components, CSS/styling, \
-web endpoints, API changes, or frontend work — run the dev server and visually confirm \
-the result. TEST alone is not sufficient for visual changes.
+- VERIFY (browser) is for visual/UI smoke checks that TEST did not cover. Skip if \
+TEST output already shows browser/E2E tests passed (Playwright, screenshots, etc.).
 - Always REVIEW before COMPLETE on non-trivial tasks
 - If tests/verification failed 3+ times for the same reason → ESCALATE
 - If the memory file shows prior work, continue from the checkpoint — don't restart
-- Skip EXPLORE if the task is self-contained and trivial
+- Skip EXPLORE when PLAN can gather the context — PLAN already reads CLAUDE.md and \
+project files. Only use EXPLORE for COMPLEX/CRITICAL tasks or when the codebase \
+structure is truly unknown.
 - Skip PLAN if the task is simple enough to implement directly
 - When uncertain whether to retry or escalate, check the retry count
 - Never go directly from IMPLEMENT to COMPLETE — always TEST first
-
+{extra_rules}
 Respond with EXACTLY one JSON object (no markdown fences, no extra text):
-{"action": "<ACTION>", "reason": "<one-line why>", "instruction": "<specific guidance \
-for the coding agent>"}
+{{"action": "<ACTION>", "reason": "<one-line why>", "instruction": "<specific guidance \
+for the coding agent>"}}
 
 On the FIRST call (when complexity has not been assessed yet), also include:
-{"action": "...", "reason": "...", "instruction": "...", "complexity": "<LEVEL>"}\
+{{"action": "...", "reason": "...", "instruction": "...", "complexity": "<LEVEL>"}}\
 """
+
+_ACTION_DESCRIPTIONS: dict[str, str] = {
+    "explore": "EXPLORE: Read codebase to understand architecture, conventions, and context.",
+    "plan": "PLAN: Create a detailed implementation plan for complex changes.",
+    "implement": "IMPLEMENT: Write code changes following the plan or task description.",
+    "test": "TEST: Run automated test suites (pytest, jest, vitest, etc.).",
+    "verify": (
+        "VERIFY: Browser-based verification — start dev server, navigate to "
+        "pages/endpoints, confirm UI renders correctly or API responds as expected."
+    ),
+    "fix": "FIX: Fix specific issues found in testing or verification.",
+    "review": "REVIEW: Self-review all changes via git diff. Read-only — no modifications.",
+    "pr": "PR: Create a pull request (branch, commit, push, gh pr create).",
+    "complete": "COMPLETE: Task is fully done and verified.",
+    "escalate": "ESCALATE: Human intervention needed — stuck, ambiguous, or beyond agent capability.",
+}
+
+
+def _build_system_prompt(
+    *,
+    enabled_actions: frozenset[str] | None = None,
+    extra_instructions: str = "",
+    docker_compose_available: bool = False,
+) -> str:
+    """Build the conductor system prompt, filtered by enabled actions."""
+    if enabled_actions is None:
+        enabled_actions = _VALID_ACTIONS
+
+    # Always include complete and escalate
+    actions = enabled_actions | {"complete", "escalate"}
+
+    action_lines = "\n".join(
+        f"- {_ACTION_DESCRIPTIONS[a]}" for a in _ACTION_DESCRIPTIONS if a in actions
+    )
+
+    extra_rules = ""
+    disabled = _VALID_ACTIONS - actions
+    if disabled:
+        extra_rules += (
+            f"\n- FORBIDDEN actions (never choose these): "
+            f"{', '.join(sorted(disabled)).upper()}\n"
+        )
+    if docker_compose_available:
+        extra_rules += (
+            "\n- DOCKER: This project has docker-compose.yml. During TEST, use "
+            "`docker compose up --build` to verify the full service stack builds "
+            "and starts correctly.\n"
+        )
+    if extra_instructions:
+        extra_rules += f"\n{extra_instructions}\n"
+
+    return _CONDUCTOR_SYSTEM_PROMPT_TEMPLATE.format(
+        available_actions=action_lines,
+        extra_rules=extra_rules,
+    )
+
 
 _FIRST_CALL_ADDENDUM = """
 This is a NEW task — no prior work has been done. Assess its complexity and \
@@ -195,6 +240,9 @@ async def decide_next_action(
     is_first_call: bool = False,
     model: str | None = None,
     timeout: float = 45.0,
+    enabled_actions: frozenset[str] | None = None,
+    extra_instructions: str = "",
+    docker_compose_available: bool = False,
 ) -> ConductorDecision:
     """Ask the conductor what the coding agent should do next.
 
@@ -210,9 +258,15 @@ async def decide_next_action(
         is_first_call=is_first_call,
     )
 
+    system_prompt = _build_system_prompt(
+        enabled_actions=enabled_actions,
+        extra_instructions=extra_instructions,
+        docker_compose_available=docker_compose_available,
+    )
+
     try:
         raw = await evaluate_via_cli(
-            _CONDUCTOR_SYSTEM_PROMPT,
+            system_prompt,
             context,
             model=model,
             timeout=timeout,

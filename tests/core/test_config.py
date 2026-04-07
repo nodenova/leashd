@@ -367,15 +367,15 @@ class TestEffortConfig:
 
 
 class TestBrowserBackendConfig:
-    def test_default_playwright(self, tmp_path):
+    def test_default_agent_browser(self, tmp_path):
         config = LeashdConfig(approved_directories=[tmp_path])
-        assert config.browser_backend == "playwright"
-
-    def test_agent_browser(self, tmp_path):
-        config = LeashdConfig(
-            approved_directories=[tmp_path], browser_backend="agent-browser"
-        )
         assert config.browser_backend == "agent-browser"
+
+    def test_playwright(self, tmp_path):
+        config = LeashdConfig(
+            approved_directories=[tmp_path], browser_backend="playwright"
+        )
+        assert config.browser_backend == "playwright"
 
     def test_invalid_backend_rejected(self, tmp_path):
         with pytest.raises(ValidationError):

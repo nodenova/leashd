@@ -207,7 +207,7 @@ def format_playbook_instruction(
     playbook: Playbook,
     topic: str | None = None,
     *,
-    browser_backend: str = "playwright",
+    browser_backend: str = "agent-browser",
 ) -> str:
     """Convert a Playbook into a system prompt section."""
     lines: list[str] = [f"NAVIGATION GUIDE ({playbook.platform}):"]

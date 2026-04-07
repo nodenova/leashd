@@ -57,6 +57,7 @@ from leashd.core.events import (
 )
 from leashd.core.queue import KeyedAsyncQueue
 from leashd.core.task import TaskOutcome, TaskRun, TaskStore
+from leashd.core.task_profile import TaskProfile
 from leashd.plugins.base import LeashdPlugin, PluginMeta
 from leashd.plugins.builtin._conductor import ConductorDecision, decide_next_action
 from leashd.plugins.builtin.browser_tools import (
@@ -261,7 +262,8 @@ def _build_action_prompt(
     task: TaskRun,
     decision: ConductorDecision,
     memory_content: str | None,
-    browser_backend: str = "playwright",
+    browser_backend: str = "agent-browser",
+    profile: TaskProfile | None = None,
 ) -> str:
     """Build the prompt sent to the coding agent for a given action."""
     lines = [
@@ -306,6 +308,11 @@ def _build_action_prompt(
         suffix = _ACTION_SUFFIXES.get(decision.action, "Continue the task.")
     lines.append(suffix)
 
+    # Merge profile-specific action instructions
+    if profile and decision.action in profile.action_instructions:
+        lines.append("")
+        lines.append(profile.action_instructions[decision.action])
+
     # Include checkpoint history for context
     checkpoints = [
         (k.replace("_checkpoint", ""), v)
@@ -346,7 +353,10 @@ class AgenticOrchestrator(LeashdPlugin):
         conductor_model: str | None = None,
         conductor_timeout: float = 45.0,
         memory_max_chars: int = 8000,
+        profile: TaskProfile | None = None,
     ) -> None:
+        from leashd.core.task_profile import STANDALONE
+
         self._store = task_store
         self._db_path = db_path
         self._db: aiosqlite.Connection | None = None
@@ -357,7 +367,9 @@ class AgenticOrchestrator(LeashdPlugin):
         self._conductor_model = conductor_model
         self._conductor_timeout = conductor_timeout
         self._memory_max_chars = memory_max_chars
-        self._browser_backend: str = "playwright"
+        self._profile = profile or STANDALONE
+        self._task_profiles: dict[str, TaskProfile] = {}
+        self._browser_backend: str = "agent-browser"
         self._active_tasks: dict[str, TaskRun] = {}
         self._queue = KeyedAsyncQueue()
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -454,6 +466,20 @@ class AgenticOrchestrator(LeashdPlugin):
             max_retries=self._max_retries,
         )
         task.phase_context["auto_pr_base_branch"] = self._auto_pr_base_branch
+
+        # Load project-level task config and merge with global profile
+        from leashd.core.task_profile import load_project_task_config, merge_profiles
+
+        project_profile = load_project_task_config(task.working_directory)
+        if project_profile is not None:
+            self._task_profiles[task.run_id] = merge_profiles(
+                self._profile, project_profile
+            )
+            logger.info(
+                "task_project_profile_loaded",
+                run_id=task.run_id,
+                working_directory=task.working_directory,
+            )
 
         # Seed the memory file
         mem_path = task_memory.seed(task.run_id, task.task, task.working_directory)
@@ -569,9 +595,15 @@ class AgenticOrchestrator(LeashdPlugin):
             lambda: self._do_advance(task, is_first_call=is_first_call),
         )
 
+    def _get_profile(self, task: TaskRun) -> TaskProfile:
+        """Get the effective profile for a task (per-task override or global)."""
+        return self._task_profiles.get(task.run_id, self._profile)
+
     async def _do_advance(self, task: TaskRun, *, is_first_call: bool = False) -> None:
         if task.is_terminal():
             return
+
+        profile = self._get_profile(task)
 
         memory = task_memory.read(
             task.run_id,
@@ -593,17 +625,28 @@ class AgenticOrchestrator(LeashdPlugin):
             # Cache the summary so we don't re-summarize on restart
             task.phase_context[f"{task.phase}_summary"] = last_output
 
-        decision = await decide_next_action(
-            task_description=task.task,
-            memory_content=memory,
-            last_output=last_output,
-            current_phase=task.phase,
-            retry_count=task.retry_count,
-            max_retries=task.max_retries,
-            is_first_call=is_first_call,
-            model=self._conductor_model,
-            timeout=self._conductor_timeout,
-        )
+        # Profile: use forced initial_action on first call if set
+        if is_first_call and profile.initial_action:
+            decision = ConductorDecision(
+                action=profile.initial_action,
+                reason="task profile initial action",
+                instruction="",
+            )
+        else:
+            decision = await decide_next_action(
+                task_description=task.task,
+                memory_content=memory,
+                last_output=last_output,
+                current_phase=task.phase,
+                retry_count=task.retry_count,
+                max_retries=task.max_retries,
+                is_first_call=is_first_call,
+                model=self._conductor_model,
+                timeout=self._conductor_timeout,
+                enabled_actions=profile.enabled_actions,
+                extra_instructions=profile.conductor_instructions,
+                docker_compose_available=profile.docker_compose_available,
+            )
 
         logger.info(
             "conductor_decided",
@@ -677,12 +720,61 @@ class AgenticOrchestrator(LeashdPlugin):
             task.phase_context.pop("_conductor_cli_failures", None)
             task.phase_context.pop("_conductor_timeout_failures", None)
 
+        # Profile: redirect disabled actions back to conductor context
+        if not profile.is_action_enabled(decision.action) and decision.action not in (
+            "complete",
+            "escalate",
+        ):
+            logger.info(
+                "conductor_action_disabled_by_profile",
+                run_id=task.run_id,
+                action=decision.action,
+            )
+            # Skip to review if verify is disabled, otherwise let conductor retry
+            if decision.action == "verify":
+                decision = ConductorDecision(
+                    action="review",
+                    reason="verify disabled by profile — skipping to review",
+                    instruction="",
+                )
+            elif decision.action == "explore":
+                decision = ConductorDecision(
+                    action="plan",
+                    reason="explore disabled by profile — starting with plan",
+                    instruction="",
+                )
+            elif decision.action == "pr":
+                decision = ConductorDecision(
+                    action="complete",
+                    reason="pr disabled by profile — platform handles PR creation",
+                    instruction="",
+                )
+            else:
+                decision = ConductorDecision(
+                    action="implement",
+                    reason=f"{decision.action} disabled by profile — defaulting to implement",
+                    instruction="",
+                )
+
         # Handle terminal decisions
         if decision.action == "complete":
-            task.transition_to("completed")
-            await self.store.save(task)
-            await self._handle_terminal(task)
-            return
+            # Auto-PR enforcement: if auto_pr enabled and PR action is available,
+            # force a PR step before completing
+            if (
+                self._auto_pr
+                and profile.is_action_enabled("pr")
+                and "pr_output" not in task.phase_context
+            ):
+                decision = ConductorDecision(
+                    action="pr",
+                    reason="auto_pr enabled — must create PR before completing",
+                    instruction="Create a PR for all changes made during this task.",
+                )
+            else:
+                task.transition_to("completed")
+                await self.store.save(task)
+                await self._handle_terminal(task)
+                return
 
         if decision.action == "escalate":
             task.transition_to("escalated")
@@ -712,8 +804,8 @@ class AgenticOrchestrator(LeashdPlugin):
         if decision.complexity:
             task.complexity = decision.complexity
 
-        # Transition to new action
-        task.transition_to(decision.action)
+        # Transition to new action ("complete"/"escalate" intercepted above)
+        task.transition_to(decision.action)  # type: ignore[arg-type]
         await self.store.save(task)
 
         if self._event_bus:
@@ -799,7 +891,13 @@ class AgenticOrchestrator(LeashdPlugin):
         if decision.action in ("test", "verify"):
             prompt = self._setup_test_or_verify(task, decision, session, memory)
         else:
-            prompt = _build_action_prompt(task, decision, memory, self._browser_backend)
+            prompt = _build_action_prompt(
+                task,
+                decision,
+                memory,
+                self._browser_backend,
+                profile=self._get_profile(task),
+            )
 
         # Set up auto-approvals based on action type
         self._setup_auto_approvals(task.chat_id, decision.action)
@@ -1015,6 +1113,7 @@ class AgenticOrchestrator(LeashdPlugin):
 
     async def _handle_terminal(self, task: TaskRun) -> None:
         self._active_tasks.pop(task.chat_id, None)
+        self._task_profiles.pop(task.run_id, None)
 
         if self._engine:
             session = self._engine.session_manager.get(task.user_id, task.chat_id)

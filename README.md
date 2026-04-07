@@ -521,14 +521,14 @@ leashd supports two browser backends for the `/web` and `/test` commands — bot
 
 | Backend | Install | Best for |
 |---|---|---|
-| [Playwright MCP](https://github.com/playwright-community/mcp) *(default)* | `npx playwright install chromium` | Test generation, MCP-native tooling |
-| [agent-browser](https://github.com/vercel-labs/agent-browser) | `npm install -g agent-browser && agent-browser install` | Fast Rust CLI, snapshot-based refs, cloud browser providers |
+| [agent-browser](https://github.com/vercel-labs/agent-browser) *(default)* | `npm install -g agent-browser && agent-browser install` | Fast Rust CLI, snapshot-based refs, headless by default |
+| [Playwright MCP](https://github.com/playwright-community/mcp) | `npx playwright install chromium` | Test generation, MCP-native tooling |
 
 Switch backends and manage profiles via `leashd browser` — see [Configuration > Browser](#browser) for all commands.
 
-**Playwright MCP** — the `.mcp.json` at the project root pre-configures Claude Code to spawn the Playwright MCP server. Read-only browser tools (snapshots, screenshots) are auto-allowed in `default.yaml`; mutation tools (click, navigate, type) require approval.
+**agent-browser** *(default)* — Vercel's headless browser CLI with a native Rust binary and Node.js fallback. Uses accessibility-tree snapshots with deterministic element refs (`@e1`, `@e2`) for reliable AI-driven interaction. Runs headless by default. Supports cloud providers (Browserbase, Browser Use, Kernel) and iOS Simulator via the `-p` flag.
 
-**agent-browser** — Vercel's headless browser CLI with a native Rust binary and Node.js fallback. Uses accessibility-tree snapshots with deterministic element refs (`@e1`, `@e2`) for reliable AI-driven interaction. Supports cloud providers (Browserbase, Browser Use, Kernel) and iOS Simulator via the `-p` flag.
+**Playwright MCP** — the `.mcp.json` at the project root pre-configures Claude Code to spawn the Playwright MCP server. Read-only browser tools (snapshots, screenshots) are auto-allowed in `default.yaml`; mutation tools (click, navigate, type) require approval.
 
 **Web session checkpoints** — `/web` sessions automatically persist progress, so if the agent crashes mid-workflow it resumes from the last checkpoint instead of restarting.
 

@@ -156,6 +156,24 @@ def create_builtin_plugins(
     task_orchestrator: TaskOrchestrator | AgenticOrchestrator | None = None
     if config.task_orchestrator:
         if config.task_orchestrator_version == "v2":
+            from leashd.core.task_profile import resolve_profile
+
+            profile = resolve_profile(config.task_profile)
+            # Merge extra conductor instructions from config
+            if config.task_conductor_instructions:
+                from leashd.core.task_profile import TaskProfile, _merge_instructions
+
+                profile = TaskProfile(
+                    enabled_actions=profile.enabled_actions,
+                    initial_action=profile.initial_action,
+                    conductor_instructions=_merge_instructions(
+                        profile.conductor_instructions,
+                        config.task_conductor_instructions,
+                    ),
+                    action_instructions=profile.action_instructions,
+                    docker_compose_available=profile.docker_compose_available,
+                )
+
             task_orchestrator = AgenticOrchestrator(
                 connector=connector,
                 db_path=session_db_path,
@@ -165,12 +183,14 @@ def create_builtin_plugins(
                 conductor_model=config.task_conductor_model,
                 conductor_timeout=config.task_conductor_timeout,
                 memory_max_chars=config.task_memory_max_chars,
+                profile=profile,
             )
             logger.info(
                 "agentic_orchestrator_v2_enabled",
                 max_retries=config.task_max_retries,
                 auto_pr=config.auto_pr,
                 conductor_model=config.task_conductor_model or "(default)",
+                task_profile=config.task_profile,
             )
         else:
             task_orchestrator = TaskOrchestrator(

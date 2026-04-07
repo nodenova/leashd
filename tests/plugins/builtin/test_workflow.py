@@ -371,7 +371,7 @@ class TestFormatPlaybookInstruction:
             ],
         )
         result = format_playbook_instruction(pb)
-        assert "Tool: browser_click" in result
+        assert "Tool: agent-browser click" in result
 
     def test_verify_false_rendering(self):
         pb = Playbook(

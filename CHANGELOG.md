@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0] - 2026-04-07
+
+- **added**: TaskProfile system — declarative contracts that control conductor behavior. Predefined profiles: `standalone` (full autonomy), `platform` (for hosting platforms), `ci` (minimal). Customizable per-project via `.leashd/task-config.yaml`
+- **changed**: Default browser backend switched from Playwright MCP to agent-browser (headless). Playwright remains supported via `leashd browser set-backend playwright`
+- **changed**: Conductor is now smarter about phase selection — plan-first for moderate tasks (no redundant explore), verify only when tests didn't include browser checks
+- **added**: Auto-PR enforcement — conductor cannot skip the PR step when `auto_pr` is enabled
+
 ## [0.12.1] - 2026-04-06
 
 - **added**: Configurable `max_tool_calls` limit (`leashd tool-calls set <N>`) — cap tool calls per agent execution or set to -1 for unlimited; enforced across all runtimes; also configurable via WebUI settings and REST API
