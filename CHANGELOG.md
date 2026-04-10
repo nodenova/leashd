@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.0] - 2026-04-10
+
+- **fixed**: `/stop` silently re-spawned a fresh agent subprocess when cancellation killed the CLI mid-turn — all three runtimes (claude-cli, claude-code, codex) now track cancelled sessions and abort instead of retrying; also fixed `/stop` and `/clear` during `/task` racing with the conductor advance loop
+- **added**: `codebase-memory-mcp` as default MCP server — auto-detected on PATH, read-only graph tools auto-allowed, and the task orchestrator now uses `search_graph`/`get_architecture`/`trace_path` during plan and implement phases
+- **changed**: Session isolation per phase — each task phase starts a fresh agent conversation; the task memory file is the sole context bridge between phases
+- **changed**: Verify phase upgraded from passive browser snapshots to active E2E + API testing, and made optional — conductor decides when E2E is appropriate instead of being forced
+- **removed**: "Explore" phase stripped from the task orchestrator — plan phase now absorbs codebase reading, eliminating the redundant explore→plan sequence
+
 ## [0.13.2] - 2026-04-07
 
 - **fixed**: Disable tools (`--tools ""`) in conductor CLI evaluator to prevent Claude CLI from consuming the single allowed turn on tool use, which caused "AI orchestrator temporarily unavailable" fallback

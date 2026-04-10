@@ -44,7 +44,7 @@ Created: {created} | Updated: {created}
 (pending — the orchestrator will assess complexity on the first action)
 
 ## Codebase Context
-(not yet explored)
+(pending — will be populated during planning)
 
 ## Plan
 (no plan yet)
@@ -205,10 +205,12 @@ _CHECKPOINT_RE = re.compile(
 def get_checkpoint(run_id: str, working_dir: str) -> dict[str, str]:
     """Parse the ``## Checkpoint`` section into a dict.
 
-    Expected format::
+    Handles both single-line pipe-delimited format and multi-line format::
 
         ## Checkpoint
-        Next: test | Retries: 0 | Blocked: none
+        Next: test | Retries: 0 | Blocked: none | Commit: abc1234
+        Completed: plan, implement
+        Pending: test, verify, review
 
     Returns an empty dict if the file or section is missing.
     """
@@ -221,22 +223,19 @@ def get_checkpoint(run_id: str, working_dir: str) -> dict[str, str]:
         return {}
 
     section = content[match.end() :].strip()
-    # Take only the first non-empty line after the heading
-    line = ""
-    for candidate in section.split("\n"):
-        candidate = candidate.strip()
-        if candidate:
-            line = candidate
-            break
-    if not line:
-        return {}
 
     result: dict[str, str] = {}
-    for part in line.split("|"):
-        part = part.strip()
-        if ":" in part:
-            key, _, value = part.partition(":")
-            result[key.strip().lower()] = value.strip()
+    for candidate in section.split("\n"):
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        if candidate.startswith("##"):
+            break
+        for part in candidate.split("|"):
+            part = part.strip()
+            if ":" in part:
+                key, _, value = part.partition(":")
+                result[key.strip().lower()] = value.strip()
     return result
 
 
@@ -248,12 +247,18 @@ def update_checkpoint(
     retries: int = 0,
     blocked: str = "none",
     git_hash: str | None = None,
+    completed_phases: list[str] | None = None,
+    pending_phases: list[str] | None = None,
 ) -> bool:
     """Update the ``## Checkpoint`` section from the orchestrator side.
 
     This ensures the memory file reflects the true system state even if
     the LLM agent didn't follow instructions to update it.  Returns
     ``True`` on success.
+
+    When *completed_phases* and *pending_phases* are provided, the section
+    includes explicit phase-tracking lines so the conductor can see at a
+    glance which mandatory phases (test, verify) have not yet run.
     """
     fp = path(run_id, working_dir)
     if not fp.is_file():
@@ -268,6 +273,14 @@ def update_checkpoint(
     if git_hash:
         new_line += f" | Commit: {git_hash}"
 
+    # Append completed/pending phase lines
+    if completed_phases is not None:
+        new_line += f"\nCompleted: {', '.join(completed_phases) if completed_phases else 'none'}"
+    if pending_phases is not None:
+        new_line += (
+            f"\nPending: {', '.join(pending_phases) if pending_phases else 'none'}"
+        )
+
     # Also update the Updated timestamp in the header
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     content = re.sub(
@@ -281,18 +294,105 @@ def update_checkpoint(
     if not match:
         return False
 
-    # Find the first non-empty line after the heading and replace it
+    # Replace everything after the heading until the next section or EOF
     after = content[match.end() :]
-    lines = after.split("\n")
-    replaced = False
-    for i, line in enumerate(lines):
-        if line.strip():
-            lines[i] = new_line
-            replaced = True
-            break
-    if not replaced:
-        lines.insert(0, new_line)
+    next_heading = _NEXT_SECTION_RE.search(after)
+    rest = after[next_heading.start() :] if next_heading else ""
 
-    content = content[: match.end()] + "\n".join(lines)
+    content = content[: match.end()] + "\n" + new_line + "\n" + rest
+    fp.write_text(content, encoding="utf-8")
+    return True
+
+
+_SECTION_RE_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _section_re(name: str) -> re.Pattern[str]:
+    """Return a compiled regex matching ``## <name>`` as a heading."""
+    if name not in _SECTION_RE_CACHE:
+        _SECTION_RE_CACHE[name] = re.compile(
+            rf"^##\s+{re.escape(name)}\s*$", re.MULTILINE
+        )
+    return _SECTION_RE_CACHE[name]
+
+
+def update_section(
+    run_id: str,
+    working_dir: str,
+    *,
+    section: str,
+    content: str,
+    only_if_placeholder: bool = False,
+) -> bool:
+    """Replace the body of a ``## <section>`` with *content*.
+
+    When *only_if_placeholder* is ``True``, the replacement only happens
+    if the current section body looks like a placeholder — i.e. it starts
+    with ``(`` (the default seed markers like ``(no plan yet)``).
+
+    Returns ``True`` on success.
+    """
+    fp = path(run_id, working_dir)
+    if not fp.is_file():
+        return False
+
+    try:
+        text = fp.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    heading = _section_re(section)
+    match = heading.search(text)
+    if not match:
+        return False
+
+    after = text[match.end() :]
+    next_heading = _NEXT_SECTION_RE.search(after)
+    body = after[: next_heading.start()] if next_heading else after
+    rest = after[next_heading.start() :] if next_heading else ""
+
+    if only_if_placeholder and not body.strip().startswith("("):
+        return False
+
+    text = text[: match.end()] + "\n" + content.strip() + "\n\n" + rest
+    fp.write_text(text, encoding="utf-8")
+    return True
+
+
+_CHANGES_RE = re.compile(r"^##\s+Changes\s*$", re.MULTILINE)
+
+
+def update_changes_section(
+    run_id: str,
+    working_dir: str,
+    *,
+    diff_stat: str,
+) -> bool:
+    """Replace the ``## Changes`` section content with a git diff stat.
+
+    Returns ``True`` on success.
+    """
+    fp = path(run_id, working_dir)
+    if not fp.is_file():
+        return False
+
+    try:
+        content = fp.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    match = _CHANGES_RE.search(content)
+    if not match:
+        return False
+
+    after = content[match.end() :]
+    next_heading = _NEXT_SECTION_RE.search(after)
+    rest = after[next_heading.start() :] if next_heading else ""
+
+    trimmed = diff_stat.strip()
+    if not trimmed:
+        trimmed = "(no changes detected)"
+
+    content = content[: match.end()] + "\n" + trimmed + "\n\n" + rest
     fp.write_text(content, encoding="utf-8")
     return True

@@ -16,7 +16,7 @@ The conductor loop::
     │  returns: {action, reason, instruction}  │
     └──────┬──────────────────────────────────┘
            │
-    DISPATCH to coding agent (explore / plan / implement / …)
+    DISPATCH to coding agent (plan / implement / test / …)
            │
     SESSION_COMPLETED → capture output → loop back to CONDUCTOR
            │
@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any
 import aiosqlite
 import structlog
 
-from leashd.core import task_memory
+from leashd.core import task_events, task_memory
 from leashd.core.context_manager import (
     git_checkpoint,
     mask_phase_output,
@@ -108,10 +108,69 @@ logger = structlog.get_logger()
 
 _STALE_TASK_HOURS = 24
 
+# Ordered list of conductor actions (excludes terminal states)
+_ORDERED_ACTIONS: list[str] = [
+    "plan",
+    "implement",
+    "test",
+    "verify",
+    "fix",
+    "review",
+    "pr",
+]
+
+
+def _compute_phase_status(
+    phase_context: dict[str, object],
+    enabled_actions: frozenset[str],
+) -> tuple[list[str], list[str]]:
+    """Derive completed and pending phases from phase_context keys.
+
+    A phase counts as completed when ``{phase}_output`` exists in the
+    context.  Only phases that are both in *_ORDERED_ACTIONS* and
+    *enabled_actions* appear in the pending list.
+    """
+    completed: list[str] = []
+    pending: list[str] = []
+    for action in _ORDERED_ACTIONS:
+        if f"{action}_output" in phase_context:
+            completed.append(action)
+        elif action in enabled_actions:
+            pending.append(action)
+    return completed, pending
+
+
+async def _git_diff_stat(working_dir: str) -> str | None:
+    """Run ``git diff --stat HEAD~`` in *working_dir*.
+
+    Returns the stat output, or ``None`` on error / empty diff.
+    """
+    from pathlib import Path
+
+    cwd = Path(working_dir)
+    if not (cwd / ".git").is_dir():
+        return None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "diff",
+            "--stat",
+            "HEAD~",
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        output = stdout.decode().strip()
+        return output if output else None
+    except Exception:
+        logger.debug("git_diff_stat_failed", cwd=str(cwd))
+        return None
+
+
 # ── Action → session mode mapping ──────────────────────────────────────
 
 _ACTION_TO_MODE: dict[str, str] = {
-    "explore": "auto",
     "plan": "plan",
     "implement": "auto",
     "test": "test",
@@ -137,41 +196,69 @@ _READ_ONLY_BASH: frozenset[str] = frozenset(
 
 # ── Action-specific prompt suffixes ────────────────────────────────────
 
+_CODEBASE_MEMORY_PLAN_HINT = (
+    "CODEBASE EXPLORATION — use codebase-memory-mcp tools FIRST to understand "
+    "the codebase before reading raw files:\n"
+    "- search_graph(name_pattern=...) to find functions, classes, routes\n"
+    "- get_architecture() for project structure overview\n"
+    "- trace_path(function_name=...) to understand call chains\n"
+    "- get_code_snippet(qualified_name=...) to read specific symbols\n"
+    "Fall back to Read/Grep/Glob only for config files, YAML, or content "
+    "not in the graph.\n\n"
+)
+
+_CODEBASE_MEMORY_IMPLEMENT_HINT = (
+    "\nIf you need to understand unfamiliar code, use codebase-memory-mcp "
+    "tools (search_graph, trace_path, get_code_snippet) before reading "
+    "raw files."
+)
+
+_PLAN_SUFFIX_BASE = (
+    "FIRST read CLAUDE.md, README.md, and key source files to understand "
+    "the project's architecture, conventions, and purpose. Do not propose "
+    "changes until you understand how the codebase works.\n\n"
+    "Then create a detailed implementation plan covering:\n"
+    "- Files to create or modify\n"
+    "- Key changes in each file\n"
+    "- Test strategy\n\n"
+    "BEFORE YOU FINISH this action, update the task memory file:\n"
+    "- Write your findings to ## Codebase Context\n"
+    "- Write the FULL plan to ## Plan (CRITICAL: the next phase starts a "
+    "fresh conversation and will ONLY see this task memory file — not your "
+    "conversation history or any .claude/plans/ files)\n"
+    "- Add a row to the ## Progress table\n"
+    "- Update ## Checkpoint"
+)
+
+_IMPLEMENT_SUFFIX_BASE = (
+    "Implement the changes described in the instruction. Work file by file, "
+    "writing clean code that follows existing conventions.\n\n"
+    "MANDATORY VERIFICATION — use the project's own commands (from CLAUDE.md, "
+    "Makefile, or package.json), NOT generic commands like 'npx lint':\n"
+    "1. Run the project's lint/format checks\n"
+    "2. Run the project's type checks (if applicable)\n"
+    "3. Run the project's unit tests\n"
+    "Fix ALL failures before completing this phase.\n\n"
+    "BEFORE YOU FINISH this action, update the task memory file:\n"
+    "- Write changed files and a summary to ## Changes\n"
+    "- Add a row to the ## Progress table\n"
+    "- Update ## Checkpoint"
+)
+
+
+def _plan_suffix(codebase_memory: bool) -> str:
+    if codebase_memory:
+        return _CODEBASE_MEMORY_PLAN_HINT + _PLAN_SUFFIX_BASE
+    return _PLAN_SUFFIX_BASE
+
+
+def _implement_suffix(codebase_memory: bool) -> str:
+    if codebase_memory:
+        return _IMPLEMENT_SUFFIX_BASE + _CODEBASE_MEMORY_IMPLEMENT_HINT
+    return _IMPLEMENT_SUFFIX_BASE
+
+
 _ACTION_SUFFIXES: dict[str, str] = {
-    "explore": (
-        "Focus on understanding the codebase. Read relevant files, search for "
-        "patterns, check existing tests and conventions. Read CLAUDE.md if "
-        "present — it contains project-specific commands and conventions.\n\n"
-        "BEFORE YOU FINISH this action, update the task memory file:\n"
-        "- Write your findings to ## Codebase Context\n"
-        "- Add a row to the ## Progress table\n"
-        "- Update ## Checkpoint"
-    ),
-    "plan": (
-        "Read CLAUDE.md and any existing documentation first. Create a detailed "
-        "implementation plan covering:\n"
-        "- Files to create or modify\n"
-        "- Key changes in each file\n"
-        "- Test strategy\n\n"
-        "BEFORE YOU FINISH this action, update the task memory file:\n"
-        "- Write the plan to ## Plan\n"
-        "- Add a row to the ## Progress table\n"
-        "- Update ## Checkpoint"
-    ),
-    "implement": (
-        "Implement the changes described in the instruction. Work file by file, "
-        "writing clean code that follows existing conventions.\n\n"
-        "MANDATORY VERIFICATION — use the project's own commands (from CLAUDE.md, "
-        "Makefile, or package.json), NOT generic commands like 'npx lint':\n"
-        "1. Run the project's lint/format checks\n"
-        "2. Run the project's type checks (if applicable)\n"
-        "3. Run the project's unit tests\n"
-        "Fix ALL failures before completing this phase.\n\n"
-        "BEFORE YOU FINISH this action, update the task memory file:\n"
-        "- Write changed files and a summary to ## Changes\n"
-        "- Add a row to the ## Progress table\n"
-        "- Update ## Checkpoint"
-    ),
     "test": (
         "Run automated test suites to verify the implementation. Check CLAUDE.md "
         "or package.json for the project's test commands.\n\n"
@@ -224,37 +311,61 @@ _ACTION_SUFFIXES: dict[str, str] = {
 
 
 def _verify_suffix(browser_backend: str) -> str:
-    """Build verify action suffix with backend-specific tool names."""
+    """Build verify action suffix — active E2E + API testing.
+
+    Unlike the ``test`` phase (which runs automated test suites), verify
+    performs agentic end-to-end testing: spin up services, make real API
+    calls, and interact with the UI through a browser.
+    """
     if browser_backend == "agent-browser":
-        return (
-            "Browser-based verification — this is manual-style checking, not "
-            "automated test suites.\n\n"
-            "1. Start the dev server if it's not already running\n"
-            "2. Use agent-browser CLI to navigate to relevant pages/endpoints "
-            "(agent-browser open <url>)\n"
-            "3. Take snapshots with `agent-browser snapshot -i` to inspect the "
-            "accessibility tree\n"
-            "4. Check `agent-browser console` for JavaScript errors\n"
-            "5. Take screenshots with `agent-browser screenshot .leashd/verify-screenshot.png` if useful\n"
-            "6. Verify the UI renders correctly, forms work, API responds as "
-            "expected\n"
-            "7. Check error states and edge cases in the browser\n\n"
-            "Write your findings to the ## Verification section of the task "
-            "memory file. Update ## Progress and ## Checkpoint."
+        browser_instructions = (
+            "- Use `agent-browser open <url>` to navigate\n"
+            "- Use `agent-browser snapshot -i` to inspect the accessibility tree\n"
+            "- Use `agent-browser console` to check for JavaScript errors\n"
+            "- Use `agent-browser screenshot .leashd/verify-screenshot.png` "
+            "to capture evidence\n"
+            "- Use `agent-browser click @ref` / `agent-browser fill @ref "
+            '"value"` to interact with forms and buttons'
         )
+    else:
+        browser_instructions = (
+            "- Use browser_navigate to go to relevant pages\n"
+            "- Use browser_snapshot to inspect the accessibility tree\n"
+            "- Use browser_console_messages to check for errors\n"
+            "- Use browser_take_screenshot to capture evidence\n"
+            "- Use browser_click / browser_type to interact with the UI"
+        )
+
     return (
-        "Browser-based verification — this is manual-style checking, not "
-        "automated test suites.\n\n"
-        "1. Start the dev server if it's not already running\n"
-        "2. Use browser_navigate to go to relevant pages/endpoints\n"
-        "3. Take browser_snapshot to inspect the accessibility tree\n"
-        "4. Check browser_console_messages for JavaScript errors\n"
-        "5. Take browser_take_screenshot if useful for documenting behavior\n"
-        "6. Verify the UI renders correctly, forms work, API responds as "
-        "expected\n"
-        "7. Check error states and edge cases in the browser\n\n"
-        "Write your findings to the ## Verification section of the task "
-        "memory file. Update ## Progress and ## Checkpoint."
+        "AGENTIC E2E + API VERIFICATION\n\n"
+        "This is active end-to-end testing — you must spin up the "
+        "application and interact with it like a QA engineer, not just "
+        "inspect static snapshots.\n\n"
+        "## 1. Start the application\n"
+        "- Start the dev server (npm run dev, uvicorn, docker-compose up, etc.)\n"
+        "- Wait for services to be ready (check health endpoints)\n"
+        "- If docker-compose is available, prefer it for full-stack testing\n\n"
+        "## 2. API verification\n"
+        "- Make actual HTTP requests to API endpoints using curl or similar\n"
+        "- Test the happy path for the feature you implemented\n"
+        "- Test error cases (invalid input, missing auth, edge cases)\n"
+        "- Verify response status codes, headers, and body content\n"
+        "- Check that database state is correct after mutations\n\n"
+        "## 3. Browser E2E testing\n"
+        f"{browser_instructions}\n\n"
+        "- Navigate to key pages affected by the changes\n"
+        "- Test user workflows end-to-end (fill forms, submit, verify result)\n"
+        "- Check that the UI renders correctly and is responsive\n"
+        "- Verify client-side state management works as expected\n\n"
+        "## 4. Regression check\n"
+        "- Verify existing functionality that could be affected by changes\n"
+        "- Check adjacent features and pages for breakage\n\n"
+        "## 5. Report findings\n"
+        "Write detailed findings to ## Verification in the task memory file.\n"
+        "Include: what was tested, pass/fail status for each check, and any "
+        "issues found.\n"
+        "If ANY test fails, report it clearly — do not mark as passing.\n"
+        "Update ## Progress and ## Checkpoint when done."
     )
 
 
@@ -264,6 +375,7 @@ def _build_action_prompt(
     memory_content: str | None,
     browser_backend: str = "agent-browser",
     profile: TaskProfile | None = None,
+    codebase_memory: bool = False,
 ) -> str:
     """Build the prompt sent to the coding agent for a given action."""
     lines = [
@@ -304,6 +416,10 @@ def _build_action_prompt(
     lines.append("")
     if decision.action == "verify":
         suffix = _verify_suffix(browser_backend)
+    elif decision.action == "plan":
+        suffix = _plan_suffix(codebase_memory)
+    elif decision.action == "implement":
+        suffix = _implement_suffix(codebase_memory)
     else:
         suffix = _ACTION_SUFFIXES.get(decision.action, "Continue the task.")
     lines.append(suffix)
@@ -370,6 +486,7 @@ class AgenticOrchestrator(LeashdPlugin):
         self._profile = profile or STANDALONE
         self._task_profiles: dict[str, TaskProfile] = {}
         self._browser_backend: str = "agent-browser"
+        self._codebase_memory_enabled: bool = False
         self._active_tasks: dict[str, TaskRun] = {}
         self._queue = KeyedAsyncQueue()
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
@@ -391,6 +508,7 @@ class AgenticOrchestrator(LeashdPlugin):
     async def initialize(self, context: PluginContext) -> None:
         self._event_bus = context.event_bus
         self._browser_backend = context.config.browser_backend
+        self._codebase_memory_enabled = context.config.codebase_memory_enabled
         self._subscriptions = [
             (TASK_SUBMITTED, self._on_task_submitted),
             (SESSION_COMPLETED, self._on_session_completed),
@@ -441,6 +559,72 @@ class AgenticOrchestrator(LeashdPlugin):
         if self._db:
             await self._db.close()
             self._db = None
+
+    # ── Codebase indexing ────────────────────────────────────────────────
+
+    @staticmethod
+    async def _ensure_codebase_indexed(working_directory: str) -> None:
+        """Ensure the codebase-memory-mcp index is fresh before a task starts.
+
+        Runs as a best-effort pre-task step — never blocks or fails the task.
+        """
+        import shutil
+
+        binary = shutil.which("codebase-memory-mcp")
+        if not binary:
+            return
+
+        project = working_directory.strip("/").replace("/", "-")
+
+        async def _run_cli(tool: str, args_json: str) -> dict[str, Any] | None:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    binary,
+                    "cli",
+                    tool,
+                    args_json,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+                raw = stdout.decode().strip()
+                # Parse MCP response: {"content":[{"type":"text","text":"..."}]}
+                import json as _json
+
+                data = _json.loads(raw)
+                inner = data.get("content", [{}])[0].get("text", "{}")
+                result: dict[str, Any] = _json.loads(inner)
+                return result
+            except Exception:
+                return None
+
+        status = await _run_cli("index_status", f'{{"project": "{project}"}}')
+
+        needs_index = False
+        if status is None or "error" in str(status).lower():
+            needs_index = True
+        elif status.get("status") == "ready":
+            changes = await _run_cli("detect_changes", f'{{"project": "{project}"}}')
+            if changes and changes.get("changed_count", 0) > 0:
+                needs_index = True
+                logger.info(
+                    "codebase_index_stale",
+                    project=project,
+                    changed_count=changes["changed_count"],
+                )
+
+        if needs_index:
+            logger.info("codebase_index_refreshing", project=project)
+            result = await _run_cli(
+                "index_repository",
+                f'{{"repo_path": "{working_directory}", "mode": "fast"}}',
+            )
+            if result:
+                logger.info(
+                    "codebase_index_refreshed",
+                    project=project,
+                    nodes=result.get("nodes"),
+                )
 
     # ── Event handlers ─────────────────────────────────────────────────
 
@@ -494,6 +678,19 @@ class AgenticOrchestrator(LeashdPlugin):
             chat_id=chat_id,
             task_preview=task.task[:80],
         )
+        task_events.append(
+            task.run_id,
+            task.working_directory,
+            {
+                "event": "task_created",
+                "run_id": task.run_id,
+                "task": task.task[:200],
+                "profile": str(self._get_profile(task).enabled_actions),
+            },
+        )
+
+        if self._codebase_memory_enabled:
+            await self._ensure_codebase_indexed(task.working_directory)
 
         await self._advance(task, is_first_call=True)
 
@@ -542,13 +739,47 @@ class AgenticOrchestrator(LeashdPlugin):
             result=result_summary,
             elapsed=elapsed,
         )
+
+        # Compute completed/pending phases for the memory file
+        profile = self._get_profile(task)
+        completed, pending = _compute_phase_status(
+            task.phase_context, profile.enabled_actions
+        )
         task_memory.update_checkpoint(
             task.run_id,
             task.working_directory,
             next_phase=f"after-{task.phase}",
             retries=task.retry_count,
             git_hash=commit_hash,
+            completed_phases=completed,
+            pending_phases=pending,
         )
+
+        task_events.append(
+            task.run_id,
+            task.working_directory,
+            {
+                "event": "phase_completed",
+                "phase": task.phase,
+                "elapsed_s": int(
+                    (datetime.now(timezone.utc) - task.phase_started_at).total_seconds()
+                )
+                if task.phase_started_at
+                else 0,
+                "cost": cost,
+                "commit": commit_hash,
+            },
+        )
+
+        # After implement, write changed files into memory
+        if task.phase == "implement":
+            diff_stat = await _git_diff_stat(task.working_directory)
+            if diff_stat:
+                task_memory.update_changes_section(
+                    task.run_id,
+                    task.working_directory,
+                    diff_stat=diff_stat,
+                )
 
         await self.store.save(task)
 
@@ -578,6 +809,9 @@ class AgenticOrchestrator(LeashdPlugin):
             await self._cancel_task(task, "User cancelled")
 
     async def _on_config_reloaded(self, event: Event) -> None:
+        cm = event.data.get("codebase_memory_enabled")
+        if cm is not None:
+            self._codebase_memory_enabled = bool(cm)
         new_backend = event.data.get("browser_backend")
         if new_backend and new_backend != self._browser_backend:
             logger.info(
@@ -648,12 +882,28 @@ class AgenticOrchestrator(LeashdPlugin):
                 docker_compose_available=profile.docker_compose_available,
             )
 
+        # Re-check after conductor call — task may have been cancelled
+        # while waiting for the LLM response.
+        if task.is_terminal():
+            return
+
         logger.info(
             "conductor_decided",
             run_id=task.run_id,
             action=decision.action,
             reason=decision.reason,
             complexity=decision.complexity,
+        )
+        task_events.append(
+            task.run_id,
+            task.working_directory,
+            {
+                "event": "conductor_decision",
+                "action": decision.action,
+                "reason": decision.reason,
+                "complexity": decision.complexity,
+                "is_first": is_first_call,
+            },
         )
 
         # Track consecutive conductor failures to avoid infinite loops.
@@ -737,12 +987,6 @@ class AgenticOrchestrator(LeashdPlugin):
                     reason="verify disabled by profile — skipping to review",
                     instruction="",
                 )
-            elif decision.action == "explore":
-                decision = ConductorDecision(
-                    action="plan",
-                    reason="explore disabled by profile — starting with plan",
-                    instruction="",
-                )
             elif decision.action == "pr":
                 decision = ConductorDecision(
                     action="complete",
@@ -754,6 +998,52 @@ class AgenticOrchestrator(LeashdPlugin):
                     action="implement",
                     reason=f"{decision.action} disabled by profile — defaulting to implement",
                     instruction="",
+                )
+
+        # Re-ask: if conductor skips test/verify, nudge it once
+        if decision.action in ("complete", "review") and not task.phase_context.get(
+            "_phases_reask_done"
+        ):
+            missing: list[str] = []
+            if "test_output" not in task.phase_context and profile.is_action_enabled(
+                "test"
+            ):
+                missing.append("test")
+            if missing:
+                task.phase_context["_phases_reask_done"] = True
+                logger.info(
+                    "conductor_reask_missing_phases",
+                    run_id=task.run_id,
+                    original=decision.action,
+                    missing=missing,
+                )
+                reask_extra = (
+                    profile.conductor_instructions
+                    + f"\n\nYou chose {decision.action} but these "
+                    f"mandatory phases have NOT run: "
+                    f"{', '.join(missing)}. Check the memory "
+                    f"file — they are listed under Pending in "
+                    f"## Checkpoint. You must run them first."
+                )
+                decision = await decide_next_action(
+                    task_description=task.task,
+                    memory_content=memory,
+                    last_output=last_output,
+                    current_phase=task.phase,
+                    retry_count=task.retry_count,
+                    max_retries=task.max_retries,
+                    is_first_call=False,
+                    model=self._conductor_model,
+                    timeout=self._conductor_timeout,
+                    enabled_actions=profile.enabled_actions,
+                    extra_instructions=reask_extra,
+                    docker_compose_available=profile.docker_compose_available,
+                )
+                logger.info(
+                    "conductor_reask_result",
+                    run_id=task.run_id,
+                    action=decision.action,
+                    reason=decision.reason,
                 )
 
         # Handle terminal decisions
@@ -848,6 +1138,8 @@ class AgenticOrchestrator(LeashdPlugin):
                 previous_phase=task.previous_phase,
             )
 
+        if task.is_terminal():
+            return
         await self._execute_action(task, decision, memory)
 
     # ── Action execution ───────────────────────────────────────────────
@@ -858,6 +1150,8 @@ class AgenticOrchestrator(LeashdPlugin):
         decision: ConductorDecision,
         memory: str | None,
     ) -> None:
+        if task.is_terminal():
+            return
         if not self._engine:
             logger.error("agentic_orchestrator_no_engine", run_id=task.run_id)
             task.error_message = "Engine not available"
@@ -882,6 +1176,15 @@ class AgenticOrchestrator(LeashdPlugin):
         session = await self._engine.session_manager.get_or_create(
             task.user_id, task.chat_id, task.working_directory
         )
+        # Phase isolation: each phase starts a FRESH agent conversation.
+        # The task memory file (.leashd/tasks/{run_id}.md) is the sole
+        # context bridge between phases — conversation is ephemeral.
+        session.agent_resume_token = None
+        logger.debug(
+            "task_phase_session_reset",
+            run_id=task.run_id,
+            action=decision.action,
+        )
         session.mode = mode
         session.task_run_id = task.run_id
         if mode == "plan":
@@ -897,13 +1200,22 @@ class AgenticOrchestrator(LeashdPlugin):
                 memory,
                 self._browser_backend,
                 profile=self._get_profile(task),
+                codebase_memory=self._codebase_memory_enabled,
             )
 
         # Set up auto-approvals based on action type
         self._setup_auto_approvals(task.chat_id, decision.action)
 
+        task_events.append(
+            task.run_id,
+            task.working_directory,
+            {"event": "phase_started", "phase": task.phase, "action": decision.action},
+        )
+
         try:
             await self._engine.handle_message(task.user_id, prompt, task.chat_id)
+            if decision.action == "plan":
+                self._capture_plan_to_memory(task)
         except asyncio.CancelledError:
             logger.info(
                 "task_action_cancelled",
@@ -920,6 +1232,15 @@ class AgenticOrchestrator(LeashdPlugin):
             task.error_message = f"Action {decision.action} failed with runtime error"
             task.transition_to("failed")
             task.outcome = "error"
+            task_events.append(
+                task.run_id,
+                task.working_directory,
+                {
+                    "event": "phase_failed",
+                    "phase": task.phase,
+                    "error": task.error_message,
+                },
+            )
             await self.store.save(task)
             await self._handle_terminal(task)
 
@@ -928,7 +1249,7 @@ class AgenticOrchestrator(LeashdPlugin):
         if not self._engine:
             return
 
-        if action in ("explore", "review"):
+        if action == "review":
             # Read-only bash + Write/Edit for task memory file updates
             self._engine.enable_tool_auto_approve(chat_id, "Write")
             self._engine.enable_tool_auto_approve(chat_id, "Edit")
@@ -959,6 +1280,55 @@ class AgenticOrchestrator(LeashdPlugin):
                 self._engine.enable_tool_auto_approve(chat_id, key)
             self._engine.enable_tool_auto_approve(chat_id, "Bash::git")
             self._engine.enable_tool_auto_approve(chat_id, "Bash::gh")
+
+    @staticmethod
+    def _capture_plan_to_memory(task: TaskRun) -> None:
+        """Copy the newest .claude/plans/*.md content into ## Plan.
+
+        After the plan phase, the agent may have written its plan to
+        Claude CLI's native plan file instead of (or in addition to) the
+        task memory file.  This method reads the most recently modified
+        plan file and injects its content into the task memory's ## Plan
+        section — but only if that section still has a placeholder.
+        """
+        from pathlib import Path
+
+        plans_dir = Path(task.working_directory) / ".claude" / "plans"
+        if not plans_dir.is_dir():
+            return
+
+        plan_files = sorted(plans_dir.glob("*.md"), key=lambda p: p.stat().st_mtime)
+        if not plan_files:
+            return
+
+        newest = plan_files[-1]
+        try:
+            plan_content = newest.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning(
+                "plan_capture_read_failed",
+                run_id=task.run_id,
+                path=str(newest),
+            )
+            return
+
+        if not plan_content.strip():
+            return
+
+        updated = task_memory.update_section(
+            task.run_id,
+            task.working_directory,
+            section="Plan",
+            content=plan_content,
+            only_if_placeholder=True,
+        )
+        if updated:
+            logger.info(
+                "plan_captured_to_memory",
+                run_id=task.run_id,
+                plan_file=newest.name,
+                plan_length=len(plan_content),
+            )
 
     def _setup_test_or_verify(
         self,
@@ -1064,6 +1434,16 @@ class AgenticOrchestrator(LeashdPlugin):
                 run_id=task.run_id,
                 next_phase=checkpoint_next,
             )
+            task_events.append(
+                task.run_id,
+                task.working_directory,
+                {
+                    "event": "task_resumed",
+                    "phase": task.phase,
+                    "source": "checkpoint",
+                    "next": checkpoint_next,
+                },
+            )
             decision = ConductorDecision(
                 action=checkpoint_next,  # type: ignore[arg-type]
                 reason="resumed from memory file checkpoint",
@@ -1084,6 +1464,16 @@ class AgenticOrchestrator(LeashdPlugin):
                 max_retries=task.max_retries,
                 model=self._conductor_model,
                 timeout=self._conductor_timeout,
+            )
+
+            task_events.append(
+                task.run_id,
+                task.working_directory,
+                {
+                    "event": "task_resumed",
+                    "phase": task.phase,
+                    "source": "conductor",
+                },
             )
 
             async def _conductor_resume() -> None:
@@ -1156,6 +1546,17 @@ class AgenticOrchestrator(LeashdPlugin):
             retry_count=task.retry_count,
             complexity=task.complexity,
         )
+        task_events.append(
+            task.run_id,
+            task.working_directory,
+            {
+                "event": "task_terminal",
+                "outcome": task.outcome,
+                "phase": task.phase,
+                "total_cost": task.total_cost,
+                "error": task.error_message,
+            },
+        )
 
     async def _finalize(
         self,
@@ -1212,6 +1613,13 @@ class AgenticOrchestrator(LeashdPlugin):
         return msg
 
     async def _cancel_task(self, task: TaskRun, reason: str) -> None:
+        # Mark terminal FIRST — before any async yield that could let
+        # _on_session_completed see a non-terminal task and spawn a
+        # new conductor advance.
+        task.error_message = reason
+        task.transition_to("cancelled")
+        self._active_tasks.pop(task.chat_id, None)
+
         bg = self._running_tasks.pop(task.chat_id, None)
         if bg and not bg.done():
             bg.cancel()
@@ -1221,8 +1629,6 @@ class AgenticOrchestrator(LeashdPlugin):
             if session_id:
                 await self._engine.agent.cancel(session_id)
 
-        task.error_message = reason
-        task.transition_to("cancelled")
         await self.store.save(task)
         await self._handle_terminal(task)
 

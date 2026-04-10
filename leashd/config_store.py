@@ -156,6 +156,7 @@ def inject_global_config_as_env(*, force: bool = False) -> None:
     _inject_autonomous_config(data, force=force)
     _inject_browser_config(data, force=force)
     _inject_web_config(data, force=force)
+    _inject_codebase_memory_config(data, force=force)
 
 
 # --- Autonomous config bridging ---
@@ -306,6 +307,38 @@ def _inject_web_config(data: dict[str, Any], *, force: bool = False) -> None:
                 os.environ[env_key] = str(value).lower()
             else:
                 os.environ[env_key] = str(value)
+
+
+# --- Codebase memory config bridging ---
+
+
+def get_codebase_memory_config(
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read the ``codebase_memory`` section from global config.
+
+    Returns an empty dict when the section is missing or not a dict.
+    """
+    if data is None:
+        data = load_global_config()
+    cm = data.get("codebase_memory", {})
+    if not isinstance(cm, dict):
+        return {}
+    return cm
+
+
+def _inject_codebase_memory_config(
+    data: dict[str, Any], *, force: bool = False
+) -> None:
+    """Bridge codebase_memory YAML → LEASHD_CODEBASE_MEMORY_ENABLED."""
+    cm = data.get("codebase_memory", {})
+    if not isinstance(cm, dict):
+        return
+    enabled = cm.get("enabled")
+    if enabled is not None:
+        key = "LEASHD_CODEBASE_MEMORY_ENABLED"
+        if force or key not in os.environ:
+            os.environ[key] = str(enabled).lower()
 
 
 # --- Workspace config at ~/.leashd/workspaces.yaml ---

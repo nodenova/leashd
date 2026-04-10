@@ -1070,6 +1070,12 @@ class TestMCPToolNameNormalization:
     def test_normalize_strips_arbitrary_server(self):
         assert normalize_tool_name("mcp__my_server__some_tool") == "some_tool"
 
+    def test_normalize_strips_hyphenated_server_prefix(self):
+        assert (
+            normalize_tool_name("mcp__codebase-memory-mcp__search_graph")
+            == "search_graph"
+        )
+
     def test_normalize_noop_for_standard_tools(self):
         assert normalize_tool_name("Write") == "Write"
         assert normalize_tool_name("Bash") == "Bash"
@@ -1100,6 +1106,31 @@ class TestMCPToolNameNormalization:
         )
         # browser_snapshot is in the allow rule for readonly browser tools
         result = await gk.check("mcp__playwright__browser_snapshot", {}, "s1", "c1")
+        assert result.behavior == "allow"
+
+    async def test_mcp_codebase_memory_tool_matches_policy(
+        self, sandbox, mock_audit, event_bus
+    ):
+        """mcp__codebase-memory-mcp__search_graph should match allow rule."""
+        from pathlib import Path
+
+        from leashd.core.safety.policy import PolicyEngine
+
+        policies_dir = (
+            Path(__file__).parent.parent.parent.parent / "leashd" / "policies"
+        )
+        policy_paths = [policies_dir / "default.yaml"]
+        pe = PolicyEngine(policy_paths)
+
+        gk = ToolGatekeeper(
+            sandbox=sandbox,
+            audit=mock_audit,
+            event_bus=event_bus,
+            policy_engine=pe,
+        )
+        result = await gk.check(
+            "mcp__codebase-memory-mcp__search_graph", {}, "s1", "c1"
+        )
         assert result.behavior == "allow"
 
     async def test_mcp_tool_matches_auto_approve_after_normalization(

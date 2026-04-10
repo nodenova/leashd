@@ -175,6 +175,36 @@ class TestGetCheckpoint:
         assert cp["retries"] == "2"
         assert cp["blocked"] == "waiting for API key"
 
+    def test_parses_multiline_checkpoint(self, tmp_path):
+        """Multi-line checkpoint with Completed/Pending lines."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        task_memory.update_checkpoint(
+            "r1",
+            str(tmp_path),
+            next_phase="after-implement",
+            retries=1,
+            git_hash="abc1234",
+            completed_phases=["explore", "plan", "implement"],
+            pending_phases=["test", "verify", "review"],
+        )
+        cp = task_memory.get_checkpoint("r1", str(tmp_path))
+        assert cp["next"] == "after-implement"
+        assert cp["retries"] == "1"
+        assert cp["commit"] == "abc1234"
+        assert cp["completed"] == "explore, plan, implement"
+        assert cp["pending"] == "test, verify, review"
+
+    def test_multiline_checkpoint_stops_at_next_section(self, tmp_path):
+        """Parser must not read past the next ## heading."""
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        # Append a fake section after checkpoint
+        content += "\n## Extra\nKey: should-not-appear\n"
+        fp.write_text(content, encoding="utf-8")
+        cp = task_memory.get_checkpoint("r1", str(tmp_path))
+        assert "key" not in cp
+
 
 class TestAppendProgressRow:
     def test_appends_first_row(self, tmp_path):
@@ -373,3 +403,184 @@ class TestUpdateCheckpoint:
         )
         cp = task_memory.get_checkpoint("r1", str(tmp_path))
         assert cp["blocked"] == "test failures"
+
+    def test_includes_completed_and_pending_phases(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        ok = task_memory.update_checkpoint(
+            "r1",
+            str(tmp_path),
+            next_phase="after-implement",
+            completed_phases=["plan", "implement"],
+            pending_phases=["test", "verify", "review"],
+        )
+        assert ok is True
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "Completed: plan, implement" in content
+        assert "Pending: test, verify, review" in content
+
+    def test_empty_completed_phases(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        task_memory.update_checkpoint(
+            "r1",
+            str(tmp_path),
+            next_phase="after-plan",
+            completed_phases=[],
+            pending_phases=["implement", "test"],
+        )
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "Completed: none" in content
+        assert "Pending: implement, test" in content
+
+    def test_phase_status_preserves_other_sections(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        task_memory.update_checkpoint(
+            "r1",
+            str(tmp_path),
+            next_phase="after-implement",
+            completed_phases=["plan"],
+            pending_phases=["test"],
+        )
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        # Checkpoint is the last section, but verify it doesn't
+        # eat into earlier sections
+        assert "## Progress" in content
+        assert "## Changes" in content
+
+
+class TestUpdateSection:
+    def test_replaces_placeholder_section(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        ok = task_memory.update_section(
+            "r1",
+            str(tmp_path),
+            section="Plan",
+            content="Step 1: create module\nStep 2: add tests",
+        )
+        assert ok is True
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "Step 1: create module" in content
+        assert "(no plan yet)" not in content
+
+    def test_only_if_placeholder_skips_real_content(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        content = content.replace("(no plan yet)", "Already has a real plan")
+        fp.write_text(content, encoding="utf-8")
+
+        ok = task_memory.update_section(
+            "r1",
+            str(tmp_path),
+            section="Plan",
+            content="Overwrite attempt",
+            only_if_placeholder=True,
+        )
+        assert ok is False
+        content = fp.read_text(encoding="utf-8")
+        assert "Already has a real plan" in content
+
+    def test_only_if_placeholder_replaces_placeholder(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        ok = task_memory.update_section(
+            "r1",
+            str(tmp_path),
+            section="Plan",
+            content="New plan content",
+            only_if_placeholder=True,
+        )
+        assert ok is True
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "New plan content" in content
+
+    def test_preserves_subsequent_sections(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        task_memory.update_section(
+            "r1",
+            str(tmp_path),
+            section="Plan",
+            content="My detailed plan",
+        )
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "## Progress" in content
+        assert "## Changes" in content
+        assert "## Checkpoint" in content
+
+    def test_returns_false_for_missing_file(self, tmp_path):
+        ok = task_memory.update_section(
+            "missing", str(tmp_path), section="Plan", content="x"
+        )
+        assert ok is False
+
+    def test_returns_false_for_missing_section(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        ok = task_memory.update_section(
+            "r1", str(tmp_path), section="NonExistent", content="x"
+        )
+        assert ok is False
+
+    def test_works_on_non_plan_sections(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        ok = task_memory.update_section(
+            "r1",
+            str(tmp_path),
+            section="Codebase Context",
+            content="FastAPI app with SQLAlchemy ORM",
+        )
+        assert ok is True
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "FastAPI app with SQLAlchemy ORM" in content
+
+
+class TestUpdateChangesSection:
+    def test_replaces_placeholder(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        ok = task_memory.update_changes_section(
+            "r1",
+            str(tmp_path),
+            diff_stat=" src/app.py | 10 ++-\n 1 file changed",
+        )
+        assert ok is True
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "src/app.py | 10 ++-" in content
+        assert "(no changes yet)" not in content
+
+    def test_preserves_subsequent_sections(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        task_memory.update_changes_section(
+            "r1",
+            str(tmp_path),
+            diff_stat="frontend/page.tsx | 5 +-",
+        )
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "## Test Results" in content
+        assert "## Verification" in content
+        assert "## Checkpoint" in content
+
+    def test_empty_diff_stat(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        task_memory.update_changes_section("r1", str(tmp_path), diff_stat="")
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        assert "(no changes detected)" in content
+
+    def test_returns_false_for_missing_file(self, tmp_path):
+        ok = task_memory.update_changes_section("missing", str(tmp_path), diff_stat="x")
+        assert ok is False
+
+    def test_returns_false_when_changes_section_missing(self, tmp_path):
+        task_memory.seed("r1", "task", str(tmp_path))
+        fp = task_memory.path("r1", str(tmp_path))
+        content = fp.read_text(encoding="utf-8")
+        content = content.replace("## Changes", "## Deleted")
+        fp.write_text(content, encoding="utf-8")
+        ok = task_memory.update_changes_section("r1", str(tmp_path), diff_stat="x")
+        assert ok is False

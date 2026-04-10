@@ -61,7 +61,7 @@ async def evaluate_via_cli(
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except TimeoutError:
+    except (TimeoutError, asyncio.CancelledError):
         proc.kill()
         await proc.wait()
         raise

@@ -50,6 +50,22 @@ rules:
     action: allow
     description: "Read-only browser observation"
 
+  - name: codebase-memory-readonly
+    tools:
+      - search_graph
+      - query_graph
+      - trace_path
+      - get_code_snippet
+      - get_graph_schema
+      - get_architecture
+      - search_code
+      - list_projects
+      - index_status
+      - detect_changes
+      - manage_adr
+    action: allow
+    description: "Read-only codebase memory graph queries"
+
   - name: agent-browser-readonly
     tool: Bash
     command_patterns:

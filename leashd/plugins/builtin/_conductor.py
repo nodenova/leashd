@@ -18,7 +18,6 @@ from leashd.plugins.builtin._cli_evaluator import evaluate_via_cli, sanitize_for
 logger = structlog.get_logger()
 
 ConductorAction = Literal[
-    "explore",
     "plan",
     "implement",
     "test",
@@ -61,28 +60,29 @@ Complexity levels (assess on first call only):
 - COMPLEX: Major refactor, new subsystem, cross-cutting concerns
 - CRITICAL: Security fix, data migration, breaking change
 
-Typical flows (guidelines, not rules):
+Typical flows:
 - TRIVIAL: implement → test → complete
 - SIMPLE: plan → implement → test → verify → complete
 - MODERATE: plan → implement → test → verify → review → complete
-- COMPLEX: explore → plan → implement → test → verify → fix → review → pr → complete
+- COMPLEX: plan → implement → test → verify → fix → review → pr → complete
 
 Rules:
 - TEST is mandatory before COMPLETE for any task that modifies code (only TRIVIAL \
 config tweaks or queries may skip it)
-- VERIFY (browser) is MANDATORY after TEST for any task that modifies code. \
-Use agent-browser to smoke-check the running application end-to-end. \
-Never skip VERIFY — even if unit/integration tests pass, browser verification \
-catches rendering bugs, broken routes, and UX regressions that automated tests miss.
+- VERIFY (browser/E2E) is recommended after TEST for tasks that modify frontend \
+files (*.tsx, *.jsx, *.css, *.html, *.vue, *.svelte) or API endpoints. \
+For backend-only changes with sufficient unit/integration test coverage, \
+you may skip VERIFY and proceed to REVIEW.
 - Always REVIEW before COMPLETE on non-trivial tasks
 - If tests/verification failed 3+ times for the same reason → ESCALATE
 - If the memory file shows prior work, continue from the checkpoint — don't restart
-- Skip EXPLORE when PLAN can gather the context — PLAN already reads CLAUDE.md and \
-project files. Only use EXPLORE for COMPLEX/CRITICAL tasks or when the codebase \
-structure is truly unknown.
 - Skip PLAN if the task is simple enough to implement directly
 - When uncertain whether to retry or escalate, check the retry count
 - Never go directly from IMPLEMENT to COMPLETE — always TEST first
+- Before choosing COMPLETE or REVIEW, check ## Checkpoint in the memory file. \
+If "Pending" includes test, you MUST run it first. \
+If ## Changes shows frontend files (*.tsx, *.jsx, *.css, *.html, *.vue, *.svelte), \
+VERIFY is strongly recommended.
 {extra_rules}
 Respond with EXACTLY one JSON object (no markdown fences, no extra text):
 {{"action": "<ACTION>", "reason": "<one-line why>", "instruction": "<specific guidance \
@@ -93,8 +93,7 @@ On the FIRST call (when complexity has not been assessed yet), also include:
 """
 
 _ACTION_DESCRIPTIONS: dict[str, str] = {
-    "explore": "EXPLORE: Read codebase to understand architecture, conventions, and context.",
-    "plan": "PLAN: Create a detailed implementation plan for complex changes.",
+    "plan": "PLAN: Read the codebase (CLAUDE.md, README, key source files) and create a detailed implementation plan.",
     "implement": "IMPLEMENT: Write code changes following the plan or task description.",
     "test": "TEST: Run automated test suites (pytest, jest, vitest, etc.).",
     "verify": (
@@ -295,7 +294,7 @@ async def decide_next_action(
             kind="timeout" if is_timeout else "cli_error",
         )
         # Fail-forward: if we haven't started, explore; otherwise implement
-        fallback_action: ConductorAction = "explore" if is_first_call else "implement"
+        fallback_action: ConductorAction = "plan" if is_first_call else "implement"
         reason_prefix = "conductor timed out" if is_timeout else "conductor call failed"
         return ConductorDecision(
             action=fallback_action,

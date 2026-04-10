@@ -635,3 +635,68 @@ class TestMaxConcurrentAgents:
                 await agent.execute("test", session, can_use_tool=AsyncMock())
             # The error should NOT be about concurrency limits
             assert len(agent._active_processes) <= 3
+
+
+class TestCancelDuringRetry:
+    """Regression for /stop bug: a cancelled session must not be retried.
+
+    Before the fix, when cancel() killed the Claude CLI subprocess (exit 143),
+    _run_with_retry caught the exception, saw agent_resume_token was still
+    set, and spawned a fresh subprocess — user's /stop was silently ignored.
+    """
+
+    async def test_cancel_before_run_aborts_immediately(self, agent, session):
+        session.agent_resume_token = "resume-token-xyz"
+        run_once = AsyncMock(return_value=None)
+
+        with patch.object(agent, "_run_once", run_once):
+            await agent.cancel(session.session_id)
+            with pytest.raises(AgentError, match="cancelled"):
+                await agent.execute("hi", session)
+
+        run_once.assert_not_called()
+
+    async def test_cancel_during_run_prevents_retry(self, agent, session):
+        session.agent_resume_token = "resume-token-xyz"
+
+        call_count = 0
+
+        async def fake_run_once(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Simulate cancel landing while _run_once is executing by
+            # marking the session as cancelled and raising the SIGTERM-ish
+            # exception the real CLI would produce.
+            await agent.cancel(session.session_id)
+            raise AgentError("CLI exited with code 143")
+
+        with (
+            patch.object(agent, "_run_once", side_effect=fake_run_once),
+            pytest.raises(AgentError, match="cancelled"),
+        ):
+            await agent.execute("hi", session)
+
+        assert call_count == 1, (
+            "retry loop should not spawn a second subprocess after cancel"
+        )
+
+    async def test_cancel_flag_cleared_after_execute(self, agent, session):
+        session.agent_resume_token = None
+
+        async def fake_run_once(*args, **kwargs):
+            from leashd.agents.base import AgentResponse
+
+            return AgentResponse(
+                content="ok",
+                session_id=session.session_id,
+                cost=0.0,
+                duration_ms=1,
+                num_turns=1,
+                tools_used=[],
+                is_error=False,
+            )
+
+        with patch.object(agent, "_run_once", side_effect=fake_run_once):
+            await agent.execute("hi", session)
+
+        assert session.session_id not in agent._cancelled_sessions

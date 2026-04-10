@@ -34,6 +34,19 @@ CLI commands are discoverable via `leashd --help` and `leashd <subcommand> --hel
 
 Before exploring the codebase, read the relevant spec in `specs/app/`. Start with `specs/app/00-quick-reference.md` for the file-to-class map, then consult the numbered spec for whichever subsystem you're working on. These are detailed technical references that save significant exploration time. **Always verify spec information against the actual source code** — specs can drift from the implementation, so treat them as a starting point, not the source of truth.
 
+## Code Exploration (codebase-memory-mcp)
+
+When exploring or planning, consider starting with `codebase-memory-mcp` tools to quickly understand code structure before diving into raw file reads:
+
+1. **`search_graph(name_pattern=..., label=..., qn_pattern=...)`** — find functions, classes, routes, or modules by name or label
+2. **`get_code_snippet(qualified_name=...)`** — read source code for a specific symbol (use instead of `Read` for code)
+3. **`trace_path(function_name=..., mode="calls|data_flow|cross_service")`** — trace call chains, data flow, or cross-service paths
+4. **`get_architecture(aspects=...)`** — get high-level project structure and architecture
+5. **`query_graph(query=...)`** — run Cypher queries for complex structural patterns
+6. **`search_code(pattern=...)`** — graph-augmented text search
+
+Fall back to `Grep`/`Glob`/`Read` only for non-code files (configs, YAML, text content, etc.). If the project is not indexed yet, run `index_repository` first.
+
 ## Mandatory Post-Implementation Check
 
 **ALWAYS run `make check` after finishing any implementation work and fix ALL issues before considering the task complete.** Non-negotiable. `make check` runs ruff, mypy, and pytest. mypy runs with `|| true` in the Makefile but you should still fix any type errors it reports.

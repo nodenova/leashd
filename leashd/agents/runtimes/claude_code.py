@@ -97,6 +97,7 @@ class ClaudeCodeAgent(BaseAgent):
         self._config = config
         self._active_clients: dict[str, ClaudeSDKClient] = {}
         self._stderr_buffers: dict[str, StderrBuffer] = {}
+        self._cancelled_sessions: set[str] = set()
         self._capabilities = AgentCapabilities(
             supports_tool_gating=True,
             supports_session_resume=True,
@@ -197,6 +198,7 @@ class ClaudeCodeAgent(BaseAgent):
             raise AgentError(friendly_error(str(e))) from e
         finally:
             self._stderr_buffers.pop(session.session_id, None)
+            self._cancelled_sessions.discard(session.session_id)
 
     def _build_options(
         self,
@@ -389,6 +391,13 @@ class ClaudeCodeAgent(BaseAgent):
 
         last_error: AgentResponse | None = None
         for _attempt in range(MAX_RETRIES):
+            if session.session_id in self._cancelled_sessions:
+                logger.info(
+                    "execution_cancelled_before_attempt",
+                    session_id=session.session_id,
+                    attempt=_attempt,
+                )
+                raise AgentError("Execution cancelled by user")
             if _attempt > 0 and on_retry:
                 await on_retry()
             start = time.monotonic()
@@ -525,6 +534,14 @@ class ClaudeCodeAgent(BaseAgent):
                     finally:
                         self._active_clients.pop(session.session_id, None)
             except Exception as exc:
+                if session.session_id in self._cancelled_sessions:
+                    logger.info(
+                        "execution_cancelled_during_run",
+                        session_id=session.session_id,
+                        error_preview=str(exc)[:ERROR_TRUNCATION_LENGTH],
+                    )
+                    raise AgentError("Execution cancelled by user") from exc
+
                 if options.resume:
                     logger.warning(
                         "resume_failed_retry_fresh",
@@ -563,6 +580,7 @@ class ClaudeCodeAgent(BaseAgent):
         return AgentResponse(content="No response received.", is_error=True)
 
     async def cancel(self, session_id: str) -> None:
+        self._cancelled_sessions.add(session_id)
         client = self._active_clients.get(session_id)
         if client:
             await client.interrupt()

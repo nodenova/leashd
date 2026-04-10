@@ -67,6 +67,7 @@ class ClaudeCliAgent(BaseAgent):
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
         self._write_locks: dict[str, asyncio.Lock] = {}
         self._stderr_buffers: dict[str, StderrBuffer] = {}
+        self._cancelled_sessions: set[str] = set()
         self._request_counter = 0
         self._capabilities = AgentCapabilities(
             supports_tool_gating=True,
@@ -279,6 +280,7 @@ class ClaudeCliAgent(BaseAgent):
             raise AgentError(friendly_error(str(e))) from e
         finally:
             self._stderr_buffers.pop(session.session_id, None)
+            self._cancelled_sessions.discard(session.session_id)
 
     async def _run_with_retry(
         self,
@@ -299,6 +301,13 @@ class ClaudeCliAgent(BaseAgent):
         resume_cleared = False
 
         for attempt in range(MAX_RETRIES):
+            if session.session_id in self._cancelled_sessions:
+                logger.info(
+                    "execution_cancelled_before_attempt",
+                    session_id=session.session_id,
+                    attempt=attempt,
+                )
+                raise AgentError("Execution cancelled by user")
             if attempt > 0 and on_retry:
                 await on_retry()
             stderr_buf.clear()
@@ -345,6 +354,14 @@ class ClaudeCliAgent(BaseAgent):
                 return response
 
             except Exception as exc:
+                if session.session_id in self._cancelled_sessions:
+                    logger.info(
+                        "execution_cancelled_during_run",
+                        session_id=session.session_id,
+                        error_preview=str(exc)[:ERROR_TRUNCATION_LENGTH],
+                    )
+                    raise AgentError("Execution cancelled by user") from exc
+
                 if session.agent_resume_token and not resume_cleared:
                     logger.warning(
                         "resume_failed_retry_fresh",
@@ -752,6 +769,7 @@ class ClaudeCliAgent(BaseAgent):
     # -- Cancel / Shutdown ---------------------------------------------------
 
     async def cancel(self, session_id: str) -> None:
+        self._cancelled_sessions.add(session_id)
         process = self._active_processes.get(session_id)
         if not process or process.returncode is not None:
             return

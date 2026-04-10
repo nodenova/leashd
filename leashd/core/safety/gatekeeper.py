@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-_MCP_PREFIX_RE = re.compile(r"^mcp__[a-zA-Z0-9_]+__")
+_MCP_PREFIX_RE = re.compile(r"^mcp__[a-zA-Z0-9_-]+__")
 
 
 def normalize_tool_name(tool_name: str) -> str:

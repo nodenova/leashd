@@ -18,6 +18,7 @@ from leashd.config_store import (
     get_approved_directories,
     get_autonomous_config,
     get_browser_config,
+    get_codebase_memory_config,
     get_skills_config,
     get_web_config,
     get_workspaces,
@@ -424,6 +425,48 @@ def _handle_browser_headless(state: str | None) -> None:
 
     label = "on (headless)" if enabled else "off (headed)"
     print(f"\u2713 Browser headless mode set to {label}")
+    _notify_daemon_reload()
+
+
+def _handle_codebase_memory(args: argparse.Namespace) -> None:
+    """Route codebase-memory subcommands."""
+    sub = getattr(args, "cm_command", None)
+    if sub is None or sub == "show":
+        _handle_codebase_memory_show()
+    elif sub == "enable":
+        _handle_codebase_memory_toggle(True)
+    elif sub == "disable":
+        _handle_codebase_memory_toggle(False)
+
+
+def _handle_codebase_memory_show() -> None:
+    """Display codebase-memory-mcp settings."""
+    data = load_global_config()
+    cm = get_codebase_memory_config(data)
+    enabled = cm.get("enabled", True)
+    binary = shutil.which("codebase-memory-mcp")
+    print(f"Enabled: {enabled}")
+    print(f"Binary:  {binary or 'not found'}")
+    if enabled and not binary:
+        print(
+            "\nNote: binary not found on PATH."
+            "\nInstall: https://github.com/DeusData"
+            "/codebase-memory-mcp"
+        )
+
+
+def _handle_codebase_memory_toggle(enabled: bool) -> None:
+    """Enable or disable codebase-memory-mcp."""
+    data = load_global_config()
+    cm = data.get("codebase_memory", {})
+    if not isinstance(cm, dict):
+        cm = {}
+    cm["enabled"] = enabled
+    data["codebase_memory"] = cm
+    save_global_config(data)
+    inject_global_config_as_env(force=True)
+    state = "enabled" if enabled else "disabled"
+    print(f"\u2713 Codebase memory {state}")
     _notify_daemon_reload()
 
 
@@ -1512,6 +1555,19 @@ def main() -> None:
         help="Set headless on or off (omit to show current)",
     )
 
+    # Codebase memory
+    cm_parser = subparsers.add_parser(
+        "codebase-memory",
+        help="Manage codebase-memory-mcp code intelligence",
+    )
+    cm_sub = cm_parser.add_subparsers(dest="cm_command")
+    cm_sub.add_parser(
+        "show",
+        help="Show codebase-memory settings (default)",
+    )
+    cm_sub.add_parser("enable", help="Enable codebase-memory-mcp")
+    cm_sub.add_parser("disable", help="Disable codebase-memory-mcp")
+
     # Thinking effort
     effort_parser = subparsers.add_parser("effort", help="Manage thinking effort level")
     effort_sub = effort_parser.add_subparsers(dest="effort_command")
@@ -1651,6 +1707,8 @@ def main() -> None:
         _handle_autonomous(args)
     elif args.command == "browser":
         _handle_browser(args)
+    elif args.command == "codebase-memory":
+        _handle_codebase_memory(args)
     elif args.command == "effort":
         _handle_effort(args)
     elif args.command == "turns":

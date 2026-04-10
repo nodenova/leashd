@@ -2990,3 +2990,101 @@ class TestBuildThreadOptionsNoAdditionalDirs:
         assert not hasattr(opts, "additional_directories") or not getattr(
             opts, "additional_directories", None
         )
+
+
+# ---------------------------------------------------------------------------
+# /stop regression: cancel must abort the retry loop, not re-spawn
+# ---------------------------------------------------------------------------
+
+
+class TestCancelDuringRetryAutonomous:
+    """Autonomous Codex path: /stop must not cause a silent retry."""
+
+    async def test_cancel_before_run_aborts_immediately(self, agent, session):
+        session.mode = "auto"
+        session.agent_resume_token = "resume-xyz"
+        mock_thread = MagicMock()
+        mock_thread.run_streamed_events = MagicMock(
+            side_effect=AssertionError("should not be called")
+        )
+        mock_codex = MagicMock()
+        mock_codex.resume_thread.return_value = mock_thread
+        mock_codex.start_thread.return_value = mock_thread
+
+        with _patch_autonomous_sdk(mock_codex):
+            await agent.cancel(session.session_id)
+            with pytest.raises(AgentError, match="cancelled"):
+                await agent._execute_autonomous("go", session)
+
+    async def test_cancel_during_run_prevents_retry(self, agent, session):
+        session.mode = "auto"
+        session.agent_resume_token = "resume-xyz"
+        call_count = 0
+
+        def run_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # Simulate stop arriving mid-turn.
+            agent._cancelled_sessions.add(session.session_id)
+            raise RuntimeError("Codex aborted: signal received")
+
+        mock_thread = MagicMock()
+        mock_thread.run_streamed_events = MagicMock(side_effect=run_side_effect)
+        mock_codex = MagicMock()
+        mock_codex.resume_thread.return_value = mock_thread
+        mock_codex.start_thread.return_value = mock_thread
+
+        with (
+            _patch_autonomous_sdk(mock_codex),
+            patch("leashd.agents.runtimes.codex.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(AgentError, match="cancelled"),
+        ):
+            await agent._execute_autonomous("go", session)
+
+        assert call_count == 1
+
+
+class TestCancelDuringRetryInteractive:
+    """Interactive Codex path: /stop must not cause a silent retry."""
+
+    async def test_cancel_before_run_aborts_immediately(self, agent, session):
+        session.mode = "default"
+        session.agent_resume_token = "resume-xyz"
+        mock_app, _mock_ts = _make_app_server_mocks(thread_id="t1")
+
+        async def _boom(*args, **kwargs):
+            raise AssertionError("thread_resume should not be called")
+
+        mock_app.thread_resume = _boom
+        mock_app.thread_start = _boom
+
+        with _patch_interactive_sdk(mock_app):
+            await agent.cancel(session.session_id)
+            with pytest.raises(AgentError, match="cancelled"):
+                await agent._execute_interactive(
+                    "go", session, can_use_tool=AsyncMock()
+                )
+
+    async def test_cancel_during_run_prevents_retry(self, agent, session):
+        session.mode = "default"
+        session.agent_resume_token = "resume-xyz"
+        call_count = 0
+
+        async def fake_thread_resume(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            agent._cancelled_sessions.add(session.session_id)
+            raise RuntimeError("AppServer aborted: signal received")
+
+        mock_app, _mock_ts = _make_app_server_mocks(thread_id="t1")
+        mock_app.thread_resume = fake_thread_resume
+        mock_app.thread_start = fake_thread_resume
+
+        with (
+            _patch_interactive_sdk(mock_app),
+            patch("leashd.agents.runtimes.codex.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(AgentError, match="cancelled"),
+        ):
+            await agent._execute_interactive("go", session, can_use_tool=AsyncMock())
+
+        assert call_count == 1

@@ -22,7 +22,7 @@ from leashd.core.task_profile import (
 
 class TestTaskProfileDefaults:
     def test_standalone_enables_all_actions(self):
-        assert "explore" in STANDALONE.enabled_actions
+        assert "plan" in STANDALONE.enabled_actions
         assert "verify" in STANDALONE.enabled_actions
         assert "pr" in STANDALONE.enabled_actions
         assert "complete" in STANDALONE.enabled_actions
@@ -45,7 +45,6 @@ class TestTaskProfileDefaults:
             initial_action="plan",
             docker_compose_available=True,
         )
-        assert "explore" not in profile.enabled_actions
         assert "plan" in profile.enabled_actions
         assert profile.initial_action == "plan"
         assert profile.docker_compose_available is True
@@ -53,13 +52,13 @@ class TestTaskProfileDefaults:
 
 class TestIsActionEnabled:
     def test_enabled_action(self):
-        assert STANDALONE.is_action_enabled("explore") is True
+        assert STANDALONE.is_action_enabled("plan") is True
 
     def test_disabled_action(self):
         profile = TaskProfile(
             enabled_actions=frozenset({"plan", "implement", "complete"})
         )
-        assert profile.is_action_enabled("explore") is False
+        assert profile.is_action_enabled("verify") is False
 
     def test_complete_always_queryable(self):
         assert STANDALONE.is_action_enabled("complete") is True
@@ -85,13 +84,13 @@ class TestResolveProfile:
         profile = resolve_profile(data)
         assert profile.initial_action == "plan"
         assert "plan" in profile.enabled_actions
-        assert "explore" not in profile.enabled_actions
+        assert "verify" not in profile.enabled_actions
 
     def test_resolve_json_with_disabled_actions(self):
-        data = json.dumps({"disabled_actions": ["explore", "verify"]})
+        data = json.dumps({"disabled_actions": ["verify", "pr"]})
         profile = resolve_profile(data)
-        assert "explore" not in profile.enabled_actions
         assert "verify" not in profile.enabled_actions
+        assert "pr" not in profile.enabled_actions
         assert "implement" in profile.enabled_actions
 
     def test_resolve_invalid_json_returns_standalone(self):
@@ -108,8 +107,8 @@ class TestProfileFromDict:
         assert "invalid_action" not in profile.enabled_actions
 
     def test_disabled_actions(self):
-        profile = _profile_from_dict({"disabled_actions": ["explore"]})
-        assert "explore" not in profile.enabled_actions
+        profile = _profile_from_dict({"disabled_actions": ["verify"]})
+        assert "verify" not in profile.enabled_actions
         assert "plan" in profile.enabled_actions
 
     def test_invalid_initial_action_becomes_none(self):
@@ -137,9 +136,9 @@ class TestMergeProfiles:
         assert merged.enabled_actions == frozenset({"implement", "test", "complete"})
 
     def test_override_initial_action_wins(self):
-        a = TaskProfile(initial_action="explore")
-        b = TaskProfile(initial_action="plan")
-        assert merge_profiles(a, b).initial_action == "plan"
+        a = TaskProfile(initial_action="plan")
+        b = TaskProfile(initial_action="implement")
+        assert merge_profiles(a, b).initial_action == "implement"
 
     def test_base_initial_action_if_override_is_none(self):
         a = TaskProfile(initial_action="plan")
@@ -193,7 +192,7 @@ class TestLoadProjectTaskConfig:
         config_file.write_text(
             textwrap.dedent("""\
             initial_action: plan
-            disabled_actions: [explore, verify]
+            disabled_actions: [verify, pr]
             conductor_instructions: "Focus on tests"
             action_instructions:
               test: "Run pytest -x"
@@ -202,8 +201,8 @@ class TestLoadProjectTaskConfig:
         profile = load_project_task_config(tmp_path)
         assert profile is not None
         assert profile.initial_action == "plan"
-        assert "explore" not in profile.enabled_actions
         assert "verify" not in profile.enabled_actions
+        assert "pr" not in profile.enabled_actions
         assert profile.conductor_instructions == "Focus on tests"
         assert profile.action_instructions["test"] == "Run pytest -x"
 

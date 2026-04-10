@@ -2535,3 +2535,103 @@ class TestStderrCapture:
 
         assert result.is_error
         assert call_count == 3
+
+
+class TestCancelDuringRetry:
+    """Regression: /stop must stop the retry loop, not re-spawn the SDK client."""
+
+    @pytest.fixture
+    def agent(self, tmp_path):
+        config = LeashdConfig(approved_directories=[str(tmp_path)])
+        return ClaudeCodeAgent(config)
+
+    @pytest.fixture
+    def session(self, tmp_path):
+        return Session(
+            session_id="test-session",
+            user_id="user-1",
+            chat_id="chat-1",
+            working_directory=str(tmp_path),
+        )
+
+    async def test_cancel_before_run_aborts_immediately(self, agent, session):
+        session.agent_resume_token = "resume-token-xyz"
+        call_count = 0
+
+        class FakeClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def query(self, prompt):
+                nonlocal call_count
+                call_count += 1
+
+            def receive_response(self):
+                async def _iter():
+                    if False:
+                        yield None
+
+                return _iter()
+
+        with patch("leashd.agents.runtimes.claude_code._SafeSDKClient", FakeClient):
+            await agent.cancel(session.session_id)
+            with pytest.raises(AgentError, match="cancelled"):
+                await agent.execute("hello", session)
+
+        assert call_count == 0
+
+    async def test_cancel_during_run_prevents_retry(self, agent, session):
+        session.agent_resume_token = "resume-token-xyz"
+        call_count = 0
+
+        class FakeClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def query(self, prompt):
+                nonlocal call_count
+                call_count += 1
+                # Simulate stop arriving mid-turn: user calls cancel, then
+                # the underlying SDK client raises because it was killed.
+                await agent.cancel(session.session_id)
+                raise RuntimeError("SDK exited with code 143")
+
+            def receive_response(self):
+                async def _iter():
+                    if False:
+                        yield None
+
+                return _iter()
+
+        with (
+            patch("leashd.agents.runtimes.claude_code._SafeSDKClient", FakeClient),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(AgentError, match="cancelled"),
+        ):
+            await agent.execute("hello", session)
+
+        assert call_count == 1, (
+            "retry loop should not spawn a second SDK client after cancel"
+        )
+
+    async def test_cancel_flag_cleared_after_execute(self, agent, session):
+        messages = [
+            _make_assistant_message([_make_text_block("done")]),
+            _make_result_message(result="done"),
+        ]
+        ctx, _ = _patch_sdk_client(messages)
+        with ctx:
+            await agent.execute("hello", session)
+        assert session.session_id not in agent._cancelled_sessions

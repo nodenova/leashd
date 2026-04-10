@@ -17,9 +17,9 @@ from leashd.plugins.builtin._conductor import (
 
 class TestParseResponse:
     def test_parses_json_response(self):
-        raw = '{"action": "explore", "reason": "need context", "instruction": "read src/"}'
+        raw = '{"action": "plan", "reason": "need context", "instruction": "read src/"}'
         result = _parse_response(raw)
-        assert result.action == "explore"
+        assert result.action == "plan"
         assert result.reason == "need context"
         assert result.instruction == "read src/"
 
@@ -35,9 +35,9 @@ class TestParseResponse:
         assert result.action == "test"
 
     def test_fallback_to_action_colon_format(self):
-        raw = "EXPLORE: need to understand the codebase"
+        raw = "PLAN: need to understand the codebase"
         result = _parse_response(raw)
-        assert result.action == "explore"
+        assert result.action == "plan"
         assert result.reason == "need to understand the codebase"
 
     def test_fallback_case_insensitive(self):
@@ -47,7 +47,6 @@ class TestParseResponse:
 
     def test_all_valid_actions_parse(self):
         for action in (
-            "explore",
             "plan",
             "implement",
             "test",
@@ -77,14 +76,14 @@ class TestParseResponse:
         assert result.action == "implement"
 
     def test_invalid_complexity_ignored(self):
-        raw = '{"action": "explore", "reason": "x", "instruction": "y", "complexity": "banana"}'
+        raw = '{"action": "plan", "reason": "x", "instruction": "y", "complexity": "banana"}'
         result = _parse_response(raw)
-        assert result.action == "explore"
+        assert result.action == "plan"
         assert result.complexity is None
 
     def test_valid_complexities(self):
         for level in ("trivial", "simple", "moderate", "complex", "critical"):
-            raw = f'{{"action": "explore", "reason": "x", "instruction": "y", "complexity": "{level}"}}'
+            raw = f'{{"action": "plan", "reason": "x", "instruction": "y", "complexity": "{level}"}}'
             result = _parse_response(raw)
             assert result.complexity == level
 
@@ -132,7 +131,7 @@ class TestDecideNextAction:
         with patch(
             "leashd.plugins.builtin._conductor.evaluate_via_cli",
             new_callable=AsyncMock,
-            return_value='{"action": "explore", "reason": "need context", "instruction": "look around", "complexity": "moderate"}',
+            return_value='{"action": "plan", "reason": "need context", "instruction": "look around", "complexity": "moderate"}',
         ):
             result = await decide_next_action(
                 task_description="Add a feature",
@@ -141,7 +140,7 @@ class TestDecideNextAction:
                 current_phase="pending",
                 is_first_call=True,
             )
-            assert result.action == "explore"
+            assert result.action == "plan"
             assert result.complexity == "moderate"
 
     async def test_falls_back_on_timeout(self):
@@ -157,7 +156,7 @@ class TestDecideNextAction:
                 current_phase="pending",
                 is_first_call=True,
             )
-            assert result.action == "explore"
+            assert result.action == "plan"
             assert "timed out" in result.reason
 
     async def test_falls_back_on_runtime_error(self):
@@ -221,18 +220,18 @@ class TestDecideNextAction:
             await decide_next_action(
                 task_description="test",
                 memory_content="## Codebase Context\nFound auth module",
-                last_output="done exploring",
-                current_phase="explore",
+                last_output="done planning",
+                current_phase="plan",
             )
             assert "Found auth module" in captured_args["user"]
-            assert "done exploring" in captured_args["user"]
+            assert "done planning" in captured_args["user"]
 
 
 class TestConductorDecisionModel:
     def test_frozen(self):
-        d = ConductorDecision(action="explore", reason="test")
+        d = ConductorDecision(action="plan", reason="test")
         with pytest.raises(ValidationError):
-            d.action = "plan"  # type: ignore[misc]
+            d.action = "implement"  # type: ignore[misc]
 
     def test_defaults(self):
         d = ConductorDecision(action="implement")
@@ -244,9 +243,10 @@ class TestConductorDecisionModel:
 class TestBuildSystemPrompt:
     def test_default_includes_all_actions(self):
         prompt = _build_system_prompt()
-        assert "EXPLORE" in prompt
+        assert "PLAN" in prompt
         assert "VERIFY" in prompt
         assert "PR" in prompt
+        assert "EXPLORE" not in prompt.split("Typical flows")[0]
 
     def test_filtered_actions_excludes_disabled(self):
         prompt = _build_system_prompt(
@@ -254,12 +254,10 @@ class TestBuildSystemPrompt:
                 {"plan", "implement", "test", "complete", "escalate"}
             )
         )
-        # Available actions section should list PLAN but not EXPLORE as an action
         actions_section = prompt.split("Available actions:")[1].split("Complexity")[0]
         assert "- PLAN:" in actions_section
         assert "- IMPLEMENT:" in actions_section
-        assert "- EXPLORE:" not in actions_section
-        # EXPLORE should be in the FORBIDDEN list
+        assert "- VERIFY:" not in actions_section
         assert "FORBIDDEN" in prompt
 
     def test_extra_instructions_appended(self):

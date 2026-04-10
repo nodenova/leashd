@@ -167,6 +167,7 @@ class CodexAgent:
         self._active_sessions: dict[str, Any] = {}
         self._active_threads: dict[str, Any] = {}
         self._abort_controllers: dict[str, Any] = {}
+        self._cancelled_sessions: set[str] = set()
         self._capabilities = AgentCapabilities(
             supports_tool_gating=True,
             supports_session_resume=True,
@@ -324,6 +325,8 @@ class CodexAgent:
             raise AgentError(
                 f"Codex agent error: {str(e)[:_ERROR_TRUNCATION_LENGTH]}"
             ) from e
+        finally:
+            self._cancelled_sessions.discard(session.session_id)
 
     async def _execute_interactive(
         self,
@@ -350,6 +353,13 @@ class CodexAgent:
         ever_had_resume = False
 
         for attempt in range(_MAX_RETRIES):
+            if session.session_id in self._cancelled_sessions:
+                logger.info(
+                    "execution_cancelled_before_attempt",
+                    session_id=session.session_id,
+                    attempt=attempt,
+                )
+                raise AgentError("Execution cancelled by user")
             if attempt > 0 and on_retry:
                 await on_retry()
 
@@ -471,6 +481,14 @@ class CodexAgent:
                 return AgentResponse(content="Execution was cancelled.", is_error=True)
 
             except Exception as exc:
+                if session.session_id in self._cancelled_sessions:
+                    logger.info(
+                        "execution_cancelled_during_run",
+                        session_id=session.session_id,
+                        error_preview=str(exc)[:_ERROR_TRUNCATION_LENGTH],
+                    )
+                    raise AgentError("Execution cancelled by user") from exc
+
                 if session.agent_resume_token:
                     logger.warning(
                         "codex_resume_failed_retry_fresh",
@@ -531,6 +549,13 @@ class CodexAgent:
         ever_had_resume = False
 
         for attempt in range(_MAX_RETRIES):
+            if session.session_id in self._cancelled_sessions:
+                logger.info(
+                    "execution_cancelled_before_attempt",
+                    session_id=session.session_id,
+                    attempt=attempt,
+                )
+                raise AgentError("Execution cancelled by user")
             if attempt > 0 and on_retry:
                 await on_retry()
 
@@ -655,6 +680,14 @@ class CodexAgent:
                 return AgentResponse(content="Execution was cancelled.", is_error=True)
 
             except Exception as exc:
+                if session.session_id in self._cancelled_sessions:
+                    logger.info(
+                        "execution_cancelled_during_run",
+                        session_id=session.session_id,
+                        error_preview=str(exc)[:_ERROR_TRUNCATION_LENGTH],
+                    )
+                    raise AgentError("Execution cancelled by user") from exc
+
                 if session.agent_resume_token:
                     logger.warning(
                         "codex_resume_failed_retry_fresh",
@@ -1151,6 +1184,7 @@ class CodexAgent:
                 )
 
     async def cancel(self, session_id: str) -> None:
+        self._cancelled_sessions.add(session_id)
         app = self._active_sessions.get(session_id)
         if app:
             with contextlib.suppress(Exception):

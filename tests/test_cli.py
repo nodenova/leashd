@@ -2336,3 +2336,59 @@ class TestPluginCli:
         _handle_plugin(args)
         captured = capsys.readouterr()
         assert "No Claude Code plugins installed" in captured.out
+
+
+class TestCodebaseMemory:
+    def test_codebase_memory_show_default(self, fake_config_dir, capsys):
+        from leashd.cli import _handle_codebase_memory_show
+
+        with patch("leashd.cli.shutil.which", return_value=None):
+            _handle_codebase_memory_show()
+        captured = capsys.readouterr()
+        assert "Enabled: True" in captured.out
+        assert "not found" in captured.out
+
+    def test_codebase_memory_show_with_binary(self, fake_config_dir, capsys):
+        from leashd.cli import _handle_codebase_memory_show
+
+        with patch(
+            "leashd.cli.shutil.which",
+            return_value="/usr/local/bin/codebase-memory-mcp",
+        ):
+            _handle_codebase_memory_show()
+        captured = capsys.readouterr()
+        assert "Enabled: True" in captured.out
+        assert "/usr/local/bin/codebase-memory-mcp" in captured.out
+
+    def test_codebase_memory_enable(self, fake_config_dir, capsys):
+        from leashd.cli import _handle_codebase_memory_toggle
+        from leashd.config_store import load_global_config
+
+        with patch("leashd.cli._notify_daemon_reload"):
+            _handle_codebase_memory_toggle(True)
+        captured = capsys.readouterr()
+        assert "enabled" in captured.out
+        data = load_global_config()
+        assert data["codebase_memory"]["enabled"] is True
+
+    def test_codebase_memory_disable(self, fake_config_dir, capsys):
+        from leashd.cli import _handle_codebase_memory_toggle
+        from leashd.config_store import load_global_config
+
+        with patch("leashd.cli._notify_daemon_reload"):
+            _handle_codebase_memory_toggle(False)
+        captured = capsys.readouterr()
+        assert "disabled" in captured.out
+        data = load_global_config()
+        assert data["codebase_memory"]["enabled"] is False
+
+    def test_codebase_memory_bare_defaults_to_show(self, fake_config_dir, capsys):
+        import argparse
+
+        from leashd.cli import _handle_codebase_memory
+
+        args = argparse.Namespace(cm_command=None)
+        with patch("leashd.cli.shutil.which", return_value=None):
+            _handle_codebase_memory(args)
+        captured = capsys.readouterr()
+        assert "Enabled:" in captured.out

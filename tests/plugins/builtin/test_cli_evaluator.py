@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -154,6 +155,25 @@ class TestEvaluateViaCli:
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             result = await evaluate_via_cli("sys", "user")
             assert result == "hello world"
+
+    async def test_cancellation_kills_subprocess(self):
+        proc = _mock_process(0, b"", b"")
+        # Make communicate hang until cancelled
+        proc.communicate = AsyncMock(side_effect=asyncio.CancelledError)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(asyncio.CancelledError):
+                await evaluate_via_cli("sys", "user")
+            proc.kill.assert_called_once()
+            proc.wait.assert_called_once()
+
+    async def test_timeout_kills_subprocess(self):
+        proc = _mock_process(0, b"", b"")
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        with patch("asyncio.create_subprocess_exec", return_value=proc):
+            with pytest.raises(TimeoutError):
+                await evaluate_via_cli("sys", "user")
+            proc.kill.assert_called_once()
+            proc.wait.assert_called_once()
 
 
 class TestSanitizeEdgeCases:

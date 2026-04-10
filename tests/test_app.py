@@ -286,7 +286,10 @@ class TestLoadDefaultMcpServers:
         assert config.mcp_servers == {"my-tool": {"command": "node"}}
 
     def test_missing_file_uses_hardcoded_defaults(self, tmp_path):
-        config = LeashdConfig(approved_directories=[tmp_path])
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            codebase_memory_enabled=False,
+        )
         _load_default_mcp_servers(config, tmp_path)
         assert config.mcp_servers == _DEFAULT_MCP_SERVERS
 
@@ -313,14 +316,20 @@ class TestLoadDefaultMcpServers:
     def test_empty_mcp_servers_in_file_uses_hardcoded_defaults(self, tmp_path):
         mcp_file = tmp_path / ".mcp.json"
         mcp_file.write_text(json.dumps({"mcpServers": {}}))
-        config = LeashdConfig(approved_directories=[tmp_path])
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            codebase_memory_enabled=False,
+        )
         _load_default_mcp_servers(config, tmp_path)
         assert config.mcp_servers == _DEFAULT_MCP_SERVERS
 
     def test_malformed_json_uses_hardcoded_defaults(self, tmp_path):
         mcp_file = tmp_path / ".mcp.json"
         mcp_file.write_text("not json{{{")
-        config = LeashdConfig(approved_directories=[tmp_path])
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            codebase_memory_enabled=False,
+        )
         _load_default_mcp_servers(config, tmp_path)
         assert config.mcp_servers == _DEFAULT_MCP_SERVERS
 
@@ -328,7 +337,10 @@ class TestLoadDefaultMcpServers:
         """OSError on .mcp.json read → caught, falls back to hardcoded defaults."""
         mcp_file = tmp_path / ".mcp.json"
         mcp_file.write_text('{"mcpServers": {"custom": {"command": "node"}}}')
-        config = LeashdConfig(approved_directories=[tmp_path])
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            codebase_memory_enabled=False,
+        )
         with patch("leashd.app.json.loads", side_effect=OSError("permission denied")):
             _load_default_mcp_servers(config, tmp_path)
         assert config.mcp_servers == _DEFAULT_MCP_SERVERS
@@ -343,3 +355,35 @@ class TestLoadDefaultMcpServers:
             pytest.raises(TypeError, match="unexpected"),
         ):
             _load_default_mcp_servers(config, tmp_path)
+
+    def test_codebase_memory_added_when_binary_exists(self, tmp_path):
+        """codebase-memory-mcp added to defaults when binary found on PATH."""
+        config = LeashdConfig(approved_directories=[tmp_path])
+        with patch(
+            "leashd.app.shutil.which", return_value="/usr/local/bin/codebase-memory-mcp"
+        ):
+            _load_default_mcp_servers(config, tmp_path)
+        assert "codebase-memory-mcp" in config.mcp_servers
+        assert (
+            config.mcp_servers["codebase-memory-mcp"]["command"]
+            == "codebase-memory-mcp"
+        )
+
+    def test_codebase_memory_skipped_when_binary_missing(self, tmp_path):
+        """codebase-memory-mcp not added when binary not on PATH."""
+        config = LeashdConfig(approved_directories=[tmp_path])
+        with patch("leashd.app.shutil.which", return_value=None):
+            _load_default_mcp_servers(config, tmp_path)
+        assert "codebase-memory-mcp" not in config.mcp_servers
+
+    def test_codebase_memory_skipped_when_disabled(self, tmp_path):
+        """codebase-memory-mcp not added when config flag is False."""
+        config = LeashdConfig(
+            approved_directories=[tmp_path],
+            codebase_memory_enabled=False,
+        )
+        with patch(
+            "leashd.app.shutil.which", return_value="/usr/local/bin/codebase-memory-mcp"
+        ):
+            _load_default_mcp_servers(config, tmp_path)
+        assert "codebase-memory-mcp" not in config.mcp_servers

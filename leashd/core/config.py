@@ -73,6 +73,7 @@ class LeashdConfig(BaseSettings):
     allowed_tools: list[str] = []
     disallowed_tools: list[str] = []
     mcp_servers: dict[str, Any] = {}
+    codebase_memory_enabled: bool = True
     effort: Literal["low", "medium", "high", "max"] | None = "medium"
 
     # Codex agent settings (only apply when agent_runtime="codex")

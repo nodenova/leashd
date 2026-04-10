@@ -6,7 +6,7 @@ prioritize, and how to behave.  Predefined profiles handle common scenarios:
 - **STANDALONE** (default): Full autonomy — all actions enabled, conductor
   decides everything.  Used when leashd runs on its own.
 - **PLATFORM**: For hosting platforms that handle Docker
-  verification and PR creation externally.  Disables explore/verify/pr,
+  verification and PR creation externally.  Disables verify/pr,
   starts with plan.
 - **CI**: Minimal — no browser, no PR, fast.  For CI/CD pipelines that
   only need implement + test.
@@ -28,7 +28,6 @@ logger = structlog.get_logger()
 # All valid conductor actions (mirrors ConductorAction literal)
 _ALL_ACTIONS: frozenset[str] = frozenset(
     {
-        "explore",
         "plan",
         "implement",
         "test",

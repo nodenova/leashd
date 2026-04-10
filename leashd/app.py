@@ -6,6 +6,7 @@ import json
 import logging
 import logging.handlers
 import os
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -139,6 +140,13 @@ _DEFAULT_MCP_SERVERS: dict[str, Any] = {
 def _load_default_mcp_servers(config: LeashdConfig, project_root: Path) -> None:
     """Merge default MCP servers into config so the agent always has browser tools."""
     defaults = dict(_DEFAULT_MCP_SERVERS)
+
+    # Add codebase-memory-mcp if enabled and binary is on PATH
+    if config.codebase_memory_enabled and shutil.which("codebase-memory-mcp"):
+        defaults["codebase-memory-mcp"] = {
+            "command": "codebase-memory-mcp",
+            "args": [],
+        }
 
     # Override defaults from file if present (local dev from repo root)
     mcp_path = project_root / ".mcp.json"
