@@ -119,8 +119,13 @@ class PolicyEngine:
         )
 
     def classify(self, tool_name: str, tool_input: dict[str, Any]) -> Classification:
+        command_texts = (
+            self._bash_match_texts(tool_input.get("command", ""))
+            if tool_name == "Bash"
+            else []
+        )
         for rule in self.rules:
-            if self._rule_matches(rule, tool_name, tool_input):
+            if self._rule_matches(rule, tool_name, tool_input, command_texts):
                 return Classification(
                     category=rule.name,
                     tool_name=tool_name,
@@ -146,24 +151,42 @@ class PolicyEngine:
         default = self.settings.get("default_action", "require_approval")
         return PolicyDecision(default)
 
+    @staticmethod
+    def _bash_match_texts(command: str) -> list[str]:
+        """The texts a Bash rule's patterns are matched against.
+
+        The normalized command — :func:`strip_benign_prefixes` peels
+        ``cd``/``sleep`` prefixes, wrappers and redirections so an anchored
+        pattern still recognizes ``agent-browser tab 2>&1``. Stripping the
+        redirection also removes where the command *writes*, which hid
+        ``echo … >> ~/.ssh/authorized_keys`` from every rule in the file and
+        left it cleared by the read-only ``echo`` allow. So a redirecting
+        command contributes its original text as well; a rule only has to
+        match one of the candidates.
+
+        Normalizing is linear in the command length and identical for every
+        rule, so it is done once per call rather than once per rule — a 100K
+        character command was paying it a dozen times over.
+        """
+        # Local import — browser_tools imports from safety modules, so
+        # defer this to call time to keep the module graph acyclic.
+        from leashd.plugins.builtin.browser_tools import strip_agent_browser_flags
+
+        raw = strip_agent_browser_flags(command)
+        normalized = strip_agent_browser_flags(strip_benign_prefixes(command))
+        candidates = shell_match_texts(normalized)
+        if raw != normalized and (">" in raw or "<" in raw):
+            candidates += shell_match_texts(raw)
+        return candidates
+
     def _rule_matches(
         self,
         rule: PolicyRule,
         tool_name: str,
         tool_input: dict[str, Any],
+        command_texts: list[str],
     ) -> bool:
-        """Whether *rule* covers this call.
-
-        A Bash rule is matched against the normalized command —
-        :func:`strip_benign_prefixes` peels ``cd``/``sleep`` prefixes, wrappers
-        and redirections so an anchored pattern still recognizes
-        ``agent-browser tab 2>&1``. Stripping the redirection also removes
-        where the command *writes*, which hid
-        ``echo … >> ~/.ssh/authorized_keys`` from every rule in the file and
-        left it cleared by the read-only ``echo`` allow. So a redirecting
-        command is matched against its original text as well; a rule only has
-        to match one of the candidates.
-        """
+        """Whether *rule* covers this call."""
         if rule.tools and tool_name not in rule.tools:
             return False
 
@@ -174,21 +197,8 @@ class PolicyEngine:
         if rule.command_patterns:
             if tool_name != "Bash":
                 return False
-            # Local import — browser_tools imports from safety modules, so
-            # defer this to call time to keep the module graph acyclic.
-            from leashd.plugins.builtin.browser_tools import (
-                strip_agent_browser_flags,
-            )
-
-            raw = strip_agent_browser_flags(tool_input.get("command", ""))
-            command = strip_agent_browser_flags(
-                strip_benign_prefixes(tool_input.get("command", ""))
-            )
-            candidates = shell_match_texts(command)
-            if raw != command and (">" in raw or "<" in raw):
-                candidates += shell_match_texts(raw)
             if not any(
-                p.search(text) for text in candidates for p in rule.command_patterns
+                p.search(text) for text in command_texts for p in rule.command_patterns
             ):
                 return False
 

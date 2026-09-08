@@ -16,13 +16,19 @@ from leashd.core.session import SessionManager
 
 
 class SlowAgent(BaseAgent):
-    """Agent that blocks until released, allowing race condition testing."""
+    """Agent that blocks until released, allowing race condition testing.
 
-    def __init__(self):
+    ``release_on_cancel=False`` keeps the turn parked past the whole ``/clear``
+    handler, so a test can pin down what a turn returning *after* the reset
+    does rather than racing the reset for it.
+    """
+
+    def __init__(self, release_on_cancel: bool = True):
         self.execute_entered = asyncio.Event()
         self.release = asyncio.Event()
         self.cancelled = False
         self.execute_count = 0
+        self.release_on_cancel = release_on_cancel
 
     async def execute(self, prompt, session, *, can_use_tool=None, **kwargs):
         self.execute_count += 1
@@ -37,7 +43,8 @@ class SlowAgent(BaseAgent):
     async def cancel(self, session_id):
         self.cancelled = True
         # Release the blocking agent so _execute_turn completes
-        self.release.set()
+        if self.release_on_cancel:
+            self.release.set()
 
     async def shutdown(self):
         pass
@@ -196,10 +203,50 @@ class TestClearDuringExecution:
 
 
 class TestClearWithConnector:
-    async def test_clear_during_execution_sends_interrupt_message(
+    async def test_clear_discards_turn_returning_after_reset(
         self, config, audit_logger, policy_engine, mock_connector
     ):
-        """When connector is present, interrupted agent shows transient message."""
+        """A turn that lands after /clear writes nothing into the fresh chat.
+
+        ``/clear`` swaps a new ``session_id`` in under the running turn, so the
+        turn is discarded on return rather than reported: the user already has
+        "Session cleared", and the transient "Task interrupted." belongs to
+        ``/stop`` and ``/cancel``, which leave the session in place.
+        """
+        mock_connector._support_streaming = True
+        agent = SlowAgent(release_on_cancel=False)
+        eng = Engine(
+            connector=mock_connector,
+            agent=agent,
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+        task = asyncio.create_task(eng.handle_message("user1", "hello", "chat1"))
+        await agent.execute_entered.wait()
+
+        reply = await eng.handle_command("user1", "clear", "", "chat1")
+        assert agent.cancelled
+        assert "cleared" in reply.lower()
+
+        agent.release.set()
+        assert await task == ""
+
+        texts = [m.get("text", "") for m in mock_connector.sent_messages]
+        assert not any("Echo: hello" in t for t in texts)
+        assert not any("interrupted" in t.lower() for t in texts)
+
+    async def test_clear_reports_interrupt_when_turn_lands_before_reset(
+        self, config, audit_logger, policy_engine, mock_connector
+    ):
+        """A turn that lands on the cancel, before the reset, is reported.
+
+        The interrupt marker ``/clear`` sets is consumed first here, so the
+        turn takes the ordinary interrupted path — either way, nothing the
+        agent produced reaches the cleared conversation.
+        """
         mock_connector._support_streaming = True
         agent = SlowAgent()
         eng = Engine(
@@ -214,12 +261,12 @@ class TestClearWithConnector:
         task = asyncio.create_task(eng.handle_message("user1", "hello", "chat1"))
         await agent.execute_entered.wait()
 
-        await eng.handle_command("user1", "clear", "", "chat1")
-        await task
+        eng._interrupted_chats.add("chat1")
+        await eng.agent.cancel(eng._executing_sessions["chat1"])
+        assert await task == ""
 
-        interrupt_msgs = [
-            m
-            for m in mock_connector.sent_messages
-            if "interrupted" in m.get("text", "").lower()
-        ]
-        assert len(interrupt_msgs) >= 1
+        await eng.handle_command("user1", "clear", "", "chat1")
+
+        texts = [m.get("text", "") for m in mock_connector.sent_messages]
+        assert not any("Echo: hello" in t for t in texts)
+        assert any("Task interrupted" in t for t in texts)
