@@ -156,13 +156,11 @@ class TestStreamingResponderFinalize:
         result = await responder.finalize("ignored when buffer is non-empty")
 
         assert result is True
-        # First edit truncates buffer tail to 4000
-        assert len(connector.edited_messages) >= 1
-        # Remainder sent via send_message
-        remainder_msgs = [
-            m for m in connector.sent_messages if m.get("message_id") is None
-        ]
-        assert len(remainder_msgs) >= 1
+        assert len(responder.all_message_ids) == 2
+        assert connector.sent_messages[0]["text"] == "x" * 4000
+        remainder = connector.edited_messages[-1]
+        assert remainder["message_id"] == responder.all_message_ids[-1]
+        assert remainder["text"] == "x" * 1000
 
 
 class TestStreamingResponderInactive:
@@ -174,6 +172,115 @@ class TestStreamingResponderInactive:
         await responder.on_chunk("hello")
 
         assert len(connector.sent_messages) == 0
+
+
+async def _backgrounded(connector, chat_id="284184690:s2"):
+    """A responder mid-turn whose chat has just moved to another conversation."""
+    responder = _StreamingResponder(connector, chat_id, throttle_seconds=0)
+    await responder.on_chunk("Part one. ")
+    await responder.suspend()
+    return responder
+
+
+class TestStreamingResponderBackgrounded:
+    """A turn the chat has moved off keeps recording, silently."""
+
+    async def test_chunks_produced_while_backgrounded_are_kept(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+
+        await responder.on_chunk("Part two. ")
+
+        assert responder.buffer == "Part one. Part two. "
+
+    async def test_nothing_is_written_to_the_chat_while_backgrounded(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+        connector.sent_messages.clear()
+        connector.edited_messages.clear()
+
+        await responder.on_chunk("Part two. ")
+        await responder.on_activity(
+            ToolActivity(tool_name="Bash", description="pytest")
+        )
+
+        assert connector.sent_messages == []
+        assert connector.edited_messages == []
+
+    async def test_tools_run_while_backgrounded_reach_the_summary(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+
+        await responder.on_activity(
+            ToolActivity(tool_name="Bash", description="pytest")
+        )
+        await responder.resume()
+        await responder.finalize("Part one. ")
+
+        assert "Bash" in connector.edited_messages[-1]["text"]
+
+    async def test_switching_back_shows_everything_produced_while_away(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+        await responder.on_chunk("Part two. ")
+        connector.sent_messages.clear()
+
+        assert await responder.resume() is True
+        assert connector.sent_messages[0]["text"].startswith("Part one. Part two. ")
+
+    async def test_switching_back_restores_the_running_tool_indicator(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+        await responder.on_activity(
+            ToolActivity(tool_name="Bash", description="pytest")
+        )
+        connector.activity_messages.clear()
+
+        await responder.resume()
+
+        assert connector.activity_messages[-1]["tool_name"] == "Bash"
+
+    async def test_a_finished_tool_is_not_re_shown_on_switching_back(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+        await responder.on_activity(
+            ToolActivity(tool_name="Bash", description="pytest")
+        )
+        await responder.on_activity(None)
+        connector.activity_messages.clear()
+
+        await responder.resume()
+
+        assert connector.activity_messages == []
+
+    async def test_a_buffer_that_outgrew_one_message_replays_paginated(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+        await responder.on_chunk("x" * 9000)
+        connector.sent_messages.clear()
+
+        await responder.resume()
+
+        assert len(connector.sent_messages) == 3
+        assert all(len(m["text"]) <= 4001 for m in connector.sent_messages)
+
+    async def test_the_reply_survives_a_switch_away_and_back_intact(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+        await responder.on_chunk("Part two. ")
+        await responder.resume()
+        await responder.on_chunk("Part three.")
+
+        assert responder.buffer == "Part one. Part two. Part three."
+
+    async def test_a_turn_that_ends_in_the_background_still_records_it_all(self):
+        connector = MockConnector(support_streaming=True)
+        responder = await _backgrounded(connector)
+
+        await responder.on_chunk("Part two. Part three.")
+
+        assert await responder.finalize(responder.buffer) is False
+        assert responder.buffer == "Part one. Part two. Part three."
 
 
 # --- Engine integration tests ---
@@ -617,17 +724,21 @@ class TestStreamingResponderOverflow:
         assert len(connector.sent_messages) == 1
         assert responder._display_offset == 0
 
-    async def test_first_chunk_exceeds_max_defers_overflow(self):
+    async def test_first_chunk_exceeds_max_overflows_at_once(self):
         connector = MockConnector(support_streaming=True)
         responder = _StreamingResponder(connector, "chat1", throttle_seconds=0.0)
         await responder.on_chunk("x" * 5000)
-        assert len(connector.sent_messages) == 1
-        assert responder._display_offset == 0
-        assert connector.sent_messages[0]["text"] == "x" * 4000 + "\u258d"
-        # Second chunk triggers overflow
+        assert len(connector.sent_messages) == 2
+        assert responder._display_offset == 4000
+        assert connector.sent_messages[0]["text"] == "x" * 4000
+        assert connector.sent_messages[1]["text"] == "x" * 1000 + "\u258d"
+        # The remainder keeps filling the message the overflow opened
         await responder.on_chunk("y" * 100)
         assert responder._display_offset == 4000
         assert len(connector.sent_messages) == 2
+        assert (
+            connector.edited_messages[-1]["text"] == "x" * 1000 + "y" * 100 + "\u258d"
+        )
 
     async def test_reset_clears_display_offset(self):
         connector = MockConnector(support_streaming=True)

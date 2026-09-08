@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import shutil
 from unittest.mock import MagicMock
@@ -13,6 +14,7 @@ from leashd.agents.base import ToolActivity
 from leashd.agents.runtimes.tmux_session import (
     _HOOK_NO_EXPIRY_SECONDS,
     HumanTypingProfile,
+    PolicyBlock,
     TmuxClaudeSession,
     TmuxSessionManager,
     TmuxTurn,
@@ -342,10 +344,14 @@ class _AllowStubGatekeeper:
 
 
 def test_credential_deny_rules_mirror_analyzer_floor():
-    """T-8: the native deny globs must cover the same credential files the
-    analyzer flags (_CREDENTIAL_PATTERNS) and must NOT over-block ordinary
-    source files. Drift here is a silent security gap (hook-denied reads are
-    bypassed under claude 2.1.x; the native floor is what actually blocks)."""
+    """T-8: the native deny globs must cover every credential file the
+    analyzer flags (_CREDENTIAL_PATTERNS) that actually lives directly in
+    $HOME or under ~/.ssh, ~/.aws, ~/.gnupg — the native floor's deliberately
+    narrowed scope (2026-09-03: every glob is `~`-anchored with a strictly
+    trailing wildcard, so it can never be resolved by claude 2.1.x against
+    raw Bash command text instead of a real Read/Edit path argument — see the
+    comment above _CREDENTIAL_DENY_GLOBS) — and must NOT over-block ordinary
+    source files."""
     from pathlib import PurePosixPath
 
     from leashd.agents.runtimes.tmux_session import _credential_deny_rules
@@ -360,29 +366,149 @@ def test_credential_deny_rules_mirror_analyzer_floor():
         p = PurePosixPath(path)
         return any(p.full_match(g.lstrip("~/")) for g in read_globs)
 
-    credentials = [
+    # Directly in $HOME, or under a directory-glob (.ssh/.aws/.gnupg) that
+    # still covers any depth below it via a trailing `**` — the native floor
+    # must catch all of these itself.
+    home_root_credentials = [
         ".env",
-        "config/.env.local",
         "server.key",
-        "tls/cert.pem",
-        "keys/id_rsa",
-        "keys/id_ed25519",
-        "aws/credentials",
-        "app/secrets.json",
         "store.keystore",
-        "auth/token.json",
-        ".ssh/config",
-        ".aws/credentials",
         "client.p12",
         "client.pfx",
+        ".ssh/config",
+        ".aws/credentials",
+        ".gnupg/private-keys-v1.d/foo",
     ]
-    for c in credentials:
+    for c in home_root_credentials:
         assert analyze_path(c).is_credential, f"analyzer should flag {c}"
         assert covered(c), f"deny globs should cover {c}"
 
     for ordinary in ["main.py", "src/app.ts", "README.md", "docs/guide.md"]:
         assert not analyze_path(ordinary).is_credential, f"{ordinary} is not a cred"
         assert not covered(ordinary), f"deny globs must not over-block {ordinary}"
+
+
+REMOTE_COMMANDS_MENTIONING_CREDENTIALS = [
+    'ssh -o ConnectTimeout=15 neomi-demo \'echo "=== SSH KEYS (root) ==="; '
+    'ls -la ~/.ssh/ 2>/dev/null; echo "=== GITHUB SSH TEST ==="; '
+    "ssh -o ConnectTimeout=10 -T git@github.com 2>&1 | head -5'",
+    "ssh -o ConnectTimeout=15 neomi-demo 'echo \"=== ssh dir ==='\"'\"'; "
+    "ls -la ~/.ssh/ 2>&1; git -C /var/www/chat config --get credential.helper; "
+    'cat ~/.git-credentials 2>&1 | sed "s/:[^:@]*@/:***@/"\'',
+    "ssh deploy@host 'cat /srv/app/.env'",
+    "docker exec api sh -c 'ls -la /root/.aws/credentials'",
+    "kubectl exec pod-1 -- cat /etc/secrets.json",
+    "grep -rn 'id_rsa' docs/",
+    "rg --files-with-matches secret.yaml src/",
+]
+
+
+def test_native_deny_floor_ignores_remote_and_mentioned_credential_paths():
+    """Regression for the 2026-09-03 neomi-demo incident: the agent connected
+    to the remote host fine, then every remote command that merely *mentioned*
+    a credential path was refused with
+    ``ssh from '<cwd>/<payload>' was blocked by a deny rule``.
+
+    Claude 2.1.x resolves a Bash tool call against file-permission rules by
+    joining the raw command text onto the working directory and matching the
+    result as if it were a path. So an ssh payload like ``ls -la ~/.ssh/`` —
+    a path on the *remote* box, which this machine's floor has no business
+    judging — became the pseudo-path ``<cwd>/... ~/.ssh/ ...`` and hit an
+    unanchored ``Read(**/.ssh/**)``.
+
+    Anchoring every glob at ``~/`` is what makes that impossible: a pseudo-path
+    is rooted at the working directory, which is not $HOME, so no ``~``-rooted
+    glob can match it. Reintroducing a ``**/``-anchored glob fails here.
+    """
+    from pathlib import PurePosixPath
+
+    from leashd.agents.runtimes.tmux_session import _credential_deny_rules
+
+    home = "/Users/vmehera"
+    cwd = f"{home}/projects/neomi/chat"
+    globs = [r[r.index("(") + 1 : -1] for r in _credential_deny_rules()]
+    assert globs
+
+    def denies(path: str) -> list[str]:
+        p = PurePosixPath(path)
+        return [g for g in globs if p.full_match(g.replace("~", home, 1))]
+
+    for command in REMOTE_COMMANDS_MENTIONING_CREDENTIALS:
+        pseudo_path = f"{cwd}/{command}"
+        assert not denies(pseudo_path), (
+            f"native floor must not resolve Bash text as a local path: "
+            f"{denies(pseudo_path)} blocked {command!r}"
+        )
+
+    assert denies(f"{home}/.ssh/id_rsa"), (
+        "a real local credential read must stay denied"
+    )
+    assert denies(f"{home}/.aws/credentials"), (
+        "a real local credential read must stay denied"
+    )
+    assert denies(f"{home}/.env"), "a real local credential read must stay denied"
+
+
+def test_native_deny_globs_are_home_anchored_with_trailing_wildcards_only():
+    """The structural invariant behind the test above, asserted directly so a
+    future edit cannot quietly restore a glob shape that matches command text.
+
+    Every glob must be ``~``-rooted, and no wildcard may be followed by a later
+    literal segment — ``~/**/foo`` would re-open the same hole as ``**/foo``,
+    because ``**`` swallows the working directory and lets ``foo`` match a word
+    inside the command.
+    """
+    from leashd.agents.runtimes.tmux_session import _CREDENTIAL_DENY_GLOBS
+
+    for glob in _CREDENTIAL_DENY_GLOBS:
+        assert glob.startswith("~/"), f"{glob} is not anchored at $HOME"
+        head, _, tail = glob.partition("**")
+        assert not tail.strip("/"), f"{glob} has a literal after a `**` wildcard"
+        assert "*" not in head.rstrip("*/").rsplit("/", 1)[0], (
+            f"{glob} wildcards a directory segment, so it can match command text"
+        )
+
+
+def test_credential_files_policy_rule_covers_nested_paths_for_read_and_edit():
+    """The native floor above deliberately stops covering a credential file
+    nested more than one segment under $HOME (e.g. `~/projects/x/.env`) —
+    that's the trade-off documented on _CREDENTIAL_DENY_GLOBS. This is the
+    OTHER, always-live half of that trade-off: `credential-files` in the
+    policy YAML matches Read/Write/Edit `path_patterns` with `re.search`
+    (core/safety/policy.py), so nesting depth never matters there. It fires
+    on every such call that reaches leashd's PreToolUse hook — i.e. whenever
+    claude's TUI classifier does NOT skip the hook, which is the gap this
+    file's native floor exists to cover for the rest of the time. It does
+    NOT cover Bash (`tools: [Read, Write, Edit]`, same as the native floor
+    above) — a Bash command that locally `cat`s a nested credential file has
+    no independent leashd-side check today; see the comment on
+    _CREDENTIAL_DENY_GLOBS."""
+    from leashd.core.safety.policy import PolicyEngine
+
+    engine = PolicyEngine(["leashd/policies/default.yaml"])
+    nested = [
+        "config/.env.local",
+        "tls/cert.pem",
+        "keys/id_rsa",
+        "keys/id_ed25519",
+        "app/secrets.json",
+        "auth/token.json",
+        "aws/credentials",
+    ]
+    for path in nested:
+        for tool in ("Read", "Edit"):
+            c = engine.classify(tool, {"file_path": path})
+            assert c.matched_rule is not None, (
+                f"credential-files should still match {tool}({path}) regardless of nesting"
+            )
+            assert c.matched_rule.name == "credential-files", (
+                f"credential-files should still match {tool}({path}) regardless of nesting"
+            )
+            assert str(c.matched_rule.action.value) == "deny"
+        c = engine.classify("Bash", {"command": f"cat {path}"})
+        assert c.matched_rule is None or c.matched_rule.name != "credential-files", (
+            "credential-files is Read/Write/Edit-scoped, not a Bash protection"
+        )
 
 
 def test_managed_settings_carry_credential_deny_floor(cfg):
@@ -392,13 +518,17 @@ def test_managed_settings_carry_credential_deny_floor(cfg):
     deny = json.loads(tsm.write_managed_settings("s1").read_text())["permissions"][
         "deny"
     ]
-    assert "Read(**/.env)" in deny
-    assert "Read(**/*.key)" in deny
-    assert "Write(**/.env)" in deny
+    assert "Read(~/.env)" in deny
+    assert "Read(~/*.key)" in deny
+    assert "Edit(~/.env)" in deny
+    # NOT Write(...): claude resolves file permission checks against Edit(path)
+    # and Read(path) only, and warns at startup for every Write rule it will
+    # never consult. Edit already covers Write/NotebookEdit/MultiEdit.
+    assert not any(r.startswith("Write(") for r in deny)
     cli_deny = json.loads(tsm.write_auto_floor_settings("s2").read_text())[
         "permissions"
     ]["deny"]
-    assert "Read(**/.env)" in cli_deny
+    assert "Read(~/.env)" in cli_deny
 
 
 def test_pre_tool_hook_timeout_outlives_human_window(cfg):
@@ -1047,9 +1177,10 @@ async def test_process_blocks_streams_and_records():
             {"type": "tool_result", "tool_use_id": "x"},
         ],
     )
-    # Transcript: narration + the recorded tool call + the tools footer,
-    # paragraph-separated (not a "".join run-on).
-    assert turn.assembled_text == ("hello\n\n\U0001f527 Read: /a.py\n\n\U0001f9f0 Read")
+    # The answer plus the tools footer. The per-call 🔧 line is a live
+    # indicator only (ToolActivity below) — it must not land in the reply.
+    assert turn.assembled_text == "hello\n\n\U0001f9f0 Read"
+    assert "\U0001f527" not in turn.assembled_text
     assert turn.tools_used == ["Read"]
     assert chunks == ["hello "]
     assert activities[0].tool_name == "Read"
@@ -1058,7 +1189,9 @@ async def test_process_blocks_streams_and_records():
 
 async def test_assembled_text_multi_step_is_structured_not_runon():
     """The /test regression: many assistant steps must not collapse into one
-    separator-less blob with the tool calls erased."""
+    separator-less blob. The paragraph break rides in the same chunk as the
+    step it introduces, so no reader of the stream ever sees the break without
+    the text behind it."""
     streamed: list[str] = []
 
     async def on_text(t):
@@ -1091,14 +1224,14 @@ async def test_assembled_text_multi_step_is_structured_not_runon():
     # No edge-to-edge concatenation across steps.
     assert "Docker.\n\n" in text
     assert "Docker.Running" not in text
-    # Tool calls are visible in the transcript.
-    assert "\U0001f527 Bash: docker ps" in text
-    assert "\U0001f527 Bash: agent-browser snapshot" in text
+    # Tool calls stay out of the reply — the trailing footer is their record.
+    assert "\U0001f527" not in text
+    assert "docker ps" not in text
     # Footer mirrors the engine summary format (Bash used twice).
     assert text.endswith("\U0001f9f0 Bash x2")
     assert turn.tools_used == ["Bash", "Bash"]
-    # Live stream gets a paragraph break between steps too.
-    assert "\n\n" in streamed
+    assert "Docker.\n\nRunning" in "".join(streamed)
+    assert "\n\n" not in streamed
 
 
 async def test_assembled_text_dedupes_verbatim_resend_and_skips_blank():
@@ -1112,6 +1245,55 @@ async def test_assembled_text_dedupes_verbatim_resend_and_skips_blank():
         ],
     )
     assert turn.assembled_text == "same"
+
+
+async def test_leading_tool_calls_do_not_open_the_reply_with_blank_lines():
+    """A turn that opens with tool calls must not emit a paragraph break before
+    its first words: the break separates *text* steps, and a leading 🔧 entry
+    used to make ``text_parts`` truthy, opening every such reply with "\\n\\n"."""
+    streamed: list[str] = []
+
+    async def on_text(t):
+        streamed.append(t)
+
+    turn = TmuxTurn(on_text_chunk=on_text, on_tool_activity=None)
+    await TmuxSessionManager._process_blocks(
+        turn,
+        [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "echo hi"}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "pwd"}},
+        ],
+    )
+    await TmuxSessionManager._process_blocks(
+        turn, [{"type": "text", "text": "Fully detached."}]
+    )
+
+    assert "".join(streamed) == "Fully detached."
+    assert turn.assembled_text == "Fully detached.\n\n\U0001f9f0 Bash x2"
+
+
+async def test_assembled_text_matches_the_stream_plus_footer():
+    """What finalize rewrites the chat with (``assembled_text``) must be the
+    text the user already watched stream in, not a transcript that re-adds the
+    ephemeral per-call indicators on top of it."""
+    streamed: list[str] = []
+
+    async def on_text(t):
+        streamed.append(t)
+
+    turn = TmuxTurn(on_text_chunk=on_text, on_tool_activity=None)
+    for block in (
+        {"type": "text", "text": "Starting with the first command."},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "echo hello"}},
+        {"type": "text", "text": "That printed the greeting."},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "whoami"}},
+        {"type": "text", "text": "Running as vmehera."},
+    ):
+        await TmuxSessionManager._process_blocks(turn, [block])
+
+    footer = "\n\n\U0001f9f0 Bash x2"
+    assert turn.assembled_text == "".join(streamed).strip() + footer
+    assert "\U0001f527" not in turn.assembled_text
 
 
 def test_tools_footer_format_matches_engine():
@@ -1301,16 +1483,126 @@ def test_build_claude_command_has_parity_flags(cfg, tmp_path):
     assert "--max-turns" not in cmd
     assert "Task" in cmd
     assert "Agent" in cmd
-    assert sysprompt_path is None
-    assert "--append-system-prompt-file" not in cmd
-    assert "--append-system-prompt SYS" in cmd
+    assert sysprompt_path is not None
+    assert "--append-system-prompt-file" in cmd
+    assert "--append-system-prompt SYS" not in cmd
+
+
+def test_build_claude_command_keeps_sysprompt_out_of_argv(cfg, tmp_path):
+    """The prompt never reaches argv, however short it is.
+
+    Regression: a pane spawned with the prompt inline matched
+    ``pkill -f agent-browser`` — a word from leashd's own browser guidance —
+    so one conversation's routine browser cleanup SIGTERMed every sibling
+    conversation's agent mid-turn.
+    """
+    tsm = TmuxSessionManager(cfg)
+    tsm._claude_path = "/usr/bin/claude"
+    tsm._socket_dir = tmp_path / "sock"
+    prompt = "Browser automation uses agent-browser on this machine."
+    cmd, sysprompt_path = tsm._build_claude_command(
+        session_id="short",
+        session=_parity_session(tmp_path),
+        settings=None,
+        perm_mode="acceptEdits",
+        settings_path=tmp_path / "managed.json",
+        model="claude-x",
+        resume_uuid=None,
+        append_system_prompt=prompt,
+    )
+    assert sysprompt_path is not None
+    assert sysprompt_path.read_text() == prompt
+    assert "--append-system-prompt-file" in cmd
+    assert "--append-system-prompt " not in cmd
+    assert "agent-browser" not in cmd
+
+
+def test_build_claude_command_hoists_tool_lists_into_settings(cfg, tmp_path):
+    """Tool allow/deny lists move into managed settings, not argv.
+
+    Regression: ``--disallowedTools`` inlined ~30 comma-joined tool names, so
+    every pane's command line carried "playwright" and "browser" and matched an
+    unrelated ``pkill -f playwright`` fired by a sibling conversation.
+    """
+    import json
+
+    tsm = TmuxSessionManager(cfg)
+    tsm._claude_path = "/usr/bin/claude"
+    tsm._socket_dir = tmp_path / "sock"
+    settings_path = tmp_path / "managed.json"
+    settings_path.write_text(json.dumps({"permissions": {"deny": ["Read(**/.env)"]}}))
+
+    cmd, _ = tsm._build_claude_command(
+        session_id="hoist",
+        session=_parity_session(tmp_path),
+        settings=None,
+        perm_mode="acceptEdits",
+        settings_path=settings_path,
+        model="claude-x",
+        resume_uuid=None,
+        append_system_prompt="SYS",
+    )
+
+    assert "--disallowedTools" not in cmd
+    assert "playwright" not in cmd
+    deny = json.loads(settings_path.read_text())["permissions"]["deny"]
+    assert "Read(**/.env)" in deny, "pre-existing entries must survive"
+    assert "Task" in deny
+    assert "Agent" in deny
+
+
+def test_build_claude_command_keeps_tool_lists_when_settings_unreadable(cfg, tmp_path):
+    """An unreadable settings file must not silently drop the deny list.
+
+    Failing open on argv is recoverable; failing open on *neither* would hand
+    the pane a toolset leashd meant to withhold.
+    """
+    tsm = TmuxSessionManager(cfg)
+    tsm._claude_path = "/usr/bin/claude"
+    tsm._socket_dir = tmp_path / "sock"
+
+    cmd, _ = tsm._build_claude_command(
+        session_id="nofile",
+        session=_parity_session(tmp_path),
+        settings=None,
+        perm_mode="acceptEdits",
+        settings_path=tmp_path / "absent.json",
+        model="claude-x",
+        resume_uuid=None,
+        append_system_prompt="SYS",
+    )
+
+    assert "--disallowedTools" in cmd
+    assert "Task" in cmd
+    assert "Agent" in cmd
+
+
+def test_build_claude_command_spills_mcp_config_to_file(cfg, tmp_path):
+    """MCP server names/commands belong in a file, not argv.
+
+    ``pkill -f codebase-memory-mcp`` to restart a stuck MCP server would
+    otherwise match every pane that merely declared it.
+    """
+    import json
+
+    tsm = TmuxSessionManager(cfg)
+    tsm._claude_path = "/usr/bin/claude"
+    tsm._socket_dir = tmp_path / "sock"
+    parts = ["claude", "--mcp-config", json.dumps({"mcpServers": {"memory-mcp": {}}})]
+
+    path = tsm._spill_mcp_config(parts, "spill")
+
+    assert path is not None
+    assert json.loads(path.read_text())["mcpServers"] == {"memory-mcp": {}}
+    assert parts[2] == str(path)
+    assert "mcpServers" not in " ".join(parts)
 
 
 def test_build_claude_command_swaps_large_sysprompt_for_file(cfg, tmp_path):
     tsm = TmuxSessionManager(cfg)
     tsm._claude_path = "/usr/bin/claude"
     tsm._socket_dir = tmp_path / "sock"
-    long_sys = "X" * (tsm._APPEND_SYSPROMPT_INLINE_MAX + 1)
+    long_sys = "X" * 8192
     cmd, sysprompt_path = tsm._build_claude_command(
         session_id="huge",
         session=_parity_session(tmp_path),
@@ -1364,11 +1656,16 @@ async def test_await_ready_returns_when_composer_drawn(cfg, no_real_sleep):
 
 
 async def test_await_ready_accepts_trust_prompt_then_ready(cfg, no_real_sleep):
+    """Legacy folder-trust wording, whose affirmative row *is* the default —
+    the cursor already sits on it, so a bare Enter confirms."""
     tsm = TmuxSessionManager(cfg)
     cs = _session(tsm)
+    legacy = "Do you trust the files in this folder?\n ❯ 1. Yes, proceed\n   2. No"
+    # Two reads of the dialog: await_ready's own capture, then the drive's.
     pane = _FakePane(
         [
-            "Do you trust the files in this folder?\n> 1. Yes, proceed",
+            legacy,
+            legacy,
             "boot...",
             "context left until auto-compact · ? for shortcuts",
         ]
@@ -1376,6 +1673,101 @@ async def test_await_ready_accepts_trust_prompt_then_ready(cfg, no_real_sleep):
     cs.attach(object(), pane)
     assert await cs.await_ready(timeout=5.0) is True
     assert ("Enter", False) in pane.sent  # trust dialog dismissed
+    assert ("Down", False) not in pane.sent  # already on "Yes"
+
+
+_WORKSPACE_TRUST_SCREEN = (
+    "Accessing workspace:\n"
+    "/work\n"
+    "Quick safety check: Is this a project you created or one you trust?\n"
+    "⚠ This folder pre-approves 102 tool permissions in "
+    ".claude/settings.local.json:\n"
+    "Security guide\n"
+    " ❯ No, exit\n"
+    "   Yes, I trust this folder\n"
+    " Enter to confirm · Esc to cancel"
+)
+_WORKSPACE_TRUST_SELECTED = _WORKSPACE_TRUST_SCREEN.replace(
+    " ❯ No, exit\n   Yes, I trust this folder",
+    "   No, exit\n ❯ Yes, I trust this folder",
+)
+
+
+async def test_await_ready_accepts_workspace_trust_dialog(cfg, no_real_sleep):
+    """claude 2.1.2xx's "Accessing workspace / Quick safety check" gate.
+
+    Two properties this dialog broke and this asserts: it is *recognised* as
+    the trust gate despite sharing no wording with the legacy prompt, and the
+    affirmative row is reached by moving the cursor — its rows carry no digits
+    to type, and the default row is "No, exit".
+    """
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _FakePane(
+        [
+            # await_ready's capture, then the drive's: one on the default row
+            # (press Down), one showing the cursor landed (press Enter).
+            _WORKSPACE_TRUST_SCREEN,
+            _WORKSPACE_TRUST_SCREEN,
+            _WORKSPACE_TRUST_SELECTED,
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+        ]
+    )
+    cs.attach(object(), pane)
+    assert await cs.await_ready(timeout=5.0) is True
+    assert pane.sent[0] == ("Down", False)
+    assert ("Enter", False) in pane.sent
+    assert pane.sent.index(("Down", False)) < pane.sent.index(("Enter", False))
+
+
+async def test_await_ready_never_confirms_trust_on_the_exit_row(cfg, no_real_sleep):
+    """The regression that killed the pane: Enter on this dialog's default row
+    is "No, exit", so ``claude`` quits and the turn dies as ``paste-buffer
+    failed: target pane has exited``. A screen whose cursor never leaves that
+    row must cost the turn a timeout, never an Enter.
+    """
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _FakePane([_WORKSPACE_TRUST_SCREEN])
+    cs.attach(object(), pane)
+    assert await cs.await_ready(timeout=0.5) is False
+    assert ("Enter", False) not in pane.sent
+    assert ("Escape", False) not in pane.sent
+
+
+async def test_await_ready_never_confirms_trust_without_a_visible_cursor(
+    cfg, no_real_sleep
+):
+    """``capture-pane -p`` drops attributes, so the cursor glyph is the only
+    evidence of which row is selected. No cursor means "cannot tell", and
+    confirming on a guess is what exits claude — so nothing is pressed."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _FakePane([_WORKSPACE_TRUST_SCREEN.replace(" ❯ No, exit", "   No, exit")])
+    cs.attach(object(), pane)
+    assert await cs.await_ready(timeout=0.5) is False
+    assert ("Enter", False) not in pane.sent
+
+
+async def test_dismiss_stray_dialog_never_escapes_trust_prompt(cfg, no_real_sleep):
+    """Escape on the trust gate is "cancel", which exits claude. The stray-
+    dialog escape hatch runs on every ``submit()``; letting it fire here turned
+    a recoverable "pane not ready" into a dead pane."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _FakePane([_WORKSPACE_TRUST_SCREEN])
+    cs.attach(object(), pane)
+    await cs._dismiss_stray_dialog()
+    assert pane.sent == []
+
+
+async def test_trust_prompt_present_spans_both_wordings(cfg):
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    cs.attach(object(), _FakePane(["composer"]))
+    assert cs.trust_prompt_present(_WORKSPACE_TRUST_SCREEN) is True
+    assert cs.trust_prompt_present("Do you trust the files in this folder?") is True
+    assert cs.trust_prompt_present("⏵⏵ auto mode on (shift+tab to cycle)") is False
 
 
 async def test_await_ready_times_out_on_stuck_splash(cfg, no_real_sleep):
@@ -2192,6 +2584,7 @@ class _StubFloorGatekeeper:
         task_description=None,
         session_mode=None,
         task_run_id=None,
+        native_ask_rules=None,
     ):
         # Returns None to signal "defer to native", or a PermissionAllow/Deny
         # for an explicit-rule gate (mirrors the real check_auto_gated).
@@ -2848,6 +3241,116 @@ async def test_answer_perm_selector_deny_presses_escape(cfg, no_real_sleep):
     assert ("Enter", False) not in pane.sent
 
 
+async def test_answer_perm_selector_presses_once_when_the_dialog_lingers(
+    cfg, no_real_sleep
+):
+    """The reported mid-turn stop: a dismissed dialog stays in the visible pane,
+    so the presence check keeps reading True. The old drive re-pressed on every
+    poll for its whole deadline — 13 to 18 Escapes into a live agent, each one
+    an interrupt — and the turn died mid-work. One keystroke, whatever the
+    screen keeps saying."""
+    from structlog.testing import capture_logs
+
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    sel = " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel"
+    pane = _FakePane([sel])  # never stops looking present
+    cs.attach(object(), pane)
+
+    with capture_logs() as logs:
+        assert await cs.answer_perm_selector(allow=False, timeout=5.0) is True
+
+    assert pane.sent.count(("Escape", False)) == 1
+    assert "tmux_perm_selector_unconfirmed" in [e["event"] for e in logs]
+
+
+def test_perm_selector_signature_separates_two_dialogs(cfg):
+    """Presence cannot tell a live dialog from the dismissed one still painted
+    behind it — both read True. The signature can: it carries the command under
+    review, so two tool calls never share one, while moving the highlight or
+    repainting the same dialog keeps it stable."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+
+    def screen(command: str, cursor_row: int) -> str:
+        rows = ["1. Yes", "2. Yes, and don't ask again", "3. No, and tell Claude"]
+        body = "\n".join(
+            f" {'❯' if i + 1 == cursor_row else ' '} {r}" for i, r in enumerate(rows)
+        )
+        return (
+            "⏺ earlier transcript line\n"
+            "\n"
+            " Bash command\n"
+            f"   {command}\n"
+            " Do you want to proceed?\n"
+            f"{body}\n"
+            " Esc to cancel"
+        )
+
+    first = screen("agent-browser open https://a.example", 1)
+    cs.attach(object(), _FakePane([first]))
+    sig_first = cs.perm_selector_signature()
+    assert sig_first is not None
+    assert "agent-browser open https://a.example" in sig_first
+    assert "earlier transcript line" not in sig_first
+
+    cs.attach(object(), _FakePane([screen("agent-browser open https://a.example", 2)]))
+    assert cs.perm_selector_signature() == sig_first
+
+    cs.attach(object(), _FakePane([screen("agent-browser open https://b.example", 1)]))
+    assert cs.perm_selector_signature() != sig_first
+
+    cs.attach(object(), _FakePane(["⏺ Done\n ⏵⏵ accept edits on"]))
+    assert cs.perm_selector_signature() is None
+
+
+async def test_answer_perm_selector_answers_the_dialog_that_renders_late(
+    cfg, no_real_sleep
+):
+    """The 67-minute wedge. The drive starts within milliseconds of the hook
+    verdict, before claude has painted the dialog for THIS call, so the first
+    thing on screen is the previous call's leftover block. Spending the single
+    press there left the real dialog — rendered a beat later — waiting on a
+    keystroke nobody would ever send, and claude blocked until the user typed
+    into the pane an hour later. The late dialog is a different block, so it
+    gets its own press."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    stale = (
+        " Bash command\n   agent-browser open https://a.example\n"
+        " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel"
+    )
+    live = (
+        " Bash command\n   agent-browser open https://b.example\n"
+        " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel"
+    )
+    pane = _FakePane([stale, live, live, "⏺ Done\n ⏵⏵ accept edits on"])
+    cs.attach(object(), pane)
+
+    assert await cs.answer_perm_selector(allow=True, timeout=5.0) is True
+    assert pane.sent.count(("Enter", False)) == 2
+    assert ("Escape", False) not in pane.sent
+
+
+async def test_answer_perm_selector_press_budget_is_capped(cfg, no_real_sleep):
+    """A screen that keeps changing must not become a keystroke storm: the
+    invocation is capped whatever the pane reports."""
+    import leashd.agents.runtimes.tmux_session as ts
+
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    screens = [
+        f" Bash command\n   cmd-{i}\n Do you want to proceed?\n"
+        " ❯ 1. Yes\n   2. No\n Esc to cancel"
+        for i in range(40)
+    ]
+    pane = _FakePane(screens)
+    cs.attach(object(), pane)
+
+    assert await cs.answer_perm_selector(allow=False, timeout=5.0) is True
+    assert pane.sent.count(("Escape", False)) == ts._PERM_SELECTOR_MAX_PRESSES
+
+
 async def test_answer_perm_selector_noop_when_no_selector(cfg, no_real_sleep):
     """Idempotent / screen-gated: if claude never rendered the selector (the
     hook decision alone sufficed, or a prior drive already answered it), the
@@ -2858,6 +3361,463 @@ async def test_answer_perm_selector_noop_when_no_selector(cfg, no_real_sleep):
     cs.attach(object(), pane)
     assert await cs.answer_perm_selector(allow=True, timeout=0.5) is False
     assert pane.sent == []
+
+
+class _TimedPane(_FakePane):
+    """A pane whose scripted screens are keyed to the clock the drive reads:
+    capture N happens at ``N * step`` seconds, so a dialog can be scripted to
+    render a chosen number of seconds after the drive started."""
+
+    def __init__(self, screens, *, step=0.5):
+        super().__init__(screens)
+        self.step = step
+        self.now = 0.0
+
+    def cmd(self, *args):
+        self.now += self.step
+        return super().cmd(*args)
+
+
+def _pane_clock(monkeypatch, pane):
+    """Point ``tmux_session``'s only clock at the pane, so a poll loop whose
+    sleeps ``no_real_sleep`` made instant still ages one step per capture."""
+    from types import SimpleNamespace
+
+    import leashd.agents.runtimes.tmux_session as ts
+
+    monkeypatch.setattr(ts, "time", SimpleNamespace(monotonic=lambda: pane.now))
+
+
+_IDLE_AFTER_DENY = "⏺ Read(crp-desktop-t1.png)\n  ⎿  read\n ⏵⏵ auto mode on"
+_NEXT_CALLS_DIALOG = (
+    " Bash command\n   agent-browser eval window.scrollTo(0,2100)\n"
+    " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel"
+)
+
+
+async def test_answer_perm_selector_ignores_a_later_calls_dialog(
+    cfg, no_real_sleep, monkeypatch
+):
+    """The regression that read back as "the agent stopped mid-turn".
+
+    A sandbox deny on a Read spawned this drive; claude never prompts for a
+    tool the hook already blocked, so no dialog rendered. The drive sat out
+    its whole window and then spent its Escape on the dialog claude painted
+    for the NEXT tool call 6s later, cancelling it — "[Request interrupted by
+    user for tool use]" — and the turn died there. A dialog that late is not
+    this drive's to answer: retire unpressed and leave it for the drive that
+    call spawns for itself."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _TimedPane([_IDLE_AFTER_DENY] * 12 + [_NEXT_CALLS_DIALOG] * 4)
+    _pane_clock(monkeypatch, pane)
+    cs.attach(object(), pane)
+
+    assert await cs.answer_perm_selector(allow=False, timeout=8.0) is False
+    assert pane.sent == []
+    assert pane.now < 8.0
+
+
+async def test_answer_perm_selector_still_waits_a_beat_for_its_own_dialog(
+    cfg, no_real_sleep, monkeypatch
+):
+    """The appearance window must not undo the drive's whole point: it starts
+    within milliseconds of the hook verdict, before claude has painted the
+    dialog for THIS call, so the first polls legitimately read idle."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    idle = "⏺ Bash(uv run pytest -q)\n ⏵⏵ auto mode on"
+    pane = _TimedPane([idle, idle] + [_LIVE_PERM_SELECTOR] * 3 + [idle])
+    _pane_clock(monkeypatch, pane)
+    cs.attach(object(), pane)
+
+    assert await cs.answer_perm_selector(allow=True, timeout=8.0) is True
+    assert pane.sent.count(("Enter", False)) == 1
+
+
+_LIVE_PERM_SELECTOR = (
+    " Bash command\n"
+    "   uv run pytest -q\n"
+    " Do you want to proceed?\n"
+    " ❯ 1. Yes\n"
+    "   2. No\n"
+    " Esc to cancel · Tab to amend"
+)
+
+
+async def test_answer_perm_selector_represses_a_swallowed_allow(
+    cfg, no_real_sleep, monkeypatch
+):
+    """The 5m47s wedge. The drive presses within milliseconds of the hook
+    verdict, which is the same instant claude paints the dialog, so the
+    keystroke can land before the dialog is listening. Every later poll then
+    read that same signature, skipped it as already pressed, and the drive
+    retired having answered nothing: an auto-approved ssh docker build blocked
+    until the user typed into the chat five minutes later. A dialog still modal
+    seconds after its press was never answered — press it again."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _TimedPane([_LIVE_PERM_SELECTOR] * 12 + ["⏺ Bash(ssh)\n ⏵⏵ auto mode on"])
+    _pane_clock(monkeypatch, pane)
+    cs.attach(object(), pane)
+
+    assert await cs.answer_perm_selector(allow=True, timeout=8.0) is True
+    assert pane.sent.count(("Enter", False)) > 1
+
+
+async def test_answer_perm_selector_does_not_repress_an_answered_dialog(
+    cfg, no_real_sleep, monkeypatch
+):
+    """The storm this drive already had to be taught not to cause: a dismissed
+    dialog stays painted, so presence alone still reads True after the press
+    landed. The live turn behind it is what says the press worked, and a second
+    keystroke there reaches the agent, not a dialog."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    answered = _LIVE_PERM_SELECTOR + "\n⏺ Bash(uv run pytest -q)\n esc to interrupt"
+    pane = _TimedPane([_LIVE_PERM_SELECTOR] + [answered] * 20)
+    _pane_clock(monkeypatch, pane)
+    cs.attach(object(), pane)
+
+    assert await cs.answer_perm_selector(allow=True, timeout=8.0) is True
+    assert pane.sent.count(("Enter", False)) == 1
+
+
+async def test_answer_perm_selector_never_represses_a_deny(
+    cfg, no_real_sleep, monkeypatch
+):
+    """Escape is not symmetric with Enter: a stray Enter on a live composer
+    submits nothing, while a stray Escape interrupts the turn. The hook has
+    already blocked a denied tool, so a second Escape buys nothing worth that
+    risk."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _TimedPane([_LIVE_PERM_SELECTOR] * 20)
+    _pane_clock(monkeypatch, pane)
+    cs.attach(object(), pane)
+
+    assert await cs.answer_perm_selector(allow=False, timeout=8.0) is True
+    assert pane.sent.count(("Escape", False)) == 1
+
+
+@pytest.mark.parametrize("decision", ["defer", "ask", None])
+async def test_perm_selector_drive_skipped_for_non_decisive_hook(
+    cfg, no_real_sleep, decision
+):
+    """`defer`/`ask` are NOT leashd decisions — Claude's own permission mode
+    owns the call and re-raises it via PermissionRequest, which drives the
+    selector there with the real verdict. The drive used to read any
+    non-`allow` as a deny and press Escape, cancelling a tool leashd had
+    explicitly allowed and interrupting the live turn."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _FakePane([_LIVE_PERM_SELECTOR])
+    cs.attach(object(), pane)
+
+    hso = {"hookEventName": "PreToolUse"}
+    if decision is not None:
+        hso["permissionDecision"] = decision
+    tsm._spawn_perm_selector_drive(cs, {"hookSpecificOutput": hso})
+    for t in list(tsm._perm_drive_tasks):
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(t, timeout=2)
+
+    assert pane.sent == []
+
+
+@pytest.mark.parametrize(("decision", "key"), [("allow", "Enter"), ("deny", "Escape")])
+async def test_perm_selector_drive_still_runs_for_a_real_decision(
+    cfg, no_real_sleep, decision, key
+):
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _FakePane([_LIVE_PERM_SELECTOR, _LIVE_PERM_SELECTOR, " ⏵⏵ accept edits on"])
+    cs.attach(object(), pane)
+
+    tsm._spawn_perm_selector_drive(
+        cs,
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": decision,
+            }
+        },
+    )
+    for t in list(tsm._perm_drive_tasks):
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(t, timeout=2)
+
+    assert pane.sent == [(key, False)]
+
+
+async def test_ungated_auto_tool_never_touches_the_pane(cfg, no_real_sleep):
+    """The reported incident, end to end. In `auto` mode an ungated tool (the
+    policy said `allow`, so `check_auto_gated` returns None) answers PreToolUse
+    with `defer` — and must send ZERO keystrokes. The old path pressed Escape,
+    which cancelled the command and then interrupted the turn; the chat got a
+    bare tool summary and no explanation."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm, mode="auto")
+    tsm._by_uuid["u1"] = cs.session_id
+    pane = _FakePane([_LIVE_PERM_SELECTOR])
+    cs.attach(object(), pane)
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    _bind(tsm, _StubFloorGatekeeper(floor_result=None))
+
+    pre = await tsm.on_pre_tool(
+        {
+            "session_id": "u1",
+            "cwd": "/work",
+            "tool_name": "Bash",
+            "tool_input": {"command": "uv run pytest -q"},
+            "permission_mode": "auto",
+        }
+    )
+    for t in list(tsm._perm_drive_tasks):
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(t, timeout=2)
+
+    assert pre["hookSpecificOutput"]["permissionDecision"] == "defer"
+    assert pane.sent == []
+
+
+def test_was_interrupted_reads_the_newest_transcript_entry(cfg):
+    """Captured live from the wedged pane: an Escape that reaches the agent
+    instead of a dialog leaves this line and nothing else, so the pane still
+    looks like a healthy idle composer to the completion backstop."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    aborted = (
+        "❯ Finish it\n"
+        "\n"
+        "  Ran 1 shell command\n"
+        "  ⎿  Interrupted · What should Claude do instead?\n"
+        "\n"
+        " ⏵⏵ accept edits on (shift+tab to cycle)"
+    )
+    cs.attach(object(), _FakePane([aborted]))
+    assert cs.was_interrupted() is True
+    assert cs.is_idle_at_composer() is True
+
+    # An interrupt still visible from an EARLIER turn, with the current turn's
+    # answer below it → the turn finished normally.
+    recovered = aborted + "\n⏺ Done — the check passes now.\n ⏵⏵ accept edits on"
+    cs.attach(object(), _FakePane([recovered]))
+    assert cs.was_interrupted() is False
+
+    cs.attach(object(), _FakePane(["⏺ Bash(ls)\n  ⎿  done\n ⏵⏵ accept edits on"]))
+    assert cs.was_interrupted() is False
+
+
+async def test_perm_selector_drive_presses_once_across_both_hooks(cfg):
+    """PreToolUse and PermissionRequest each spawn a drive for ONE tool call,
+    and the single-press rule inside answer_perm_selector is local to one
+    invocation — so two concurrent drives each held their own and each pressed.
+    The second Escape lands after claude tore the dialog down itself and
+    reaches the live agent, which interrupts the turn. The plan and question
+    drives have carried this guard for exactly this reason; the one drive that
+    presses Escape did not.
+
+    Real sleeps, deliberately: the drives only overlap when the first one
+    actually yields at its post-keystroke sleep, which is the moment the second
+    used to press into a pane the first had already answered.
+    """
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    pane = _FakePane([_LIVE_PERM_SELECTOR])  # dialog text lingers after dismissal
+    cs.attach(object(), pane)
+
+    answered = await asyncio.gather(
+        cs.answer_perm_selector(allow=False, timeout=0.5),
+        cs.answer_perm_selector(allow=False, timeout=0.5),
+    )
+
+    assert pane.sent.count(("Escape", False)) == 1
+    assert answered.count(False) == 1  # the re-entrant call answered nothing
+
+
+async def test_second_perm_drive_is_refused_while_the_first_runs(cfg, no_real_sleep):
+    """The guard itself, at the level the plan/question drives state it: a
+    re-entrant call answers nothing rather than sending a second keystroke."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    cs.attach(object(), _FakePane([_LIVE_PERM_SELECTOR]))
+    cs._perm_drive_active = True
+
+    assert await cs.answer_perm_selector(allow=False, timeout=5.0) is False
+
+
+async def test_policy_deny_is_recorded_as_the_block_that_ended_the_turn(
+    cfg, no_real_sleep
+):
+    """The bidlens incident: a `destructive-bash` deny on the agent's own
+    scratch cleanup. Claude aborts the WHOLE turn on a hook deny — it is handed
+    "the tool use was rejected ... STOP what you are doing" — so leashd has to
+    remember which call did it, or the turn is reported as an anonymous
+    interruption indistinguishable from a stray keystroke."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm, mode="auto")
+    tsm._by_uuid["u1"] = cs.session_id
+    cs.attach(object(), _FakePane([" ⏵⏵ auto mode on"]))
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    _bind(
+        tsm,
+        _StubFloorGatekeeper(
+            floor_result=PermissionDeny(message="Destructive or dangerous command")
+        ),
+    )
+
+    out = await tsm.on_pre_tool(
+        {
+            "session_id": "u1",
+            "cwd": "/work",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf $SP/roles_pilot && df -h ."},
+            "permission_mode": "auto",
+        }
+    )
+
+    # Reported in-band now, so the turn survives — but the block is still
+    # recorded verbatim, which is what lets the chat name it.
+    assert out["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert cs.policy_block is not None
+    assert cs.policy_block.tool_name == "Bash"
+    assert "rm -rf" in cs.policy_block.description
+    assert cs.policy_block.reason == "Destructive or dangerous command"
+
+
+async def test_bash_deny_is_reported_in_band_instead_of_ending_the_turn(
+    cfg, no_real_sleep
+):
+    """The fix for the reported UX. Claude has no "refuse but keep going"
+    verdict — a hook deny aborts the whole turn (45/45 in the local corpus), so
+    one blocked command cost 21 minutes of work. The command is swapped for a
+    notice that reports the block and fails: the denied text never executes,
+    and the model gets an ordinary tool failure it can work around."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm, mode="auto")
+    tsm._by_uuid["u1"] = cs.session_id
+    cs.attach(object(), _FakePane([" ⏵⏵ auto mode on"]))
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    _bind(
+        tsm,
+        _StubFloorGatekeeper(
+            floor_result=PermissionDeny(message="Destructive or dangerous command")
+        ),
+    )
+
+    out = await tsm.on_pre_tool(
+        {
+            "session_id": "u1",
+            "cwd": "/work",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /important"},
+            "permission_mode": "auto",
+        }
+    )
+
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "allow"  # ← the turn survives
+    swapped = hso["updatedInput"]["command"]
+    assert "rm -rf /important" not in swapped  # ← but the command is gone
+    assert "leashd blocked this command" in swapped
+    assert "Destructive or dangerous command" in swapped
+    assert swapped.endswith("exit 1")
+    # Still surfaced to the user, phrased as survivable.
+    assert cs.policy_block is not None
+    assert cs.policy_block.inline is True
+
+
+async def test_blocked_bash_notice_cannot_break_out_of_its_quoting(cfg, tmp_path):
+    """The reason carries the matched command's own words, so it reaches the
+    substituted shell as attacker-adjacent text. Run the real thing under a
+    real shell: the injected payload must stay inert data."""
+    import subprocess
+
+    from leashd.agents.runtimes.tmux_session import _blocked_bash_command
+
+    sentinel = tmp_path / "pwned"
+    cmd = _blocked_bash_command(f"bad '; touch {sentinel}; echo '")
+    proc = subprocess.run(  # noqa: S602
+        cmd, shell=True, capture_output=True, text=True, cwd=tmp_path
+    )
+
+    assert not sentinel.exists()  # the injection did not execute
+    assert proc.returncode == 1
+    assert "leashd blocked this command" in proc.stderr
+    assert proc.stdout == ""
+
+
+async def test_non_bash_deny_still_ends_the_turn(cfg, no_real_sleep):
+    """Only Bash has a harmless rewrite. A denied credential read keeps the
+    hard deny — there is no no-op that satisfies a Read."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm, mode="auto")
+    tsm._by_uuid["u1"] = cs.session_id
+    cs.attach(object(), _FakePane([" ⏵⏵ auto mode on"]))
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    _bind(tsm, _StubFloorGatekeeper(floor_result=PermissionDeny(message="creds")))
+
+    out = await tsm.on_pre_tool(
+        {
+            "session_id": "u1",
+            "cwd": "/work",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/work/.env"},
+            "permission_mode": "auto",
+        }
+    )
+
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert cs.policy_block is not None
+    assert cs.policy_block.inline is False
+
+
+async def test_policy_block_clears_when_the_agent_keeps_working(cfg, no_real_sleep):
+    """A deny only ended the turn if nothing came after it. An agent that
+    absorbed the block and ran another tool was not stopped by it, so the
+    record must not survive to caption an unrelated ending."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm, mode="auto")
+    tsm._by_uuid["u1"] = cs.session_id
+    cs.attach(object(), _FakePane([" ⏵⏵ auto mode on"]))
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    gk = _StubFloorGatekeeper(floor_result=PermissionDeny(message="nope"))
+    _bind(tsm, gk)
+
+    await tsm.on_pre_tool(
+        {
+            "session_id": "u1",
+            "cwd": "/work",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /tmp/x"},
+            "permission_mode": "auto",
+        }
+    )
+    assert cs.policy_block is not None
+
+    gk.floor_result = None  # next call is ungated → defer
+    await tsm.on_pre_tool(
+        {
+            "session_id": "u1",
+            "cwd": "/work",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/work/a.py"},
+            "permission_mode": "auto",
+        }
+    )
+    assert cs.policy_block is None
+
+
+async def test_begin_turn_drops_a_previous_turn_policy_block(cfg):
+    """A block belongs to the turn it ended — the next turn starts clean."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    cs.policy_block = PolicyBlock(tool_name="Bash", description="rm -rf x", reason="no")
+
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    assert cs.policy_block is None
 
 
 # The exact ExitPlanMode plan-approval dialog rendered live by claude 2.1.177.
@@ -3699,6 +4659,97 @@ def test_detect_native_dialog_generic_fallback():
     match = _detect_native_dialog(_GENERIC_DIALOG_SCREEN)
     assert match is not None
     assert match.name == "generic_native_dialog"
+    assert [o["label"] for o in match.options] == ["Option Alpha", "Option Beta"]
+
+
+# Reconstructed from the live pane that produced the reported incident: an
+# ordinary assistant reply whose body happens to carry a numbered list, drawn
+# above a composer that still shows a dismissed dialog's "Esc to cancel".
+_PROSE_WITH_A_NUMBERED_LIST = (
+    "⏺ Here is what I found and fixed.\n"
+    "\n"
+    "  1. Name the cause. PolicyBlock records the denied call.\n"
+    "\n"
+    "  2. A latent defect: answer_perm_selector missed the guard.\n"
+    "\n"
+    "❯ \n"
+    " Esc to cancel · ⏵⏵ auto mode on (shift+tab to cycle)"
+)
+
+
+def test_prose_with_a_numbered_list_is_not_a_dialog():
+    """The reported bug. leashd bridged this reply as a question: the turn
+    blocked on an answer nobody could give, the scraped prose was stored as a
+    *user* message, and the phantom dialog's "chosen row" was driven as a
+    keystroke into the live agent. The rows are not contiguous-from-1 under a
+    footer, and a one-option 'dialog' is prose."""
+    from leashd.agents.runtimes.tmux_session import _detect_native_dialog
+
+    assert _detect_native_dialog(_PROSE_WITH_A_NUMBERED_LIST) is None
+
+
+def test_prose_list_items_spanning_two_lines_are_not_a_dialog():
+    """One-line items separated by a blank line is the shape that actually
+    fired; a first cut allowed a two-line gap and still bridged it."""
+    from leashd.agents.runtimes.tmux_session import _detect_native_dialog
+
+    screen = (
+        "⏺ Two points:\n"
+        "\n"
+        "  1. the first point\n"
+        "\n"
+        "  2. the second point\n"
+        "\n"
+        "❯ \n"
+        " Esc to cancel"
+    )
+    assert _detect_native_dialog(screen) is None
+
+
+def test_dialog_with_a_wrapped_option_label_still_detected():
+    """Rows can be more than a line apart when a label wraps — the gap is
+    continuation text, never a blank line. Tightening to strictly adjacent
+    rows would drop this real dialog."""
+    from leashd.agents.runtimes.tmux_session import _detect_native_dialog
+
+    screen = (
+        " Do you want to proceed?\n"
+        " ❯ 1. Yes, and always allow access to a path so long that the label\n"
+        "      wraps onto a second rendered line\n"
+        "   2. No\n"
+        " Enter to confirm · Esc to cancel"
+    )
+    match = _detect_native_dialog(screen)
+    assert match is not None
+    assert len(match.options) == 2
+
+
+def test_single_option_list_is_not_a_dialog():
+    """A real selector always offers a choice. The incident bridged an
+    ``option_count=1`` 'dialog' scraped out of a sentence."""
+    from leashd.agents.runtimes.tmux_session import _detect_native_dialog
+
+    screen = " Only one thing here:\n ❯ 1. Just this\n Enter to confirm · Esc to cancel"
+    assert _detect_native_dialog(screen) is None
+
+
+def test_numbered_list_above_a_real_dialog_does_not_capture_it():
+    """Transcript above, dialog below: only the bottom-most contiguous run is
+    the selector, so the prose rows must not be folded into its options."""
+    from leashd.agents.runtimes.tmux_session import _detect_native_dialog
+
+    screen = (
+        "⏺ Two things to note:\n"
+        "  1. the first note\n"
+        "  2. the second note\n"
+        "\n"
+        " Please confirm your choice:\n"
+        " ❯ 1. Option Alpha\n"
+        "   2. Option Beta\n"
+        " Enter to confirm · Esc to cancel"
+    )
+    match = _detect_native_dialog(screen)
+    assert match is not None
     assert [o["label"] for o in match.options] == ["Option Alpha", "Option Beta"]
 
 
@@ -4798,9 +5849,34 @@ async def test_submit_retypes_when_delivery_vanishes(cfg, no_real_sleep, monkeyp
 
     monkeypatch.setattr(cs, "_deliver_prompt", _vanishing_delivery)
 
-    await cs.submit("which model do you use now?", max_enter_presses=1)
+    delivered_ok = await cs.submit("which model do you use now?", max_enter_presses=1)
 
     assert ("which model do you use now?", True) in pane.sent
+    assert pane.sent.count(("Enter", False)) == 2
+    # The retype vanished too — nothing reached claude, and submit says so.
+    assert delivered_ok is False
+
+
+async def test_submit_reports_delivery_when_retype_lands(
+    cfg, no_real_sleep, monkeypatch
+):
+    """The retype is only a success when the turn actually starts on it."""
+    monkeypatch.setattr(
+        "leashd.agents.runtimes.tmux_session._STRAY_DIALOG_WAIT_S", 0.01
+    )
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    idle = "❯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+    running = "⏺ working…\nesc to interrupt\n"
+    pane = _FakePane([idle, idle, running])
+    cs.attach(object(), pane)
+
+    async def _vanishing_delivery(text):
+        pass
+
+    monkeypatch.setattr(cs, "_deliver_prompt", _vanishing_delivery)
+
+    assert await cs.submit("try again", max_enter_presses=1) is True
     assert pane.sent.count(("Enter", False)) == 2
 
 
@@ -4826,10 +5902,34 @@ async def test_submit_does_not_retype_over_stuck_composer(
 
     monkeypatch.setattr(cs, "_deliver_prompt", _no_typing)
 
-    await cs.submit("hello there", max_enter_presses=2)
+    delivered_ok = await cs.submit("hello there", max_enter_presses=2)
 
     assert ("hello there", True) not in pane.sent
     assert pane.sent.count(("Enter", False)) == 2
+    # Text still sitting in the composer: claude never got it, and submit
+    # says so — a mid-turn follow-up rolls its pending count back on this.
+    assert delivered_ok is False
+
+
+async def test_submit_reports_delivery_when_turn_starts(
+    cfg, no_real_sleep, monkeypatch
+):
+    monkeypatch.setattr(
+        "leashd.agents.runtimes.tmux_session._STRAY_DIALOG_WAIT_S", 0.01
+    )
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    idle = "❯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+    running = "⏺ working…\nesc to interrupt\n"
+    pane = _FakePane([idle, running])
+    cs.attach(object(), pane)
+
+    async def _typed(text):
+        pass
+
+    monkeypatch.setattr(cs, "_deliver_prompt", _typed)
+
+    assert await cs.submit("run the tests", max_enter_presses=2) is True
 
 
 async def test_dialog_watcher_suppresses_recently_failed_dialog(cfg, monkeypatch):
@@ -5376,3 +6476,505 @@ async def test_spawn_survives_a_failing_remain_on_exit(cfg, monkeypatch, no_real
     cs.jsonl_task.cancel()
 
     assert cs.tmux_name == "leashd_sess1"
+
+
+class _DialogPane:
+    """A pane sitting on a native dialog, back at the composer once dismissed."""
+
+    def __init__(self):
+        self.session_id = "sess1"
+        self.tmux_name = "leashd_sess1"
+        self.chat_id = "chat1"
+        self.user_id = "u1"
+        self.keys: list[str] = []
+        self.submitted: list[str] = []
+        self.turn = None
+        self.submit_succeeds = True
+
+    def send_keys(self, keys, literal=False):
+        self.keys.append(keys)
+
+    def capture(self):
+        return "composer" if "Escape" in self.keys else "dialog"
+
+    def _composer_accepts_input(self, screen):
+        return screen == "composer"
+
+    async def submit(self, text, **_kwargs):
+        self.submitted.append(text)
+        return self.submit_succeeds
+
+
+def _dialog_match():
+    from leashd.agents.runtimes import tmux_session as ts
+
+    return ts.NativeDialogMatch(
+        name="generic_native_dialog",
+        question="Proceed?",
+        header="Claude needs a decision",
+        options=[{"label": "Yes"}],
+        fingerprint="generic:Proceed?",
+        selected_row_index=0,
+    )
+
+
+async def test_a_typed_dialog_answer_is_delivered_to_the_pane(cfg):
+    """An answer matching no option is the human replying in their own words.
+
+    Escaping the dialog and dropping the text left the turn running as if
+    nobody had answered — the pane went quiet and the chat looked stuck.
+    """
+    tsm = TmuxSessionManager(cfg)
+    pane = _DialogPane()
+
+    await tsm._answer_native_dialog_with_text(
+        pane, _dialog_match(), "do it the other way"
+    )
+
+    assert pane.keys[0] == "Escape"
+    assert pane.submitted == ["do it the other way"]
+
+
+async def test_a_typed_dialog_answer_defers_turn_completion(cfg):
+    """The follow-up must be counted, or the turn ends before claude reads it."""
+    from leashd.agents.runtimes import tmux_session as ts
+
+    tsm = TmuxSessionManager(cfg)
+    pane = _DialogPane()
+    pane.turn = ts.TmuxTurn(on_text_chunk=None, on_tool_activity=None)
+
+    await tsm._answer_native_dialog_with_text(pane, _dialog_match(), "keep going")
+
+    assert pane.turn.pending_followups == 1
+
+
+async def test_an_undelivered_dialog_answer_is_not_counted(cfg):
+    """A counted answer claude never received swallows the turn's completion.
+
+    The count only pays for itself if a further response is coming; when the
+    keystrokes stayed in the composer, nothing else ever arrives and the turn
+    waits out its watchdog instead of replying.
+    """
+    from leashd.agents.runtimes import tmux_session as ts
+
+    tsm = TmuxSessionManager(cfg)
+    pane = _DialogPane()
+    pane.submit_succeeds = False
+    turn = ts.TmuxTurn(on_text_chunk=None, on_tool_activity=None)
+    pane.turn = turn
+
+    await tsm._answer_native_dialog_with_text(pane, _dialog_match(), "keep going")
+
+    assert turn.pending_followups == 0
+    turn.complete()
+    assert turn.stop_event.is_set()
+
+
+async def test_a_typed_dialog_answer_is_not_counted_after_the_turn_ended(cfg):
+    from leashd.agents.runtimes import tmux_session as ts
+
+    tsm = TmuxSessionManager(cfg)
+    pane = _DialogPane()
+    pane.turn = ts.TmuxTurn(on_text_chunk=None, on_tool_activity=None)
+    pane.turn.stop_event.set()
+
+    await tsm._answer_native_dialog_with_text(pane, _dialog_match(), "too late")
+
+    assert pane.turn.pending_followups == 0
+    assert pane.submitted == ["too late"]
+
+
+# ---------------------------------------------------------------------------
+# Cursor-only dialogs (``/chrome``) — verbatim from claude 2.1.263.
+# ---------------------------------------------------------------------------
+
+_CHROME_DIALOG_SCREEN = """❯ /chrome
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Claude in Chrome
+
+   Claude in Chrome works with the Chrome extension to let you control your
+   browser directly from Claude Code.
+
+   Status: Enabled
+   Extension: Installed
+
+   ❯ Select browser…
+     Manage permissions
+     Reconnect extension
+     Enabled by default: Yes
+
+   Usage: claude --chrome or claude --no-chrome
+
+   Learn more: https://code.claude.com/docs/en/chrome
+
+   Enter to confirm · Esc to cancel
+"""
+
+
+def _chrome_screen(hl: int) -> str:
+    rows = [
+        "Select browser…",
+        "Manage permissions",
+        "Reconnect extension",
+        "Enabled by default: Yes",
+    ]
+    body = "\n".join(
+        f"   {'❯' if i == hl else ' '} {label}" for i, label in enumerate(rows)
+    )
+    return (
+        "▔" * 16
+        + "\n   Claude in Chrome\n\n   Status: Enabled\n   Extension: Installed\n\n"
+        + body
+        + "\n\n   Enter to confirm · Esc to cancel\n"
+    )
+
+
+_STUB_CHROME_MATCH_OPTIONS = [
+    {"label": "Select browser…"},
+    {"label": "Manage permissions"},
+    {"label": "Reconnect extension"},
+    {"label": "Enabled by default: Yes"},
+]
+
+
+def test_detect_native_dialog_cursor_only_chrome():
+    """The reported bug. ``/chrome`` draws its actions as a cursor-only list
+    with no row digits, so the numbered parser saw nothing and the dialog was
+    never bridged: it stayed open in the pane, invisible to Telegram, and the
+    next turn died on ``tmux_prompt_submit_unconfirmed``."""
+    from leashd.agents.runtimes.tmux_session import _detect_native_dialog
+
+    match = _detect_native_dialog(_CHROME_DIALOG_SCREEN)
+    assert match is not None
+    assert match.name == "generic_native_dialog"
+    assert match.numbered is False
+    assert match.question == "Claude in Chrome"
+    assert [o["label"] for o in match.options] == [
+        "Select browser…",
+        "Manage permissions",
+        "Reconnect extension",
+        "Enabled by default: Yes",
+    ]
+    assert match.selected_row_index == 0
+
+
+def test_detect_native_dialog_cursor_highlight_tracks_the_row():
+    from leashd.agents.runtimes.tmux_session import _detect_native_dialog
+
+    match = _detect_native_dialog(_chrome_screen(2))
+    assert match is not None
+    assert match.selected_row_index == 2
+
+
+def test_numbered_dialog_still_reports_numbered():
+    """The ``/model`` picker keeps the digit drive — its rows commit from
+    anywhere, and arrowing to them instead would be a regression."""
+    from leashd.agents.runtimes.tmux_session import _detect_native_dialog
+
+    match = _detect_native_dialog(_picker_screen(2))
+    assert match is not None
+    assert match.numbered is True
+    assert [o["label"] for o in match.options] == [
+        "Default (recommended)",
+        "Opus",
+        "Opus 4.7 ✔",
+    ]
+
+
+def test_composer_prompt_is_not_a_cursor_dialog():
+    """claude's own composer is a bare chevron in column 0. Reading it as an
+    option row would make every idle pane a dialog, so the indent is required."""
+    from leashd.agents.runtimes.tmux_session import _cursor_block_options
+
+    idle = (
+        "⏺ Done.\n"
+        "\n"
+        "────────────────\n"
+        "❯ \n"
+        "────────────────\n"
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · Esc to cancel\n"
+    )
+    assert _cursor_block_options(idle) == []
+
+
+def test_cursor_dialog_needs_a_confirm_hint_below_it():
+    """Without the keyboard hint under the block there is nothing to answer —
+    a lone highlighted line in prose must not become a question."""
+    from leashd.agents.runtimes.tmux_session import _cursor_block_options
+
+    screen = "   ❯ Something highlighted\n     Another line\n\n⏺ still talking\n"
+    assert _cursor_block_options(screen) == []
+
+
+def test_cursor_dialog_needs_more_than_one_row():
+    from leashd.agents.runtimes.tmux_session import _cursor_block_options
+
+    screen = "   ❯ Only one\n\n   Enter to confirm · Esc to cancel\n"
+    assert _cursor_block_options(screen) == []
+
+
+def test_cursor_block_stops_at_differently_indented_body_text():
+    """The panel's prose sits one column left of its options. Folding it in
+    would offer the user 'Status: Enabled' as something to pick."""
+    from leashd.agents.runtimes.tmux_session import _cursor_block_options
+
+    rows = _cursor_block_options(_CHROME_DIALOG_SCREEN)
+    assert [label for _, _, label in rows] == [
+        "Select browser…",
+        "Manage permissions",
+        "Reconnect extension",
+        "Enabled by default: Yes",
+    ]
+
+
+async def test_bridge_cursor_dialog_arrows_and_presses_enter(cfg, no_real_sleep):
+    """A cursor-only dialog has no digits: typing the row number types a
+    stray character into the dialog and leaves it open. It must be arrowed
+    to and confirmed with Enter."""
+    from leashd.agents.runtimes.tmux_session import (
+        NativeDialogMatch,
+        TmuxSessionManager,
+    )
+    from leashd.agents.types import PermissionAllow
+
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    idle = "❯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+    cs.attach(
+        object(),
+        _FakePane(
+            [
+                _chrome_screen(0),
+                _chrome_screen(0),
+                _chrome_screen(1),
+                _chrome_screen(2),
+                idle,
+                idle,
+            ]
+        ),
+    )
+
+    class _StubInteractions:
+        async def handle_question(self, chat_id, tool_input, *, user_id, session_id):
+            return PermissionAllow(
+                updated_input={
+                    **tool_input,
+                    "answers": {
+                        tool_input["questions"][0]["question"]: "Reconnect extension"
+                    },
+                }
+            )
+
+    tsm._interactions = _StubInteractions()  # type: ignore[assignment]
+
+    match = NativeDialogMatch(
+        name="generic_native_dialog",
+        question="Claude in Chrome",
+        header="Claude",
+        options=list(_STUB_CHROME_MATCH_OPTIONS),
+        fingerprint="chrome-panel",
+        selected_row_index=0,
+        numbered=False,
+    )
+    await tsm._bridge_native_dialog(cs, match)
+
+    assert cs._pane.sent.count(("Down", False)) == 2
+    assert cs._pane.sent.count(("Enter", False)) == 1
+    assert ("3", True) not in cs._pane.sent
+    assert ("Escape", False) not in cs._pane.sent
+
+
+async def test_bridge_cursor_dialog_fails_closed_when_row_never_reached(
+    cfg, no_real_sleep
+):
+    """Navigation that never lands must not confirm whatever row happens to
+    be highlighted — Enter on a stuck ``/chrome`` panel would toggle
+    'Enabled by default' behind the user's back."""
+    from leashd.agents.runtimes.tmux_session import (
+        NativeDialogMatch,
+        TmuxSessionManager,
+    )
+    from leashd.agents.types import PermissionAllow
+
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    cs.attach(object(), _FakePane([_chrome_screen(0)]))
+
+    class _StubInteractions:
+        async def handle_question(self, chat_id, tool_input, *, user_id, session_id):
+            return PermissionAllow(
+                updated_input={
+                    **tool_input,
+                    "answers": {
+                        tool_input["questions"][0]["question"]: "Reconnect extension"
+                    },
+                }
+            )
+
+    tsm._interactions = _StubInteractions()  # type: ignore[assignment]
+
+    match = NativeDialogMatch(
+        name="generic_native_dialog",
+        question="Claude in Chrome",
+        header="Claude",
+        options=list(_STUB_CHROME_MATCH_OPTIONS),
+        fingerprint="chrome-panel",
+        selected_row_index=0,
+        numbered=False,
+    )
+    await tsm._bridge_native_dialog(cs, match)
+
+    assert ("Enter", False) not in cs._pane.sent
+    assert ("Escape", False) in cs._pane.sent
+    assert "chrome-panel" in cs.failed_dialog_fingerprints
+
+
+async def test_bridge_cursor_dialog_never_repeats_the_action(cfg, no_real_sleep):
+    """``/chrome`` runs the chosen row's action and redraws itself, so the
+    composer does not come back on its own. Retrying Enter there would fire
+    'Reconnect extension' up to four times; the panel is closed instead, and
+    the drive counts as confirmed so a second ``/chrome`` inside the
+    re-bridge cooldown is not silently Escaped."""
+    from leashd.agents.runtimes.tmux_session import (
+        NativeDialogMatch,
+        TmuxSessionManager,
+    )
+    from leashd.agents.types import PermissionAllow
+
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    idle = "❯\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+    still_open = _chrome_screen(2)
+    cs.attach(
+        object(),
+        _FakePane(
+            [
+                _chrome_screen(0),
+                _chrome_screen(0),
+                _chrome_screen(1),
+                still_open,
+                still_open,
+                still_open,
+                still_open,
+                still_open,
+                idle,
+            ]
+        ),
+    )
+
+    class _StubInteractions:
+        async def handle_question(self, chat_id, tool_input, *, user_id, session_id):
+            return PermissionAllow(
+                updated_input={
+                    **tool_input,
+                    "answers": {
+                        tool_input["questions"][0]["question"]: "Reconnect extension"
+                    },
+                }
+            )
+
+    tsm._interactions = _StubInteractions()  # type: ignore[assignment]
+
+    match = NativeDialogMatch(
+        name="generic_native_dialog",
+        question="Claude in Chrome",
+        header="Claude",
+        options=list(_STUB_CHROME_MATCH_OPTIONS),
+        fingerprint="chrome-panel",
+        selected_row_index=0,
+        numbered=False,
+    )
+    await tsm._bridge_native_dialog(cs, match)
+
+    assert cs._pane.sent.count(("Enter", False)) == 1
+    assert ("Escape", False) in cs._pane.sent
+    assert "chrome-panel" not in cs.failed_dialog_fingerprints
+
+
+async def test_final_text_block_recorded_before_it_streams():
+    """A turn that lands while the last block is mid-stream must still answer
+    with it. The completion path reads ``assembled_text`` on the same event
+    loop the chunk callbacks yield to, so a block has to be recorded before it
+    is streamed — otherwise claude's real answer is dropped and the turn is
+    reported with only the inter-tool preambles behind it."""
+    turn = TmuxTurn(on_text_chunk=None, on_tool_activity=None)
+    snapshots: list[str] = []
+
+    async def on_text(_chunk):
+        await asyncio.sleep(0)
+        snapshots.append(turn.assembled_text)
+
+    turn.on_text_chunk = on_text
+
+    await TmuxSessionManager._process_blocks(
+        turn, [{"type": "text", "text": "Found a real gap. Let me fix it:"}]
+    )
+    await TmuxSessionManager._process_blocks(
+        turn, [{"type": "text", "text": "All green. Here's the review."}]
+    )
+
+    assert turn.assembled_text == (
+        "Found a real gap. Let me fix it:\n\nAll green. Here's the review."
+    )
+    assert [s for s in snapshots if "All green" not in s] == [
+        "Found a real gap. Let me fix it:"
+    ]
+
+
+async def test_paragraph_break_never_streams_without_its_block():
+    """The connector persists what it has streamed, so a chunk carrying only
+    the paragraph break lets a turn that lands during it store a reply ending
+    in a bare separator — the production signature of the lost final answer."""
+    streamed: list[str] = []
+
+    async def on_text(chunk):
+        streamed.append(chunk)
+        await asyncio.sleep(0)
+
+    turn = TmuxTurn(on_text_chunk=on_text, on_tool_activity=None)
+    for block in (
+        {"type": "text", "text": "Now verifying nothing broke:"},
+        {"type": "tool_use", "name": "Bash", "input": {"command": "make check"}},
+        {"type": "text", "text": "All green. Here's the review."},
+    ):
+        await TmuxSessionManager._process_blocks(turn, [block])
+
+    assert all(chunk.strip() for chunk in streamed)
+    for i in range(1, len(streamed) + 1):
+        assert not "".join(streamed[:i]).endswith("\n\n")
+
+
+async def test_turn_landing_mid_stream_keeps_the_whole_reply():
+    """End-to-end shape of the tmux loss: the turn is answered from the same
+    loop a slow connector write is suspended on. Both what the turn reports and
+    what the connector has buffered must already carry the final block."""
+    buffer = ""
+    answered: dict[str, str] = {}
+
+    turn = TmuxTurn(on_text_chunk=None, on_tool_activity=None)
+
+    async def slow_connector_write(chunk):
+        nonlocal buffer
+        buffer += chunk
+        answered.setdefault("at_write", turn.assembled_text)
+        await asyncio.sleep(0.05)
+
+    turn.on_text_chunk = slow_connector_write
+
+    async def stream_blocks():
+        for block in (
+            {"type": "text", "text": "Working on it:"},
+            {"type": "text", "text": "FINAL: the command printed MARKER-42"},
+        ):
+            await TmuxSessionManager._process_blocks(turn, [block])
+
+    async def land_the_turn():
+        await asyncio.sleep(0.06)
+        answered["content"] = turn.assembled_text
+        answered["buffer"] = buffer
+
+    await asyncio.gather(stream_blocks(), land_the_turn())
+
+    assert "FINAL: the command printed MARKER-42" in answered["content"]
+    assert "FINAL: the command printed MARKER-42" in answered["buffer"]
+    assert not answered["buffer"].endswith("\n\n")

@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 
 from leashd.agents.runtimes.tmux import TmuxAgent
-from leashd.agents.runtimes.tmux_session import TmuxTurn, reset_tmux_session_manager
+from leashd.agents.runtimes.tmux_session import (
+    PolicyBlock,
+    TmuxTurn,
+    reset_tmux_session_manager,
+)
 from leashd.core.config import LeashdConfig
 from leashd.core.plan_gate import PlanState
 from leashd.exceptions import AgentError
@@ -96,15 +100,38 @@ class FakeCS:
         self.goal_active = False
         self._goal_indicator_seen = False
         self._idle_at_composer = False
+        self._was_interrupted = False
         self._stream_text_on_submit = False
         self.last_model = None
+        self.answer_drive_active = False
+        # Screen the liveness poll reads for the unattended-dialog watchdog.
+        # Inert by default: no selector, so the watchdog never arms.
+        self.screen = ""
+        self.dedicated_selector = False
+        # Mirrors TmuxClaudeSession: cleared at begin_turn, then set by the
+        # hook bridge when a tool is denied during the turn.
+        self.policy_block: PolicyBlock | None = None
+        self._policy_block: PolicyBlock | None = None
+        # Readiness: ``ready=False`` models a pane that never reached the
+        # composer, ``trust_prompt`` which dialog is holding it there.
+        self.ready = True
+        self.trust_prompt = False
+        self.session_id = "sess1"
+        self.chat_id = "web:c1"
+        self.working_directory = "/work"
 
     @property
     def goal_indicator_seen(self):
         return self._goal_indicator_seen
 
+    def dedicated_selector_present(self, screen=None):
+        return self.dedicated_selector
+
     def is_idle_at_composer(self, screen=None):
         return self._idle_at_composer
+
+    def was_interrupted(self, screen=None):
+        return self._was_interrupted
 
     def pane_is_dead(self):
         return False
@@ -116,6 +143,7 @@ class FakeCS:
             goal_active_cb=lambda: self.goal_active,
         )
         self.plan_state = PlanState()
+        self.policy_block = self._policy_block
         if self._reject_feedback:
             self.plan_state.plan_adjustment_feedback = self._reject_feedback.pop(0)
         return self.turn
@@ -130,10 +158,13 @@ class FakeCS:
             self.turn.complete(is_error=self._is_error)
 
     async def await_ready(self, timeout):
-        return True
+        return self.ready
+
+    def trust_prompt_present(self, screen=None):
+        return self.trust_prompt
 
     def capture(self):
-        return ""
+        return self.screen
 
     def death_report(self):
         return {"pane_status": "dead" if self.pane_is_dead() else "alive"}
@@ -179,8 +210,9 @@ class FakeTSM:
         self.terminated = session_id
         self.spawned = False  # next get() returns None → execute() re-spawns
 
-    async def shutdown_all(self):
+    async def shutdown_all(self, *, keep_panes=False):
         self.shutdown_called = True
+        self.shutdown_kept_panes = keep_panes
 
     def has_pending_human(self, chat_id):
         return False
@@ -205,7 +237,7 @@ def test_capabilities(tmp_path):
     assert caps.supports_streaming is True
     assert caps.supports_mcp is True
     assert caps.instruction_path == "CLAUDE.md"
-    assert caps.stability == "experimental"
+    assert caps.stability == "stable"
 
 
 async def test_execute_no_longer_requires_webui(tmp_path):
@@ -540,6 +572,78 @@ async def test_execute_emits_one_time_blocked_notice(tmp_path):
     assert "approved" in resp.content
 
 
+async def test_execute_reports_a_dialog_nobody_will_answer(tmp_path, monkeypatch):
+    """The 67-minute silence. A permission prompt whose keystroke the drive
+    missed blocks claude with nothing watching: no pending human pauses the
+    turn, the pane is alive, the tailer is fine — so the turn just goes quiet
+    until the engine-wide timeout hours later. An unchanging selector screen is
+    the proof, and the user has to be told."""
+    import leashd.agents.runtimes.tmux as tmux_mod
+
+    monkeypatch.setattr(tmux_mod, "UNATTENDED_DIALOG_STALL_S", 0.0)
+    monkeypatch.setattr(tmux_mod, "LIVENESS_POLL_INTERVAL", 0.01)
+    cs = FakeCS(text="released")
+    cs._complete_on_enter = False
+    cs.screen = " Do you want to proceed?\n ❯ 1. Yes\n   2. No"
+    cs.dedicated_selector = True
+    tsm = FakeTSM(cs)  # has_pending_human → False
+    cfg = _cfg(tmp_path)
+    cfg.agent_timeout_seconds = 0
+    agent = _agent(cfg, tsm)
+
+    chunks: list[str] = []
+
+    async def _on_text(text):
+        chunks.append(text)
+        assert cs.turn is not None
+        cs.turn.text_parts.append(cs._text)
+        cs.turn.complete()
+
+    resp = await agent.execute("research", _session(tmp_path), on_text_chunk=_on_text)
+
+    notices = [c for c in chunks if "waiting on a permission prompt" in c]
+    assert len(notices) == 1
+    assert resp.is_error is False
+
+
+async def test_execute_stays_quiet_while_the_pane_is_working(tmp_path, monkeypatch):
+    """A dismissed dialog stays painted behind working output, so the selector
+    check alone reads True all turn. Only a screen that stops changing is a
+    wedge — a live turn repaints its elapsed-time counter every second."""
+    import leashd.agents.runtimes.tmux as tmux_mod
+
+    monkeypatch.setattr(tmux_mod, "UNATTENDED_DIALOG_STALL_S", 0.0)
+    monkeypatch.setattr(tmux_mod, "LIVENESS_POLL_INTERVAL", 0.01)
+    cs = FakeCS(text="done")
+    cs._complete_on_enter = False
+    cs.dedicated_selector = True
+    tsm = FakeTSM(cs)
+    cfg = _cfg(tmp_path)
+    cfg.agent_timeout_seconds = 0
+    agent = _agent(cfg, tsm)
+
+    chunks: list[str] = []
+    ticks = {"n": 0}
+
+    def _repainting_screen():
+        ticks["n"] += 1
+        if ticks["n"] >= 4:
+            assert cs.turn is not None
+            cs.turn.text_parts.append(cs._text)
+            cs.turn.complete()
+        return f" Do you want to proceed?\n ❯ 1. Yes\n Sock-hopping ({ticks['n']}s)"
+
+    cs.capture = _repainting_screen
+
+    async def _on_text(text):
+        chunks.append(text)
+
+    resp = await agent.execute("research", _session(tmp_path), on_text_chunk=_on_text)
+
+    assert not [c for c in chunks if "waiting on a permission prompt" in c]
+    assert resp.is_error is False
+
+
 async def test_execute_bails_when_pane_dies_while_blocked(tmp_path):
     # A pane that died while blocked on a human can never complete the turn —
     # surface an error instead of re-waiting forever (pane-death is now
@@ -744,6 +848,103 @@ async def test_execute_idle_completion_backstop_when_stop_missed(tmp_path):
     assert "tmux_turn_idle_completed" in [e["event"] for e in logs]
     assert resp.is_error is False
     assert "the finished reply" in resp.content
+    assert "interrupted" not in resp.content
+
+
+@pytest.mark.usefixtures("_advancing_clock")
+async def test_execute_idle_completion_reports_an_interrupted_turn(tmp_path):
+    """An aborted tool call leaves a pane that reads as a healthy idle
+    composer, so the backstop used to deliver the bare tool summary with no
+    explanation — the reported 'terminated for no reason'. Say what happened
+    and point at /resume."""
+    from structlog.testing import capture_logs
+
+    cs = FakeCS(text="Running the check")
+    cs._complete_on_enter = False
+    cs._stream_text_on_submit = True
+    cs._idle_at_composer = True
+    cs._was_interrupted = True
+    agent = _agent(_cfg(tmp_path), FakeTSM(cs))
+
+    chunks: list[str] = []
+
+    with capture_logs() as logs:
+        resp = await agent.execute(
+            "do it", _session(tmp_path), on_text_chunk=chunks.append
+        )
+
+    idle = next(e for e in logs if e["event"] == "tmux_turn_idle_completed")
+    assert idle["interrupted"] is True
+    assert any("interrupted" in c for c in chunks)
+    assert "/resume" in "".join(chunks)
+    assert resp.is_error is False
+
+
+_BIDLENS_BLOCK = PolicyBlock(
+    tool_name="Bash",
+    description="rm -rf $SP/roles_pilot && df -h .",
+    reason="Destructive or dangerous command",
+)
+
+
+async def test_execute_names_the_policy_deny_that_ended_the_turn(tmp_path):
+    """The bidlens incident. 21 minutes of work ended when the policy denied
+    the agent's own scratch cleanup — Claude aborts the whole turn on a hook
+    deny — and the chat got a reply that simply stopped. This lands on the
+    CLEAN Stop path, where there was previously no notice at all: the user had
+    nothing to distinguish their own rule from a crash."""
+    from structlog.testing import capture_logs
+
+    cs = FakeCS(text="Let me clean up the scratch dir")
+    cs._policy_block = _BIDLENS_BLOCK
+    agent = _agent(_cfg(tmp_path), FakeTSM(cs))
+
+    chunks: list[str] = []
+    with capture_logs() as logs:
+        resp = await agent.execute(
+            "finish the rebuild", _session(tmp_path), on_text_chunk=chunks.append
+        )
+
+    note = "".join(chunks)
+    assert "tmux_turn_ended_on_policy_block" in [e["event"] for e in logs]
+    assert "Blocked by your safety policy" in note
+    assert "rm -rf $SP/roles_pilot" in note
+    assert "Destructive or dangerous command" in note
+    assert "/resume" in note
+    assert resp.is_error is False
+
+
+@pytest.mark.usefixtures("_advancing_clock")
+async def test_policy_block_replaces_the_generic_interrupted_note(tmp_path):
+    """A denied tool leaves the pane reading as an interrupted turn, so both
+    notices apply. Only the one that names the cause is worth sending — the
+    generic line is what made a policy decision look like the interruption bug
+    it is not."""
+    cs = FakeCS(text="Running the check")
+    cs._complete_on_enter = False
+    cs._stream_text_on_submit = True
+    cs._idle_at_composer = True
+    cs._was_interrupted = True
+    cs._policy_block = _BIDLENS_BLOCK
+    agent = _agent(_cfg(tmp_path), FakeTSM(cs))
+
+    chunks: list[str] = []
+    await agent.execute("do it", _session(tmp_path), on_text_chunk=chunks.append)
+
+    note = "".join(chunks)
+    assert "Blocked by your safety policy" in note
+    assert "last tool call was interrupted" not in note
+
+
+async def test_no_policy_block_sends_no_block_notice(tmp_path):
+    """A turn nothing denied says nothing about the policy."""
+    cs = FakeCS(text="all done")
+    agent = _agent(_cfg(tmp_path), FakeTSM(cs))
+
+    chunks: list[str] = []
+    await agent.execute("do it", _session(tmp_path), on_text_chunk=chunks.append)
+
+    assert "Blocked by your safety policy" not in "".join(chunks)
 
 
 @pytest.mark.usefixtures("_advancing_clock")
@@ -761,6 +962,113 @@ async def test_execute_idle_backstop_does_not_fire_while_busy(tmp_path):
 
     assert resp.is_error is True
     assert "timed out" in resp.content
+
+
+async def test_idle_backstop_does_not_count_time_blocked_on_a_human(tmp_path):
+    """The multi-session incident: a question left unanswered for 193s (its
+    prompt held while another slot was on screen) made the idle clock older
+    than the 45s grace, so the completion backstop fired on the very poll the
+    human answered — the turn ended with only the pre-question preamble and
+    everything claude did with the answer was dropped."""
+    import time as _time
+
+    from structlog.testing import capture_logs
+
+    cs = FakeCS()
+    cs._complete_on_enter = False
+    cs._idle_at_composer = True  # dialog dismissed → bare composer on screen
+    tsm = FakeTSM(cs)
+    agent = _agent(_cfg(tmp_path), tsm)
+
+    polls = {"n": 0}
+
+    def _pending(chat_id):
+        polls["n"] += 1
+        assert cs.turn is not None
+        if polls["n"] == 1:
+            cs.turn.text_parts.append("I'll start by reading the proposal doc")
+            cs.turn.last_activity = _time.monotonic() - 193
+        if polls["n"] <= 3:
+            return True
+        if polls["n"] == 5:
+            cs.turn.text_parts.append("here are the 49 company reports")
+            cs.turn.complete()
+        return False
+
+    tsm.has_pending_human = _pending
+
+    with capture_logs() as logs:
+        resp = await agent.execute("harvest the list", _session(tmp_path))
+
+    assert "tmux_turn_idle_completed" not in [e["event"] for e in logs]
+    assert "here are the 49 company reports" in resp.content
+    assert resp.is_error is False
+
+
+async def test_idle_backstop_holds_while_the_answer_is_typed_into_the_pane(tmp_path):
+    """The wait clears the moment the human taps, but leashd then types the
+    chosen option into the dialog — no JSONL, bare composer. The turn must not
+    be completed inside that window either."""
+    import time as _time
+
+    from structlog.testing import capture_logs
+
+    cs = FakeCS()
+    cs._complete_on_enter = False
+    cs._idle_at_composer = True
+    cs.answer_drive_active = True
+    tsm = FakeTSM(cs)
+    agent = _agent(_cfg(tmp_path), tsm)
+
+    polls = {"n": 0}
+
+    def _pending(chat_id):
+        polls["n"] += 1
+        assert cs.turn is not None
+        if polls["n"] == 1:
+            cs.turn.text_parts.append("preamble")
+            cs.turn.last_activity = _time.monotonic() - 193
+        if polls["n"] == 4:
+            cs.answer_drive_active = False  # answer submitted
+            cs.turn.text_parts.append("acting on the answer")
+            cs.turn.complete()
+        return False
+
+    tsm.has_pending_human = _pending
+
+    with capture_logs() as logs:
+        resp = await agent.execute("harvest the list", _session(tmp_path))
+
+    assert "tmux_turn_idle_completed" not in [e["event"] for e in logs]
+    assert "acting on the answer" in resp.content
+
+
+@pytest.mark.usefixtures("_advancing_clock")
+async def test_idle_backstop_still_fires_once_the_pane_is_genuinely_quiet(tmp_path):
+    """Guard the guard: freezing the clock across a human wait must not disarm
+    the backstop for a turn that really did finish without a Stop hook."""
+    from structlog.testing import capture_logs
+
+    cs = FakeCS(text="the finished reply")
+    cs._complete_on_enter = False
+    cs._stream_text_on_submit = True
+    cs._idle_at_composer = True
+    tsm = FakeTSM(cs)
+    agent = _agent(_cfg(tmp_path), tsm)
+
+    polls = {"n": 0}
+
+    def _pending(chat_id):
+        polls["n"] += 1
+        return polls["n"] <= 2  # blocked, then answered and quiet for good
+
+    tsm.has_pending_human = _pending
+
+    with capture_logs() as logs:
+        resp = await agent.execute("do it", _session(tmp_path))
+
+    assert "tmux_turn_idle_completed" in [e["event"] for e in logs]
+    assert "the finished reply" in resp.content
 
 
 def _followup_begin(cs):
@@ -973,6 +1281,38 @@ async def test_max_concurrent_agents_raises_clear_error(tmp_path):
 
     with pytest.raises(AgentError, match="Too many concurrent agents"):
         await agent.execute("hi", _session(tmp_path, session_id="s2"))
+
+
+async def test_execute_aborts_naming_the_trust_prompt(tmp_path):
+    """An untrusted working directory holds ``claude`` on its folder-trust
+    gate. Submitting into that dialog is what killed the pane, so the turn
+    must stop first — and say which directory to go accept, rather than
+    surfacing ``tmux paste-buffer failed: target pane has exited``.
+    """
+    cs = FakeCS()
+    cs.ready = False
+    cs.trust_prompt = True
+    cs.working_directory = "/Users/me/projects/untrusted"
+    agent = _agent(_cfg(tmp_path), FakeTSM(cs))
+
+    with pytest.raises(AgentError, match="folder-trust prompt"):
+        await agent.execute("hi", _session(tmp_path))
+
+    assert "/Users/me/projects/untrusted" in str(cs.working_directory)
+    assert cs.sent == []  # nothing was typed into the dialog
+
+
+async def test_execute_aborts_when_pane_never_reaches_the_composer(tmp_path):
+    """Same guard for any other dialog that owns the boot screen: abort with
+    a pointer to /screen instead of typing the prompt into it."""
+    cs = FakeCS()
+    cs.ready = False
+    agent = _agent(_cfg(tmp_path), FakeTSM(cs))
+
+    with pytest.raises(AgentError, match="never reached the prompt"):
+        await agent.execute("hi", _session(tmp_path))
+
+    assert cs.sent == []
 
 
 def test_update_config_propagates_to_tsm(tmp_path):

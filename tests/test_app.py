@@ -408,7 +408,26 @@ class TestTmuxReapGating:
         reap.assert_not_called()
 
     def test_reaps_when_opted_in(self, tmp_path):
-        config = LeashdConfig(approved_directories=[tmp_path])
+        config = LeashdConfig(approved_directories=[tmp_path], tmux_persist_panes=False)
+        with patch(
+            "leashd.agents.runtimes.tmux_session.TmuxSessionManager.kill_owned_sessions"
+        ) as reap:
+            _patched_build_engine(config=config, reap_orphan_tmux=True)
+        reap.assert_called_once()
+
+    def test_defers_sweep_to_startup_when_panes_persist(self, tmp_path):
+        """Adoption owns the sweep: it must not run before `bind_safety`."""
+        config = LeashdConfig(approved_directories=[tmp_path], agent_runtime="tmux")
+        assert config.tmux_persist_panes is True
+        with patch(
+            "leashd.agents.runtimes.tmux_session.TmuxSessionManager.kill_owned_sessions"
+        ) as reap:
+            _patched_build_engine(config=config, reap_orphan_tmux=True)
+        reap.assert_not_called()
+
+    def test_reaps_when_runtime_is_not_tmux(self, tmp_path):
+        """A runtime switched away from tmux leaves panes nothing will adopt."""
+        config = LeashdConfig(approved_directories=[tmp_path], agent_runtime="codex")
         with patch(
             "leashd.agents.runtimes.tmux_session.TmuxSessionManager.kill_owned_sessions"
         ) as reap:

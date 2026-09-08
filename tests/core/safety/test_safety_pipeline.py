@@ -213,13 +213,13 @@ class TestAutonomousPolicyPipeline:
         )
         assert result.behavior == "allow"
 
-    async def test_autonomous_policy_hard_blocks_rm_rf(
+    async def test_autonomous_policy_hard_blocks_sudo(
         self, sandbox, audit_logger, event_bus, autonomous_policy
     ):
         gk = _build_gatekeeper(
             sandbox, audit_logger, event_bus, policy_engine=autonomous_policy
         )
-        result = await gk.check("Bash", {"command": "rm -rf /"}, "s1", "c1")
+        result = await gk.check("Bash", {"command": "sudo rm -rf /"}, "s1", "c1")
         assert result.behavior == "deny"
 
     async def test_autonomous_credential_denied_despite_file_write_allow(

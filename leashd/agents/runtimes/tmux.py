@@ -21,11 +21,12 @@ fallback) before returning a populated ``AgentResponse``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import structlog
 
@@ -41,6 +42,7 @@ from leashd.agents.runtimes._helpers import (
 )
 from leashd.agents.runtimes.tmux_session import (
     PANE_GONE,
+    PolicyBlock,
     get_or_create_tmux_session_manager,
 )
 from leashd.exceptions import AgentError
@@ -67,6 +69,13 @@ PANE_READY_TIMEOUT = 45.0
 # dead or stalled pane is caught in seconds on EVERY path (not only while a
 # human approval is pending, and not after a 60-minute blind wait).
 LIVENESS_POLL_INTERVAL = 5.0
+
+# How long a dedicated selector must sit on a byte-identical screen, with no
+# drive of our own running, before the turn is reported as wedged on it. A live
+# turn repaints its elapsed-time counter every second, so an unchanging screen
+# this long is proof nothing is happening — not merely the dismissed dialog
+# still painted behind working output.
+UNATTENDED_DIALOG_STALL_S = 45.0
 
 # The Stop lifecycle hook can fire before the JSONL tailer has drained claude's
 # final assistant ``text`` block (already on disk, lands just before the
@@ -178,6 +187,25 @@ def _wait_note(kind: str | None) -> str:
     return "⏳ Waiting for your response in this chat (or /stop to abort)."
 
 
+def _unattended_dialog_notice() -> str:
+    """Line shown when claude is blocked on a native dialog nobody will answer.
+
+    leashd's selector drives retire after their own short deadline and the
+    Stage-2 dialog watcher skips selector screens by design (T-9), so a
+    permission prompt whose keystroke was missed leaves claude waiting on a
+    keystroke no component will ever send. Nothing else notices: there is no
+    pending human interaction to pause the turn on, no pane death, no tailer
+    failure — the turn just goes silent until the engine-wide timeout hours
+    later. One such wedge ran 67 minutes before the user asked whether the
+    agent was stuck, which is why this says how to release it: typing into the
+    pane is what answered the dialog that time.
+    """
+    return (
+        "⏳ The agent is waiting on a permission prompt in its terminal that "
+        "leashd could not answer. Send any message to release it, or /stop to abort."
+    )
+
+
 def _resume_note(kind: str | None, approved: bool | None) -> str:
     """Line shown when the block clears, reflecting what the user actually did —
     an answered question or a plan review is not an 'approval'."""
@@ -192,6 +220,36 @@ def _resume_note(kind: str | None, approved: bool | None) -> str:
     return "▶️ Continuing."
 
 
+_INTERRUPTED_NOTE = (
+    "⚠️ The agent's last tool call was interrupted, so this turn stopped early. "
+    "Send /resume to pick it back up."
+)
+
+
+def _policy_block_note(block: PolicyBlock) -> str:
+    """Line shown when the turn ended because leashd denied a tool.
+
+    Claude Code treats a hook ``deny`` as the user rejecting the call and stops
+    the whole turn, so a policy decision and a stray keystroke both surface as
+    a reply that just stops. Naming the command and the rule is the difference
+    between "it broke again" and "my own policy blocked this", and it is the
+    only signal that tells the user a rule — not a bug — cost them the turn.
+    """
+    what = (
+        f"{block.tool_name}: {block.description}"
+        if block.description
+        else block.tool_name
+    )
+    reason = block.reason.strip() or "Blocked by safety policy"
+    tail = (
+        "It did not run; the agent was told and could carry on."
+        if block.inline
+        else "Claude stops the turn on a blocked tool. Send /resume to carry on "
+        "without it."
+    )
+    return f"🛑 Blocked by your safety policy: `{what}`\n{reason}\n{tail}"
+
+
 def _death_report(cs: TmuxClaudeSession) -> dict[str, Any]:
     """Post-mortem fields for an abort, never raising.
 
@@ -204,6 +262,41 @@ def _death_report(cs: TmuxClaudeSession) -> dict[str, Any]:
     except Exception:
         logger.debug("tmux_death_report_failed", exc_info=True)
         return {"pane_status": "unknown"}
+
+
+def _raise_not_ready(cs: TmuxClaudeSession) -> NoReturn:
+    """Abort a turn whose pane never reached the composer, saying why.
+
+    Proceeding to ``submit()`` from here is worse than failing: the prompt is
+    typed into whatever dialog owns the screen, and the escape hatch that runs
+    first can dismiss claude itself. The folder-trust gate gets its own message
+    because it is the one cause the user can clear in seconds, and because the
+    generic wording it used to produce — ``tmux paste-buffer failed: target
+    pane has exited`` — describes leashd's plumbing rather than the prompt
+    sitting unanswered in the pane.
+    """
+    report = _death_report(cs)
+    if cs.trust_prompt_present():
+        logger.warning(
+            "tmux_trust_prompt_blocked_turn",
+            session_id=cs.session_id,
+            chat_id=cs.chat_id,
+            working_directory=cs.working_directory,
+            **report,
+        )
+        raise AgentError(
+            f"Claude is waiting on its folder-trust prompt for "
+            f"`{cs.working_directory}` and leashd could not answer it. "
+            "Run `claude` in that directory once and accept the prompt, then "
+            "resend."
+        )
+    logger.warning(
+        "tmux_pane_never_ready", session_id=cs.session_id, chat_id=cs.chat_id, **report
+    )
+    raise AgentError(
+        "Claude's terminal never reached the prompt — a dialog may be open. "
+        "Check /screen, or /clear to start a fresh pane."
+    )
 
 
 def _pane_died_notice(report: dict[str, Any], *, resumable: bool) -> str:
@@ -255,7 +348,7 @@ class TmuxAgent(BaseAgent):
             # claude TUI (native queue) rather than engine-queued + re-submitted.
             accepts_input_while_busy=True,
             instruction_path="CLAUDE.md",
-            stability="experimental",
+            stability="stable",
         )
 
     @property
@@ -507,7 +600,8 @@ class TmuxAgent(BaseAgent):
         staged_attachments = False
         plan_revisions = 0
         while True:
-            await cs.await_ready(PANE_READY_TIMEOUT)
+            if not await cs.await_ready(PANE_READY_TIMEOUT):
+                _raise_not_ready(cs)
 
             turn = cs.begin_turn(
                 on_text_chunk=on_text_chunk, on_tool_activity=on_tool_activity
@@ -557,6 +651,24 @@ class TmuxAgent(BaseAgent):
                 current_text = feedback
                 continue
             break
+
+        # A deny that survived to here is the one that ended the turn: Claude
+        # aborts on a blocked tool wherever it happens, so this covers the
+        # clean Stop path as well as the idle backstop, which is where most of
+        # these landed with no explanation at all.
+        if cs.policy_block is not None:
+            logger.info(
+                "tmux_turn_ended_on_policy_block",
+                session_id=session.session_id,
+                chat_id=session.chat_id,
+                tool_name=cs.policy_block.tool_name,
+            )
+            if on_text_chunk is not None:
+                await safe_callback(
+                    on_text_chunk,
+                    f"\n\n{_policy_block_note(cs.policy_block)}\n",
+                    log_event="tmux_policy_block_notice_failed",
+                )
 
         # Resume that produced no turns → stale session id; clear it so the
         # next execute() spawns fresh (mirrors claude_cli behaviour).
@@ -618,6 +730,9 @@ class TmuxAgent(BaseAgent):
         notified_blocked = False
         blocked_since: float | None = None
         blocked_kind: str | None = None
+        notified_unattended = False
+        unattended_screen: str | None = None
+        unattended_since: float | None = None
 
         async def _abort(event: str, content: str, **fields: Any) -> AgentResponse:
             """End a turn that can never legitimately complete: log, unblock
@@ -697,6 +812,7 @@ class TmuxAgent(BaseAgent):
                         f"\n\n{_wait_note(blocked_kind)}\n",
                         log_event="tmux_blocked_notice_failed",
                     )
+                turn.mark_activity()
                 logger.warning(
                     "tmux_turn_blocked_on_human",
                     session_id=session.session_id,
@@ -705,14 +821,50 @@ class TmuxAgent(BaseAgent):
                 )
                 continue
 
-            # No human pending. If we told the user we were waiting, the block
-            # just cleared — emit a resume line reflecting what the user did
-            # (approved/rejected vs answered a question), then re-arm so a later
-            # block notifies again. (The streamed "⏳ Waiting…" chunk can't be
-            # retracted, so this is the signal that work resumed.)
+            stalled_screen = None
+            if not cs.answer_drive_active:
+                with contextlib.suppress(Exception):
+                    stalled_screen = cs.capture()
+            if stalled_screen and cs.dedicated_selector_present(stalled_screen):
+                if stalled_screen != unattended_screen:
+                    unattended_screen = stalled_screen
+                    unattended_since = time.monotonic()
+                elif not notified_unattended and unattended_since is not None:
+                    stalled_s = time.monotonic() - unattended_since
+                    if stalled_s > UNATTENDED_DIALOG_STALL_S:
+                        notified_unattended = True
+                        logger.warning(
+                            "tmux_native_dialog_unattended",
+                            session_id=session.session_id,
+                            chat_id=session.chat_id,
+                            stalled_s=int(stalled_s),
+                        )
+                        if on_text_chunk is not None:
+                            await safe_callback(
+                                on_text_chunk,
+                                f"\n\n{_unattended_dialog_notice()}\n",
+                                log_event="tmux_unattended_notice_failed",
+                            )
+                turn.mark_activity()
+            else:
+                unattended_screen = None
+                unattended_since = None
+                notified_unattended = False
+
+            human_wait_still_settling = (
+                blocked_since is not None or cs.answer_drive_active
+            )
+            if human_wait_still_settling:
+                turn.mark_activity()
+
+            # If we told the user we were waiting, the block just cleared —
+            # emit a resume line reflecting what the user did (approved/rejected
+            # vs answered a question), then re-arm so a later block notifies
+            # again. (The streamed "⏳ Waiting…" chunk can't be retracted, so
+            # this is the signal that work resumed.)
+            blocked_since = None
             if notified_blocked:
                 notified_blocked = False
-                blocked_since = None
                 approved = self._tsm.last_approval_approved(session.chat_id)
                 logger.info(
                     "tmux_human_wait_resolved",
@@ -776,12 +928,23 @@ class TmuxAgent(BaseAgent):
                 and now - turn.last_activity > completion_idle_grace
                 and cs.is_idle_at_composer()
             ):
+                interrupted = cs.was_interrupted()
                 logger.info(
                     "tmux_turn_idle_completed",
                     session_id=session.session_id,
                     chat_id=session.chat_id,
                     idle_s=int(now - turn.last_activity),
+                    interrupted=interrupted,
                 )
+                # A recorded policy block IS the explanation for this
+                # interrupt, and execute() reports it for every completion
+                # path — so the generic note would only bury the real cause.
+                if interrupted and on_text_chunk is not None and not cs.policy_block:
+                    await safe_callback(
+                        on_text_chunk,
+                        f"\n\n{_INTERRUPTED_NOTE}\n",
+                        log_event="tmux_interrupt_notice_failed",
+                    )
                 turn.force_complete()
                 break
 
@@ -795,6 +958,7 @@ class TmuxAgent(BaseAgent):
                     logger.info(
                         "tmux_turn_no_progress_finalized_with_text",
                         session_id=session.session_id,
+                        chat_id=session.chat_id,
                         idle_s=int(now - turn.last_activity),
                     )
                     turn.force_complete()
@@ -835,11 +999,39 @@ class TmuxAgent(BaseAgent):
         ``TmuxTurn.pending_followups`` / ``complete()``).
 
         Returns ``True`` when the text was queued into the running turn; returns
-        ``False`` (no side effects) when there is no live turn to attach to —
-        the engine then falls back to its normal queue-and-resubmit path.
+        ``False`` when there is no live turn to attach to, when the pane is
+        holding a dialog the human still owes an answer to, or when the
+        keystrokes never reached claude — the engine then falls back to its
+        normal queue-and-resubmit path, which runs the text as its own turn.
+
+        ``queue_confirmed`` on the success log says whether claude's own
+        ``queue-operation: enqueue`` receipt had landed by the time submit
+        returned. It is the only positive delivery evidence available: the
+        pane already reads "esc to interrupt" mid-turn, so the screen check
+        inside ``submit`` cannot distinguish an accepted follow-up from a
+        lost one. A ``False`` there is the first thing to look at when a
+        conversation goes quiet after a follow-up.
+
+        Every ``False`` leaves the counter where it found it. A follow-up
+        counted but never delivered makes ``complete()`` swallow the turn's own
+        completion signal, waiting forever for a response to a prompt claude
+        was never given: the turn hangs, and neither the original message nor
+        the follow-up is ever answered.
         """
         cs = self._tsm.get(session_id)
         if cs is None or cs.pane_is_dead():
+            return False
+        if self._tsm.has_pending_human(cs.chat_id):
+            # The pane is showing a dialog leashd is asking the human about.
+            # submit() types into it: the characters are read as the dialog's
+            # own keystrokes, the follow-up is eaten, and the count is left
+            # standing over a response that will never come.
+            logger.info(
+                "tmux_followup_declined_human_pending",
+                session_id=session_id,
+                chat_id=cs.chat_id,
+                kind=self._tsm.pending_human_kind(cs.chat_id),
+            )
             return False
         turn = cs.turn
         if turn is None or turn.stop_event.is_set():
@@ -848,6 +1040,7 @@ class TmuxAgent(BaseAgent):
         # landing during submit()'s sleeps already sees the pending follow-up
         # and defers instead of ending the turn.
         turn.pending_followups += 1
+        enqueued_before = cs.followup_enqueued_at
         if attachments:
             for staged in self._stage_attachments(attachments, cs.working_directory):
                 cs.send_keys(f"@{staged} ", literal=True)
@@ -855,12 +1048,24 @@ class TmuxAgent(BaseAgent):
         # submit() returns fast here: the pane already shows "esc to interrupt",
         # so its started-check is immediately true after one Enter — exactly the
         # "claude queued it" outcome.
-        await cs.submit(text)
+        delivered = await cs.submit(text)
+        if not delivered:
+            turn.pending_followups = max(0, turn.pending_followups - 1)
+            cs.clear_composer()
+            logger.warning(
+                "tmux_followup_delivery_unconfirmed",
+                session_id=session_id,
+                chat_id=cs.chat_id,
+                pending_followups=turn.pending_followups,
+            )
+            return False
+        turn.pending_followup_texts.append(" ".join(text.split()))
         logger.info(
             "tmux_followup_injected",
             session_id=session_id,
             chat_id=cs.chat_id,
             pending_followups=turn.pending_followups,
+            queue_confirmed=cs.followup_enqueued_at != enqueued_before,
         )
         return True
 
@@ -996,6 +1201,16 @@ class TmuxAgent(BaseAgent):
         cs.complete_turn(is_error=True)
         await self._tsm.terminate(session_id)
 
+    def live_chat_ids(self) -> set[str]:
+        """Chats that own a pane a message can be sent straight into.
+
+        A dead pane is not live — the chat still has a session and resumes on
+        the next turn, so the picker shows it, just without an agent behind it.
+        """
+        return {
+            cs.chat_id for cs in self._tsm.active_sessions() if not cs.pane_is_dead()
+        }
+
     async def cancel_chat(self, chat_id: str) -> None:
         """Terminate every live pane owned by this chat.
 
@@ -1007,5 +1222,83 @@ class TmuxAgent(BaseAgent):
         for cs in self._tsm.sessions_for_chat(chat_id):
             await self.cancel(cs.session_id)
 
+    async def adopt_panes(self) -> list[TmuxClaudeSession]:
+        """Re-adopt the panes a previous daemon left running on the socket."""
+        if not self._config.tmux_persist_panes:
+            return []
+        return await self._tsm.adopt_orphan_panes(
+            max_age_hours=self._config.tmux_adopt_max_age_hours
+        )
+
+    async def reattach_turn(
+        self,
+        session: Session,
+        *,
+        on_text_chunk: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        on_tool_activity: Callable[[ToolActivity | None], Coroutine[Any, Any, None]]
+        | None = None,
+    ) -> AgentResponse | None:
+        """Await the turn an adopted pane was already running, and answer it.
+
+        The counterpart to :meth:`execute` for work that started under a
+        previous daemon: the prompt was typed long ago and claude never stopped
+        working on it, so this only re-attaches the chat's stream to the live
+        turn and waits for it exactly as a normal turn is waited for. Returns
+        ``None`` when the pane has no turn to wait for.
+        """
+        cs = self._tsm.get(session.session_id)
+        if cs is None or cs.pane_is_dead():
+            return None
+        turn = cs.turn
+        if turn is None or turn.stop_event.is_set():
+            return None
+        turn.on_text_chunk = on_text_chunk
+        turn.on_tool_activity = on_tool_activity
+        logger.info(
+            "agent_execute_started",
+            session_id=session.session_id,
+            prompt_length=len(cs.last_prompt),
+            mode=session.mode,
+            reattached=True,
+            runtime="tmux",
+        )
+        early = await self._await_turn(
+            cs,
+            turn,
+            session,
+            on_text_chunk,
+            ceiling=float(self._config.tmux_turn_ceiling_seconds),
+            no_progress=float(self._config.tmux_no_progress_timeout_seconds),
+            completion_idle_grace=float(
+                self._config.tmux_completion_idle_grace_seconds
+            ),
+            goal_idle_grace=float(self._config.tmux_goal_idle_grace_seconds),
+            goal_stuck_ceiling=float(self._config.tmux_goal_stuck_ceiling_seconds),
+        )
+        if early is not None:
+            return early
+        if cs.claude_uuid:
+            session.agent_resume_token = cs.claude_uuid
+        logger.info(
+            "agent_execute_completed",
+            session_id=session.session_id,
+            duration_ms=turn.duration_ms,
+            num_turns=turn.num_turns,
+            cost_usd=turn.cost_usd,
+            tools_used_count=len(turn.tools_used),
+            is_error=turn.is_error,
+            reattached=True,
+            runtime="tmux",
+        )
+        return AgentResponse(
+            content=turn.assembled_text or "(no text in turn — see the terminal)",
+            session_id=cs.claude_uuid,
+            cost=turn.cost_usd,
+            duration_ms=turn.duration_ms,
+            num_turns=turn.num_turns,
+            tools_used=turn.tools_used,
+            is_error=turn.is_error,
+        )
+
     async def shutdown(self) -> None:
-        await self._tsm.shutdown_all()
+        await self._tsm.shutdown_all(keep_panes=self._config.tmux_persist_panes)

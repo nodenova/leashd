@@ -217,7 +217,7 @@ def _print_yaml_only_config(yaml_data: dict[str, Any]) -> None:
     effort = yaml_data.get("effort", "xhigh")
     print(f"\nThinking effort: {effort}")
 
-    runtime = yaml_data.get("agent_runtime", "claude-code")
+    runtime = yaml_data.get("agent_runtime", "tmux")
     print(f"Agent runtime: {runtime}")
 
     if yaml_data.get("task_orchestrator"):
@@ -1088,7 +1088,7 @@ def _handle_runtime(args: argparse.Namespace) -> None:
 def _handle_runtime_show() -> None:
     """Display current agent runtime."""
     data = load_global_config()
-    runtime = data.get("agent_runtime", "claude-code")
+    runtime = data.get("agent_runtime", "tmux")
     print(f"Agent runtime: {runtime}")
 
 
@@ -1126,7 +1126,7 @@ def _handle_runtime_list() -> None:
 
     runtimes = list_runtimes()
     data = load_global_config()
-    current = data.get("agent_runtime", "claude-code")
+    current = data.get("agent_runtime", "tmux")
     print("Available runtimes:")
     for rt in runtimes:
         marker = " (active)" if rt["name"] == current else ""
@@ -1224,6 +1224,7 @@ def _handle_clean() -> None:
         if socket_dir.is_dir():
             for artifact in (
                 *socket_dir.glob("*.settings.json"),
+                *socket_dir.glob("*.pane.json"),
                 socket_dir / "tmux.sock",
             ):
                 if artifact.exists():
@@ -1683,7 +1684,7 @@ def _handle_start(*, foreground: bool) -> None:
     print(f"Logs: {daemon_log_path()}")
 
 
-def _handle_stop() -> None:
+def _handle_stop(end_agents: bool = False) -> None:
     """Stop the leashd daemon."""
     from leashd.daemon import stop_daemon
     from leashd.exceptions import DaemonError
@@ -1694,8 +1695,25 @@ def _handle_stop() -> None:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    kept = 0
+    config = _try_resolve_config()
+    if config is not None:
+        with contextlib.suppress(Exception):
+            from leashd.agents.runtimes.tmux_session import TmuxSessionManager
+
+            tsm = TmuxSessionManager(config)
+            if end_agents:
+                print(f"Ended {tsm.kill_owned_sessions()} agent session(s).")
+            else:
+                kept = len(tsm.owned_session_names())
+
     if clean:
         print("leashd stopped.")
+        if kept:
+            print(
+                f"{kept} agent session(s) still running — the next start picks "
+                "them back up. 'leashd stop --end-agents' ends them instead."
+            )
     else:
         print(
             "Warning: leashd did not exit after SIGTERM + SIGKILL — PID file removed."
@@ -1787,7 +1805,13 @@ def main() -> None:
         help="Run in foreground instead of daemonizing",
     )
 
-    subparsers.add_parser("stop", help="Stop the leashd daemon")
+    stop_parser = subparsers.add_parser("stop", help="Stop the leashd daemon")
+    stop_parser.add_argument(
+        "--end-agents",
+        action="store_true",
+        help="Also end the running agent sessions instead of leaving them for "
+        "the next start to pick back up",
+    )
     subparsers.add_parser("restart", help="Restart the leashd daemon")
     subparsers.add_parser("status", help="Show daemon status")
     subparsers.add_parser("_run", help=argparse.SUPPRESS)
@@ -2091,7 +2115,7 @@ def main() -> None:
     elif args.command == "start":
         _handle_start(foreground=args.foreground)
     elif args.command == "stop":
-        _handle_stop()
+        _handle_stop(end_agents=args.end_agents)
     elif args.command == "restart":
         _handle_restart()
     elif args.command == "status":

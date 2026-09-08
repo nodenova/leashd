@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from leashd.agents.base import AgentResponse, ToolActivity
+from leashd.agents.runtimes._helpers import is_retryable_error
 from leashd.agents.runtimes.codex import (
     _APPROVAL_MAP,
     _AUTO_MODE_INSTRUCTION,
@@ -18,7 +19,6 @@ from leashd.agents.runtimes.codex import (
     _SANDBOX_MAP,
     CodexAgent,
     _backoff_delay,
-    _is_retryable_error,
     _safe_callback,
     _truncate,
     _unwrap_shell,
@@ -830,14 +830,14 @@ class TestHelpers:
         assert _backoff_delay(10) == 16.0
 
     def test_is_retryable_true(self):
-        assert _is_retryable_error("api_error: overloaded")
-        assert _is_retryable_error("rate_limit exceeded")
-        assert _is_retryable_error("HTTP 529")
-        assert _is_retryable_error("HTTP 500")
+        assert is_retryable_error("api_error: overloaded")
+        assert is_retryable_error("rate_limit exceeded")
+        assert is_retryable_error("HTTP 529")
+        assert is_retryable_error("HTTP 500")
 
     def test_is_retryable_false(self):
-        assert not _is_retryable_error("permission denied")
-        assert not _is_retryable_error("file not found")
+        assert not is_retryable_error("permission denied")
+        assert not is_retryable_error("file not found")
 
 
 # ---------------------------------------------------------------------------

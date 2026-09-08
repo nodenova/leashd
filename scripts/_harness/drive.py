@@ -10,6 +10,7 @@ Usage:
   python drive.py watch <seconds> <start_iso>   poll until the turn completes
   python drive.py calls [since]         dump recorded calls
   python drive.py buttons <message_id>
+  python drive.py sessions              conversation roster + which slot is live
   python drive.py files [since]         dump real files the bot uploaded
   python drive.py errors                dump Bot API errors the engine caused
   python drive.py log <start_iso>       filtered app.log events since timestamp
@@ -201,6 +202,19 @@ if __name__ == "__main__":
         streaming_timeline(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
     elif cmd == "buttons":
         print(json.dumps(_get(f"/control/buttons?message_id={sys.argv[2]}"), indent=2))
+    elif cmd == "sessions":
+        d = _get("/control/sessions")
+        if not d.get("ready"):
+            print("  (engine not up yet)")
+        else:
+            print(f"foreground: {d['foreground']}")
+            for slot in d["slots"]:
+                marker = "▸" if slot["foreground"] else " "
+                print(
+                    f"  {marker} #{slot['index']} {slot['chat_id']:24} "
+                    f"{slot['directory']:16} {slot['mode']:12} {slot['status']:10} "
+                    f"msgs={slot['messages']}"
+                )
     elif cmd == "files":
         uploaded_files(int(sys.argv[2]) if len(sys.argv) > 2 else 0)
     elif cmd == "log":

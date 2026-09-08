@@ -93,7 +93,13 @@ class LeashdConfig(BaseSettings):
     # so this runtime requires web_enabled=true (the hook receiver mounts on
     # the WebUI FastAPI app).
     tmux_socket_dir: Path = Path("~/.leashd/tmux")
-    tmux_hook_secret: str | None = None  # auto-generated per daemon if unset
+    tmux_hook_secret: str | None = None  # minted once and persisted if unset
+    tmux_persist_panes: bool = True  # panes outlive the daemon and are re-adopted
+    # on the next start, so restarting to pick up a fix does not kill live work.
+    # Set false for the pre-1.6 behaviour: every pane is reaped at stop and start.
+    tmux_adopt_max_age_hours: float = 24.0  # a pane older than this is reaped
+    # instead of adopted, so a forgotten `claude` cannot be revived indefinitely.
+    # 0 disables the age check.
     tmux_hook_timeout_seconds: int = 25  # optional larger floor only; the
     # effective PreToolUse hook timeout is effectively-infinite when the human
     # wait is unbounded (the default — parity with claude-cli), else sized to

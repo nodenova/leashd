@@ -237,3 +237,68 @@ class TestApprovalCards:
         by_id = {r["approval_id"]: r for r in capture["approvals"]}
         assert by_id["ap-multi-1"]["approved"] is True
         assert by_id["ap-multi-2"]["approved"] is False
+
+
+@pytest.mark.asyncio(loop_scope="module")
+@pytest.mark.e2e
+class TestApproveAll:
+    """The WebUI had Approve/Deny only, so every gated call cost a tap."""
+
+    async def test_button_names_the_scope_it_grants(
+        self, authed_page: Page, test_server: SimpleNamespace
+    ) -> None:
+        await inject(
+            test_server.ws_handler,
+            test_server.chat_ids,
+            "approval_request",
+            {
+                "request_id": "ap-all-label",
+                "tool": "Bash::curl raw.githubusercontent.com",
+                "description": "Network access",
+            },
+        )
+        card_sel = '[data-approval-id="ap-all-label"]'
+        await authed_page.wait_for_selector(card_sel, timeout=5000)
+
+        label = await authed_page.text_content(f"{card_sel} .btn-approve-all")
+        assert label == "Approve all “curl raw.githubusercontent.com”"
+
+    async def test_it_approves_and_enables_auto_approve(
+        self, authed_page: Page, test_server: SimpleNamespace, capture: dict
+    ) -> None:
+        tool = "Bash::curl api.github.com"
+        await inject(
+            test_server.ws_handler,
+            test_server.chat_ids,
+            "approval_request",
+            {"request_id": "ap-all-send", "tool": tool, "description": "Network"},
+        )
+        await authed_page.wait_for_selector(
+            '[data-approval-id="ap-all-send"]', timeout=5000
+        )
+        await authed_page.click(
+            '[data-approval-id="ap-all-send"] [data-action="approve-all"]'
+        )
+
+        await wait_for(
+            lambda: bool(capture["auto_approvals"]),
+            msg="No auto-approve captured",
+        )
+        assert capture["approvals"][-1] == {
+            "approval_id": "ap-all-send",
+            "approved": True,
+        }
+        assert capture["auto_approvals"][-1]["tool_name"] == tool
+
+    async def test_a_toolless_prompt_offers_no_blanket_grant(
+        self, authed_page: Page, test_server: SimpleNamespace
+    ) -> None:
+        await inject(
+            test_server.ws_handler,
+            test_server.chat_ids,
+            "approval_request",
+            {"request_id": "ap-all-none", "tool": "", "description": "unknown"},
+        )
+        card_sel = '[data-approval-id="ap-all-none"]'
+        await authed_page.wait_for_selector(card_sel, timeout=5000)
+        assert await authed_page.query_selector(f"{card_sel} .btn-approve-all") is None

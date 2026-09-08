@@ -70,9 +70,17 @@ class TestPolicyRuleMatching:
         c = engine.classify("Bash", {"command": "git push -f origin main"})
         assert engine.evaluate(c) == PolicyDecision.DENY
 
-    def test_rm_rf_denied(self, engine):
+    def test_rm_rf_asks(self, engine):
+        """Recursive delete asks; it is not on the deny floor.
+
+        Every `rm -rf` in this machine's audit log was the agent clearing its
+        own litter (`.venv`, `__pycache__`, `~/.npm/_npx`, `/tmp/...`), so a
+        hard deny ended real work to protect a cache. It still cannot run
+        unattended — see [[test_all_policies_gate_rm_rf]].
+        """
         c = engine.classify("Bash", {"command": "rm -rf /"})
-        assert engine.evaluate(c) == PolicyDecision.DENY
+        assert engine.evaluate(c) == PolicyDecision.REQUIRE_APPROVAL
+        assert c.category == "recursive-delete"
 
     def test_sudo_denied(self, engine):
         c = engine.classify("Bash", {"command": "sudo apt install something"})
@@ -468,14 +476,29 @@ class TestPolicyBypassAttacks:
         # No command key at all
         assert isinstance(c.category, str)
 
-    def test_single_quotes_hiding_rm(self, engine):
-        """Regex should still find rm -rf inside quoted strings."""
-        c = engine.classify("Bash", {"command": "echo 'rm -rf /'"})
-        assert engine.evaluate(c) == PolicyDecision.DENY
+    def test_quoted_string_is_data_not_a_command(self, engine):
+        """A dangerous phrase inside a quoted argument runs nothing.
 
-    def test_double_quotes_hiding_sudo(self, engine):
-        c = engine.classify("Bash", {"command": 'echo "sudo apt install"'})
-        assert engine.evaluate(c) == PolicyDecision.DENY
+        Denying it made every ``grep``/``echo``/heredoc that mentions the
+        phrase a blocked call — including a search for the deny rules
+        themselves — while blocking no destructive command at all.
+        """
+        for command in (
+            "echo 'rm -rf /'",
+            'echo "sudo apt install"',
+            'grep -n "rm -rf" tests/core/safety/test_policy.py',
+        ):
+            c = engine.classify("Bash", {"command": command})
+            assert engine.evaluate(c) != PolicyDecision.DENY, command
+
+    def test_quoted_string_handed_to_a_shell_is_still_gated(self, engine):
+        """Quotes only hide text the shell passes along, not text it runs."""
+        for command in ('sh -c "sudo apt install"', "eval 'sudo whoami'"):
+            c = engine.classify("Bash", {"command": command})
+            assert engine.evaluate(c) == PolicyDecision.DENY, command
+        for command in ("bash -c 'rm -rf /'", "eval 'rm -rf /'"):
+            c = engine.classify("Bash", {"command": command})
+            assert engine.evaluate(c) == PolicyDecision.REQUIRE_APPROVAL, command
 
     def test_very_long_command_no_redos(self, engine):
         """100K character string completes without ReDoS."""
@@ -510,7 +533,7 @@ class TestPolicyBypassAttacks:
         """Python resolves r\\x6d to 'rm' — regex sees the resolved string."""
         cmd = "r\x6d -rf /"  # resolves to "rm -rf /"
         c = engine.classify("Bash", {"command": cmd})
-        assert engine.evaluate(c) == PolicyDecision.DENY
+        assert engine.evaluate(c) == PolicyDecision.REQUIRE_APPROVAL
 
     def test_backtick_substitution_in_command(self, engine):
         """`echo rm` -rf / — regex sees the literal backtick string."""
@@ -634,8 +657,14 @@ class TestDevToolsOverlay:
         assert engine.evaluate(c) == PolicyDecision.REQUIRE_APPROVAL
 
     def test_overlay_does_not_bypass_deny_rules(self, dev_overlay_engine):
-        c = dev_overlay_engine.classify("Bash", {"command": "rm -rf /"})
+        c = dev_overlay_engine.classify("Bash", {"command": "sudo apt install x"})
         assert dev_overlay_engine.evaluate(c) == PolicyDecision.DENY
+
+    def test_overlay_does_not_bypass_the_recursive_delete_gate(
+        self, dev_overlay_engine
+    ):
+        c = dev_overlay_engine.classify("Bash", {"command": "rm -rf /"})
+        assert dev_overlay_engine.evaluate(c) == PolicyDecision.REQUIRE_APPROVAL
 
     def test_overlay_preserves_credential_deny(self, dev_overlay_engine):
         c = dev_overlay_engine.classify("Read", {"file_path": "/home/user/.env"})
@@ -725,9 +754,9 @@ class TestCdPrefixStripping:
         c = engine.classify("Bash", {"command": "cd /project && git status"})
         assert engine.evaluate(c) == PolicyDecision.ALLOW
 
-    def test_cd_rm_rf_denied(self, engine):
+    def test_cd_rm_rf_still_gated(self, engine):
         c = engine.classify("Bash", {"command": "cd /project && rm -rf /"})
-        assert engine.evaluate(c) == PolicyDecision.DENY
+        assert engine.evaluate(c) == PolicyDecision.REQUIRE_APPROVAL
 
     def test_cd_git_push_requires_approval(self, engine):
         c = engine.classify("Bash", {"command": "cd /project && git push origin main"})
@@ -809,9 +838,18 @@ class TestCrossPolicyInvariants:
             pytest.skip(f"{request.param} not found")
         return PolicyEngine([policy_path])
 
-    def test_all_policies_deny_rm_rf(self, any_policy_engine):
+    def test_all_policies_gate_rm_rf(self, any_policy_engine):
+        """The invariant that survived the deny→ask move: never auto-allowed.
+
+        Which of the two gates applies is a per-policy choice — `strict.yaml`
+        denies every `rm`, the rest ask — but no policy lets a recursive
+        delete through without a human.
+        """
         c = any_policy_engine.classify("Bash", {"command": "rm -rf /"})
-        assert any_policy_engine.evaluate(c) == PolicyDecision.DENY
+        assert any_policy_engine.evaluate(c) in (
+            PolicyDecision.DENY,
+            PolicyDecision.REQUIRE_APPROVAL,
+        )
 
     @pytest.fixture(params=["default.yaml", "permissive.yaml", "autonomous.yaml"])
     def force_push_policy_engine(self, request):

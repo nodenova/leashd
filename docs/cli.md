@@ -10,7 +10,8 @@ leashd is controlled entirely from the command line. The `leashd` command manage
 | `leashd init` | Run the first-time setup wizard |
 | `leashd start` | Start daemon in background |
 | `leashd start -f` | Start in foreground (useful for debugging) |
-| `leashd stop` | Graceful shutdown (SIGTERM, 10s grace period) |
+| `leashd stop` | Graceful shutdown (SIGTERM, 10s grace period); running agents are left for the next start |
+| `leashd stop --end-agents` | Same, but also ends the running agent sessions |
 | `leashd status` | Show PID and running state |
 | `leashd config` | Show resolved config (masks tokens) |
 | `leashd add-dir [path]` | Add directory to approved list (default: cwd) |
@@ -126,12 +127,12 @@ Displays backend, headless mode, and profile path.
 ### Switching Backend
 
 ```bash
-leashd browser set-backend playwright       # Playwright MCP (default)
-leashd browser set-backend agent-browser    # agent-browser CLI
+leashd browser set-backend playwright       # Playwright MCP
+leashd browser set-backend agent-browser    # agent-browser CLI (default)
 ```
 
-- **`playwright`** — uses Playwright MCP server via `.mcp.json`. Provides 28 browser tools through the Claude Agent SDK. This is the default.
-- **`agent-browser`** — uses the agent-browser CLI skill instead. Installs the skill automatically on switch; Playwright MCP is disabled.
+- **`playwright`** — uses Playwright MCP server via `.mcp.json`. Provides 28 browser tools through the Claude Agent SDK.
+- **`agent-browser`** — uses the agent-browser CLI skill instead. Installs the skill automatically on switch; Playwright MCP is disabled. This is the default.
 
 ### Headless Mode
 
@@ -172,7 +173,8 @@ leashd runtime show
 ```bash
 leashd runtime set codex          # switch to codex
 leashd runtime set claude-code    # switch to claude-code (SDK)
-leashd runtime set claude-cli     # switch to claude-cli (native subprocess, default)
+leashd runtime set claude-cli     # switch to claude-cli (native subprocess)
+leashd runtime set tmux           # switch to tmux (interactive claude TUI, default)
 ```
 
 Persists the choice in `~/.leashd/config.yaml` under the `agent_runtime` key. A daemon restart (`leashd restart`) is required for the change to take effect.
@@ -272,10 +274,13 @@ Background mode spawns `leashd _run` as a detached subprocess and writes a PID f
 ### Stopping
 
 ```bash
-leashd stop
+leashd stop                # agents keep running; the next start picks them up
+leashd stop --end-agents   # end them too
 ```
 
 Sends `SIGTERM` to the daemon process. Waits up to 10 seconds for graceful shutdown. If the process doesn't exit, the PID file is removed and a warning is shown.
+
+On the `tmux` runtime, agent panes live on a tmux server of their own, so they survive the daemon and the next start re-adopts them — a `leashd restart` to pick up a config change or a new build no longer ends the work in progress. See [Restarting without losing work](agents.md#restarting-without-losing-work). `--end-agents` kills them instead, and so does `leashd clean`.
 
 ### Status
 

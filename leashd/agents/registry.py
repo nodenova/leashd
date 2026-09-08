@@ -85,7 +85,7 @@ def _register_builtins() -> None:
     _CAPABILITIES["claude-cli"] = {"stability": "beta"}
     _CAPABILITIES["claude-code"] = {"stability": "stable"}
     _CAPABILITIES["codex"] = {"stability": "beta"}
-    _CAPABILITIES["tmux"] = {"stability": "experimental"}
+    _CAPABILITIES["tmux"] = {"stability": "stable"}
 
 
 _register_builtins()

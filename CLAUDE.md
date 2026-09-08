@@ -31,9 +31,6 @@ make check
 uv run playwright install chromium   # one-time setup
 uv run pytest -m e2e -v
 make check-all                       # = make check + E2E
-
-# JS unit tests (WebUI utils.js, Vitest) — NOT included in `make check`
-cd tests/js && npm install && npm test
 ```
 
 CLI commands are discoverable via `leashd --help` and `leashd <subcommand> --help`.
@@ -57,7 +54,7 @@ This repo ships Claude Code skills in `.claude/skills/`. They hold architecture 
 
 ## Mandatory Post-Implementation Check
 
-**ALWAYS run `make check` after finishing any implementation work and fix ALL issues before considering the task complete.** Non-negotiable. `make check` runs ruff, mypy, and unit pytest — it does **not** run the E2E (`pytest -m e2e`) or JS (`tests/js`, Vitest) tiers, so run those too when you touch the WebUI, browser automation, or `data/webui/*.js`. mypy runs with `|| true` in the Makefile but you should still fix any type errors it reports.
+**ALWAYS run `make check` after finishing any implementation work and fix ALL issues before considering the task complete.** Non-negotiable. `make check` runs ruff, mypy, and unit pytest — it does **not** run the E2E tier (`pytest -m e2e`, or `make check-all`), so run that too when you touch the WebUI, browser automation, or `data/webui/*.js`. mypy runs with `|| true` in the Makefile but you should still fix any type errors it reports.
 
 ## Architecture
 

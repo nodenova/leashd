@@ -260,7 +260,7 @@ def create_rest_router(
             content={
                 "agent": {
                     "effort": raw.get("effort", "xhigh"),
-                    "runtime": raw.get("agent_runtime", "claude-code"),
+                    "runtime": raw.get("agent_runtime", "tmux"),
                     "default_mode": raw.get("default_mode", "auto"),
                     "max_turns": raw.get("max_turns", 250),
                     "max_tool_calls": raw.get("max_tool_calls", -1),
@@ -274,7 +274,7 @@ def create_rest_router(
                     if get_workspace_settings(name)
                 },
                 "browser": {
-                    "backend": browser.get("backend", "playwright"),
+                    "backend": browser.get("backend", "agent-browser"),
                     "headless": browser.get("headless", False),
                 },
             }

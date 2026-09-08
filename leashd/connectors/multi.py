@@ -188,6 +188,22 @@ class MultiConnector(BaseConnector):
             chat_id, message_id, delay=delay
         )
 
+    def supports_chat_sessions(self, chat_id: str) -> bool:
+        return self._get_connector(chat_id).supports_chat_sessions(chat_id)
+
+    async def activate_chat_session(self, chat_id: str) -> None:
+        await self._get_connector(chat_id).activate_chat_session(chat_id)
+
+    def chat_session_visible(self, chat_id: str) -> bool:
+        return self._get_connector(chat_id).chat_session_visible(chat_id)
+
+    def discard_prompt(self, prompt_id: str) -> None:
+        for c in self._connectors:
+            c.discard_prompt(prompt_id)
+
+    async def flush_chat_session_prompts(self, chat_id: str) -> None:
+        await self._get_connector(chat_id).flush_chat_session_prompts(chat_id)
+
     def set_message_handler(
         self,
         handler: MessageHandler,

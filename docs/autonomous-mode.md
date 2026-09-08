@@ -4,7 +4,7 @@ Autonomous mode enables leashd sessions to run with minimal human intervention b
 
 ## Three Guarantees
 
-1. **Human-in-the-loop when it matters** — Hard blocks (credentials, force push, `rm -rf`, `sudo`) can never be overridden by any approver. The AI approver only handles `require_approval` decisions, never `deny` decisions.
+1. **Human-in-the-loop when it matters** — Hard blocks (credentials, force push, `sudo`, pipe-to-shell) can never be overridden by any approver. The AI approver only handles `require_approval` decisions, never `deny` decisions.
 2. **Fail-safe defaults** — The AutoApprover fails closed (denies on error), the AutonomousLoop escalates to the human when retries are exhausted, and circuit breakers cap both approval calls and plan revisions per session.
 3. **Full auditability** — Every AI approval decision is logged with `approver_type` in the same append-only JSONL audit trail. No decision is invisible.
 
@@ -406,7 +406,7 @@ See the [Autonomous Setup Guide](autonomous-setup-guide.md) for a step-by-step c
 ```mermaid
 flowchart TB
     subgraph Autonomous["autonomous.yaml"]
-        deny["DENY: credentials, force push, push to main/master,<br>rm -rf, sudo, pipe-to-shell, chmod 777, DROP/TRUNCATE"]
+        deny["DENY: credentials, force push, push to main/master,<br>sudo, pipe-to-shell, chmod 777, DROP/TRUNCATE"]
         allow["ALLOW: agent tools, reads, browser readonly,<br>test runners, linters, package managers,<br>safe git (add/commit/stash), file writes, gh pr"]
         approval["REQUIRE AI APPROVAL: git push (feature branch),<br>git mutations (reset/rebase/merge),<br>network bash (curl/wget/ssh), browser mutations"]
         default_action["Default: require_approval"]
@@ -427,7 +427,8 @@ flowchart TB
 | Browser readonly | Allow | Approval | Allow | Allow |
 | Browser mutations | Approval | Approval | Allow | AI Approval |
 | Network bash (curl, wget) | Approval | Approval | Allow | AI Approval |
-| rm -rf / sudo | Deny | Deny | Deny | Deny |
+| sudo / pipe-to-shell | Deny | Deny | Deny | Deny |
+| rm -rf | Approval | Approval | Approval | Deny |
 | Credential files | Deny | Deny | Deny | Deny |
 | Approval timeout | 300s | 120s | 600s | 30s |
 | Approver | Human | Human | Human | AI (Claude CLI) |
@@ -540,7 +541,7 @@ The `session_mode` field is added to `tool_attempt` audit entries when running i
 
 ## Safety Guarantees
 
-1. **Hard blocks are absolute.** The `deny` rules in `autonomous.yaml` (credentials, force push, `rm -rf`, `sudo`, pipe-to-shell, `chmod 777`, `DROP/TRUNCATE`) can never be overridden by the AI approver. The policy engine evaluates deny rules before the approver is ever consulted.
+1. **Hard blocks are absolute.** The `deny` rules in `autonomous.yaml` (credentials, force push, `sudo`, pipe-to-shell, `chmod 777`, `DROP/TRUNCATE`) can never be overridden by the AI approver. The policy engine evaluates deny rules before the approver is ever consulted. `rm -rf` is `require_approval`, so in an autonomous run the AI approver does weigh it in context.
 
 2. **Sandbox enforcement is unchanged.** Path tools (Read, Write, Edit, Glob, Grep, NotebookEdit) still pass through `SandboxEnforcer` before policy evaluation. The AI approver cannot bypass directory boundaries.
 

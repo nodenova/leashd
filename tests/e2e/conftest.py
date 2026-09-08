@@ -165,6 +165,7 @@ async def capture(test_server: SimpleNamespace) -> dict[str, list[dict[str, Any]
     """
     results: dict[str, list[dict[str, Any]]] = {
         "approvals": [],
+        "auto_approvals": [],
         "interactions": [],
         "interrupts": [],
     }
@@ -172,6 +173,9 @@ async def capture(test_server: SimpleNamespace) -> dict[str, list[dict[str, Any]
     async def _approval(approval_id: str, approved: bool) -> bool:
         results["approvals"].append({"approval_id": approval_id, "approved": approved})
         return True
+
+    def _auto_approve(chat_id: str, tool_name: str) -> None:
+        results["auto_approvals"].append({"chat_id": chat_id, "tool_name": tool_name})
 
     async def _interaction(interaction_id: str, answer: str) -> bool:
         results["interactions"].append(
@@ -186,6 +190,7 @@ async def capture(test_server: SimpleNamespace) -> dict[str, list[dict[str, Any]
         return True
 
     test_server.ws_handler.set_approval_resolver(_approval)
+    test_server.ws_handler.set_auto_approve_handler(_auto_approve)
     test_server.ws_handler.set_interaction_resolver(_interaction)
     test_server.ws_handler.set_interrupt_resolver(_interrupt)
 

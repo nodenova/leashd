@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import structlog
 from telegram import (
@@ -42,6 +44,8 @@ from leashd.connectors.telegram_markdown import (
     render_chunks,
     render_one,
 )
+from leashd.connectors.telegram_sessions import ChatSessionRouter
+from leashd.core.chat_sessions import index_of
 from leashd.exceptions import ConnectorError
 
 if TYPE_CHECKING:
@@ -72,6 +76,10 @@ _GIT_PREFIX = "git:"
 _DIR_PREFIX = "dir:"
 _WS_PREFIX = "ws:"
 _INTERRUPT_PREFIX = "interrupt:"
+_SESSION_PREFIX = "sess:"
+_BACKGROUND_PREVIEW_CHARS = 280
+_DEFERRED_SUMMARY_CHARS = 120
+_DELETED_ID_MEMORY = 256
 
 _STARTUP_MAX_RETRIES = 5
 _STARTUP_BASE_DELAY = 2.0
@@ -153,6 +161,25 @@ def _truncate_callback_data(data: str) -> str:
 
 
 _T = TypeVar("_T")
+_R = TypeVar("_R")
+
+_sent_message_ids: ContextVar[list[str] | None] = ContextVar(
+    "leashd_telegram_sent_message_ids", default=None
+)
+
+
+def _record_sent(message_id: str | None) -> str | None:
+    """Note a message id against the prompt currently being rendered, if any.
+
+    Every prompt type opens its messages through the same two senders, so one
+    hook here is what lets a prompt of any shape — a plan review's body pages
+    included — be taken back down as a unit.
+    """
+    if message_id is not None:
+        sink = _sent_message_ids.get()
+        if sink is not None:
+            sink.append(message_id)
+    return message_id
 
 
 async def _retry_on_network_error(
@@ -255,6 +282,56 @@ async def _send_rendered(
         )
 
 
+def _summarize_prompt(text: str) -> str:
+    body = " ".join(text.split())
+    if len(body) <= _DEFERRED_SUMMARY_CHARS:
+        return body
+    return body[:_DEFERRED_SUMMARY_CHARS].rstrip() + "…"
+
+
+_APPROVE_ALL_LABEL_CHARS = 44
+
+
+def _approve_all_scope(tool_name: str) -> str:
+    """What the "Approve all" button on this prompt actually grants."""
+    scope = tool_name.split("::", 1)[1] if tool_name.startswith("Bash::") else tool_name
+    body = " ".join(scope.split())
+    if len(body) <= _APPROVE_ALL_LABEL_CHARS:
+        return body
+    return body[: _APPROVE_ALL_LABEL_CHARS - 1].rstrip() + "…"
+
+
+def _approve_all_label(tool_name: str) -> str:
+    if not tool_name:
+        return "Approve all in session"
+    if tool_name.startswith("Bash::"):
+        return f"Approve all '{_approve_all_scope(tool_name)}' cmds"
+    return f"Approve all {_approve_all_scope(tool_name)}"
+
+
+@dataclass
+class _Prompt:
+    """A question, approval, plan review or interrupt awaiting a human answer.
+
+    Held back rather than written into the chat whenever the conversation that
+    raised it is not the one on screen: a prompt pasted under someone else's
+    conversation reads as belonging to it, and by the time they switch to the
+    one that asked it has scrolled out of reach. The chat gets a notice naming
+    the slot instead, and ``render`` runs when that conversation comes back.
+
+    ``message_ids`` is filled while it is on screen so the same prompt can be
+    taken back down — unanswered — if the chat moves off it again. ``reissued``
+    marks one that has been through that cycle: whoever raised it remembers the
+    message id it first had, so the connector owns cleaning up the replacement.
+    """
+
+    prompt_id: str
+    summary: str
+    render: Callable[[], Awaitable[object]]
+    message_ids: list[str] = field(default_factory=list)
+    reissued: bool = False
+
+
 class TelegramConnector(BaseConnector):
     def __init__(self, bot_token: str, api_base_url: str | None = None) -> None:
         super().__init__()
@@ -267,7 +344,241 @@ class TelegramConnector(BaseConnector):
         self._activity_locks: dict[str, asyncio.Lock] = {}
         self._plan_message_ids: dict[str, list[str]] = {}
         self._question_message_ids: dict[str, str] = {}
-        self._approval_tool_names: dict[str, str] = {}  # approval_id -> tool_name
+        self._approval_tool_names: dict[str, str] = {}
+        self._prompt_chats: dict[str, str] = {}
+        self._router = ChatSessionRouter()
+        self._deferred: dict[str, list[_Prompt]] = {}
+        self._onscreen: dict[str, list[_Prompt]] = {}
+        self._deferred_notices: dict[str, str] = {}
+        self._deleted_messages: list[tuple[str, str]] = []
+
+    def _target(self, chat_id: str) -> int:
+        """The real Telegram chat behind a (possibly slotted) conversation id."""
+        return int(self._router.target(chat_id))
+
+    def _foreground(self, chat_id: str) -> bool:
+        return self._router.is_foreground(chat_id)
+
+    async def _raise_prompt(
+        self,
+        chat_id: str,
+        prompt_id: str,
+        summary: str,
+        render: Callable[[], Awaitable[_R]],
+    ) -> _R | None:
+        """Show a prompt, or hold it back while its conversation is off screen.
+
+        The two halves of one rule: a prompt belongs to the conversation that
+        raised it and is only ever readable there. Off screen it becomes a
+        notice naming the slot; on screen it renders, and stays tracked so
+        leaving takes it back down again.
+        """
+        if not self._foreground(chat_id):
+            await self._defer_prompt(chat_id, prompt_id, summary, render)
+            return None
+        prompt = _Prompt(prompt_id, summary, render)
+        result = await self._present(prompt, chat_id)
+        return cast("_R | None", result)
+
+    async def _defer_prompt(
+        self,
+        chat_id: str,
+        prompt_id: str,
+        summary: str,
+        render: Callable[[], Awaitable[object]],
+    ) -> None:
+        await self._hold(_Prompt(prompt_id, summary, render), chat_id, front=False)
+
+    async def _hold(self, prompt: _Prompt, chat_id: str, *, front: bool) -> None:
+        prompt.message_ids = []
+        queue = [
+            p
+            for p in self._deferred.get(chat_id, [])
+            if p.prompt_id != prompt.prompt_id
+        ]
+        if front:
+            queue.insert(0, prompt)
+        else:
+            queue.append(prompt)
+        self._deferred[chat_id] = queue
+        logger.info(
+            "telegram_prompt_deferred",
+            chat_id=chat_id,
+            prompt_id=prompt.prompt_id,
+            pending=len(queue),
+        )
+        await self._refresh_deferred_notice(chat_id)
+
+    async def _present(self, prompt: _Prompt, chat_id: str) -> Any:
+        """Render a prompt into the chat, recording the messages it opened."""
+        sent: list[str] = []
+        token = _sent_message_ids.set(sent)
+        try:
+            result = await prompt.render()
+        finally:
+            _sent_message_ids.reset(token)
+        prompt.message_ids = sent
+        tracked = [
+            p
+            for p in self._onscreen.get(chat_id, [])
+            if p.prompt_id != prompt.prompt_id
+        ]
+        tracked.append(prompt)
+        self._onscreen[chat_id] = tracked
+        return result
+
+    async def _withdraw_onscreen(self, chat_id: str) -> None:
+        """Take an unanswered prompt back down when the chat moves off it.
+
+        A prompt the user saw before switching away is no less misplaced than
+        one raised after: left in the chat it sits under whichever conversation
+        is on screen now, answerable there, in a stream it does not belong to.
+        It goes back to being a notice and returns intact when they do.
+        """
+        prompts = self._onscreen.pop(chat_id, [])
+        if not prompts:
+            return
+        for prompt in prompts:
+            for message_id in prompt.message_ids:
+                await self._try_delete_message(chat_id, message_id)
+        for prompt in reversed(prompts):
+            prompt.reissued = True
+            await self._hold(prompt, chat_id, front=True)
+        logger.info(
+            "telegram_prompts_withdrawn", chat_id=chat_id, prompt_count=len(prompts)
+        )
+
+    def discard_prompt(self, prompt_id: str) -> None:
+        """Drop a prompt that was answered or expired, held or on screen."""
+        for chat_id, tracked in list(self._onscreen.items()):
+            remaining = [p for p in tracked if p.prompt_id != prompt_id]
+            for settled in tracked:
+                if settled.prompt_id == prompt_id and settled.reissued:
+                    for message_id in settled.message_ids:
+                        self.schedule_message_cleanup(chat_id, message_id)
+            if remaining:
+                self._onscreen[chat_id] = remaining
+            else:
+                self._onscreen.pop(chat_id, None)
+        for chat_id, queue in list(self._deferred.items()):
+            remaining = [p for p in queue if p.prompt_id != prompt_id]
+            if len(remaining) == len(queue):
+                continue
+            if remaining:
+                self._deferred[chat_id] = remaining
+            else:
+                self._deferred.pop(chat_id, None)
+            self._schedule(self._refresh_deferred_notice(chat_id))
+
+    def _schedule(self, coro: Coroutine[Any, Any, None]) -> None:
+        try:
+            task = asyncio.create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return
+        self._cleanup_tasks.add(task)
+        task.add_done_callback(self._cleanup_tasks.discard)
+
+    def _deferred_notice_text(self, chat_id: str) -> str:
+        queue = self._deferred.get(chat_id, [])
+        slot = index_of(chat_id)
+        head = f"🔔 #{slot} is waiting on you"
+        lines = [f"• {p.summary}" for p in queue[:3]]
+        if len(queue) > 3:
+            lines.append(f"• …and {len(queue) - 3} more")
+        return "\n".join([head, "", *lines])
+
+    async def _refresh_deferred_notice(self, chat_id: str) -> None:
+        """Keep one notice per background conversation, never a prompt per call.
+
+        A blocked agent can raise several prompts before anyone looks at it, and
+        one chat message each would bury the conversation actually on screen.
+        """
+        if self._app is None:
+            return
+        queue = self._deferred.get(chat_id)
+        existing = self._deferred_notices.get(chat_id)
+        if not queue:
+            if existing:
+                self._deferred_notices.pop(chat_id, None)
+                await self._try_delete_message(chat_id, existing)
+            return
+        slot = index_of(chat_id)
+        text = self._deferred_notice_text(chat_id)
+        chunk = render_one(text, _MAX_MESSAGE_LENGTH)
+        markup = _to_telegram_markup(
+            [
+                [
+                    InlineButton(
+                        text=f"Open #{slot}",
+                        callback_data=f"{_SESSION_PREFIX}sw:{slot}",
+                    )
+                ]
+            ]
+        )
+        if existing and await self._try_edit_chunk(chat_id, existing, chunk, markup):
+            return
+        bot = self._app.bot
+        try:
+            msg = await _send_rendered(
+                lambda body, mode: bot.send_message(
+                    chat_id=self._target(chat_id),
+                    text=body,
+                    reply_markup=markup,
+                    parse_mode=mode,
+                ),
+                chunk,
+                operation="send_deferred_notice",
+            )
+            self._deferred_notices[chat_id] = str(msg.message_id)
+        except Exception:
+            logger.exception("telegram_deferred_notice_failed", chat_id=chat_id)
+
+    async def _flush_deferred(self, chat_id: str) -> None:
+        """Render everything this conversation was holding, now that it shows."""
+        queue = self._deferred.pop(chat_id, None)
+        notice = self._deferred_notices.pop(chat_id, None)
+        if notice:
+            await self._try_delete_message(chat_id, notice)
+        if not queue:
+            return
+        logger.info(
+            "telegram_deferred_flushed", chat_id=chat_id, prompt_count=len(queue)
+        )
+        for prompt in queue:
+            try:
+                await self._present(prompt, chat_id)
+            except Exception:
+                logger.exception(
+                    "telegram_deferred_render_failed",
+                    chat_id=chat_id,
+                    prompt_id=prompt.prompt_id,
+                )
+
+    def _prompt_chat(self, prompt_id: str, fallback: str) -> str:
+        """The conversation a pending prompt was raised for.
+
+        A prompt can be answered from a chat now showing a different
+        conversation, so its own per-chat bookkeeping (plan message ids,
+        auto-approve scope) must be keyed on the conversation that raised it,
+        never on whatever is on screen when the button is tapped.
+        """
+        return self._prompt_chats.get(prompt_id, fallback)
+
+    def supports_chat_sessions(self, chat_id: str) -> bool:  # noqa: ARG002
+        return True
+
+    def chat_session_visible(self, chat_id: str) -> bool:
+        return self._foreground(chat_id)
+
+    async def activate_chat_session(self, chat_id: str) -> None:
+        leaving = self._router.foreground(chat_id)
+        self._router.activate(chat_id)
+        if leaving != chat_id:
+            await self._withdraw_onscreen(leaving)
+
+    async def flush_chat_session_prompts(self, chat_id: str) -> None:
+        await self._flush_deferred(chat_id)
 
     async def start(self) -> None:
         builder = Application.builder().token(self._token).concurrent_updates(True)
@@ -298,6 +609,8 @@ class TelegramConnector(BaseConnector):
                     "web",
                     "goal",
                     "file",
+                    "session",
+                    "sessions",
                 ],
                 self._on_command,
             )
@@ -348,6 +661,9 @@ class TelegramConnector(BaseConnector):
     ) -> None:
         if self._app is None:
             return
+        if not self._foreground(chat_id):
+            await self._send_background_notice(chat_id, text)
+            return
         chunks = render_chunks(text, _MAX_MESSAGE_LENGTH)
         markup = _to_telegram_markup(buttons) if buttons else None
         bot = self._app.bot
@@ -357,7 +673,7 @@ class TelegramConnector(BaseConnector):
                 rm = markup if is_last else None
                 await _send_rendered(
                     lambda body, mode, _rm=rm: bot.send_message(  # type: ignore[misc]
-                        chat_id=int(chat_id),
+                        chat_id=self._target(chat_id),
                         text=body,
                         reply_markup=_rm,
                         parse_mode=mode,
@@ -374,7 +690,62 @@ class TelegramConnector(BaseConnector):
         except Exception:
             logger.exception("telegram_send_message_failed", chat_id=chat_id)
 
+    async def _send_background_notice(self, chat_id: str, text: str) -> None:
+        """Announce a background conversation's output without pasting it in.
+
+        A backgrounded agent keeps working and keeps talking; letting it write
+        into the chat would interleave it with the conversation on screen. The
+        notice names the slot and shows enough to judge whether to switch, and
+        the full text is what switching to that slot replays.
+        """
+        body = " ".join(text.split())
+        preview = (
+            body
+            if len(body) <= _BACKGROUND_PREVIEW_CHARS
+            else body[:_BACKGROUND_PREVIEW_CHARS].rstrip() + "…"
+        )
+        slot = index_of(chat_id)
+        label = f"#{slot}"
+        chunk = Chunk(
+            f"🔔 {label} replied\n\n{preview}",
+            f"🔔 {escape(label)} replied\n\n{quote_block(preview)}",
+        )
+        markup = _to_telegram_markup(
+            [
+                [
+                    InlineButton(
+                        text=f"Open #{slot}",
+                        callback_data=f"{_SESSION_PREFIX}sw:{slot}",
+                    )
+                ]
+            ]
+        )
+        if self._app is None:
+            return
+        bot = self._app.bot
+        try:
+            await _send_rendered(
+                lambda body_text, mode: bot.send_message(
+                    chat_id=self._target(chat_id),
+                    text=body_text,
+                    reply_markup=markup,
+                    parse_mode=mode,
+                ),
+                chunk,
+                operation="send_background_notice",
+            )
+            logger.info(
+                "telegram_background_notice_sent",
+                chat_id=chat_id,
+                slot=slot,
+                text_length=len(text),
+            )
+        except Exception:
+            logger.exception("telegram_background_notice_failed", chat_id=chat_id)
+
     async def send_message_with_id(self, chat_id: str, text: str) -> str | None:
+        if not self._foreground(chat_id):
+            return None
         return await self._send_chunk_with_id(
             chat_id, render_one(text, _MAX_MESSAGE_LENGTH)
         )
@@ -386,24 +757,24 @@ class TelegramConnector(BaseConnector):
         try:
             msg = await _send_rendered(
                 lambda body, mode: bot.send_message(
-                    chat_id=int(chat_id), text=body, parse_mode=mode
+                    chat_id=self._target(chat_id), text=body, parse_mode=mode
                 ),
                 chunk,
                 operation="send_message_with_id",
             )
-            return str(msg.message_id)
+            return _record_sent(str(msg.message_id))
         except Exception:
             logger.exception("telegram_send_message_with_id_failed", chat_id=chat_id)
             return None
 
     async def edit_message(self, chat_id: str, message_id: str, text: str) -> None:
-        if self._app is None:
+        if self._app is None or not self._foreground(chat_id):
             return
         bot = self._app.bot
         try:
             await _send_rendered(
                 lambda body, mode: bot.edit_message_text(
-                    chat_id=int(chat_id),
+                    chat_id=self._target(chat_id),
                     message_id=int(message_id),
                     text=body,
                     parse_mode=mode,
@@ -415,15 +786,31 @@ class TelegramConnector(BaseConnector):
             logger.debug("telegram_edit_message_failed", chat_id=chat_id)
 
     async def delete_message(self, chat_id: str, message_id: str) -> None:
-        if self._app is None:
+        if self._app is None or not self._claim_deletion(chat_id, message_id):
             return
         try:
             await self._app.bot.delete_message(
-                chat_id=int(chat_id),
+                chat_id=self._target(chat_id),
                 message_id=int(message_id),
             )
         except Exception:
             logger.debug("telegram_delete_message_failed", chat_id=chat_id)
+
+    def _claim_deletion(self, chat_id: str, message_id: str) -> bool:
+        """Whether this caller is the one that gets to delete that message.
+
+        A message can be reached by two owners at once — a deferred prompt's
+        notice is retired by the flush and again by the tap that triggered it —
+        and Telegram answers the loser with a 400. Keyed by chat as well as id
+        because message ids are only unique within a chat.
+        """
+        key = (self._router.target(chat_id), message_id)
+        if key in self._deleted_messages:
+            return False
+        self._deleted_messages.append(key)
+        if len(self._deleted_messages) > _DELETED_ID_MEMORY:
+            del self._deleted_messages[:-_DELETED_ID_MEMORY]
+        return True
 
     async def _send_message_with_id_and_buttons(
         self,
@@ -431,8 +818,16 @@ class TelegramConnector(BaseConnector):
         text: str,
         buttons: list[list[InlineButton]],
     ) -> str | None:
+        """Send a prompt the human has to answer.
+
+        Reached only for the conversation on screen — a background one is held
+        by ``_defer_prompt`` and replayed through here when it comes back — so
+        the prompt always renders under the conversation that raised it.
+        """
         return await self._send_chunk_with_buttons(
-            chat_id, render_one(text, _MAX_MESSAGE_LENGTH), buttons
+            chat_id,
+            render_one(text, _MAX_MESSAGE_LENGTH),
+            buttons,
         )
 
     async def _send_chunk_with_buttons(
@@ -448,7 +843,7 @@ class TelegramConnector(BaseConnector):
         try:
             msg = await _send_rendered(
                 lambda body, mode: bot.send_message(
-                    chat_id=int(chat_id),
+                    chat_id=self._target(chat_id),
                     text=body,
                     reply_markup=markup,
                     parse_mode=mode,
@@ -456,7 +851,7 @@ class TelegramConnector(BaseConnector):
                 chunk,
                 operation="send_message_with_buttons",
             )
-            return str(msg.message_id)
+            return _record_sent(str(msg.message_id))
         except Exception:
             logger.exception(
                 "telegram_send_message_with_buttons_failed", chat_id=chat_id
@@ -478,7 +873,7 @@ class TelegramConnector(BaseConnector):
         *,
         agent_name: str = "",  # noqa: ARG002
     ) -> str | None:
-        if self._app is None:
+        if self._app is None or not self._foreground(chat_id):
             return None
         emoji, verb = _activity_label(tool_name, description)
         chunk = _activity_chunk(emoji, verb, description)
@@ -503,13 +898,13 @@ class TelegramConnector(BaseConnector):
 
     async def _try_delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a message with retry on transient errors. Returns True on success."""
-        if self._app is None:
+        if self._app is None or not self._claim_deletion(chat_id, message_id):
             return False
         app = self._app
         try:
             await _retry_on_network_error(
                 lambda: app.bot.delete_message(
-                    chat_id=int(chat_id), message_id=int(message_id)
+                    chat_id=self._target(chat_id), message_id=int(message_id)
                 ),
                 max_retries=_SEND_MAX_RETRIES,
                 base_delay=_SEND_BASE_DELAY,
@@ -532,7 +927,11 @@ class TelegramConnector(BaseConnector):
         )
 
     async def _try_edit_chunk(
-        self, chat_id: str, message_id: str, chunk: Chunk
+        self,
+        chat_id: str,
+        message_id: str,
+        chunk: Chunk,
+        markup: InlineKeyboardMarkup | None = None,
     ) -> bool:
         if self._app is None:
             return False
@@ -540,9 +939,10 @@ class TelegramConnector(BaseConnector):
         try:
             await _send_rendered(
                 lambda body, mode: app.bot.edit_message_text(
-                    chat_id=int(chat_id),
+                    chat_id=self._target(chat_id),
                     message_id=int(message_id),
                     text=body,
+                    reply_markup=markup,
                     parse_mode=mode,
                 ),
                 chunk,
@@ -613,6 +1013,21 @@ class TelegramConnector(BaseConnector):
         interrupt_id: str,
         message_preview: str,
     ) -> str | None:
+        return await self._raise_prompt(
+            chat_id,
+            interrupt_id,
+            _summarize_prompt("Interrupt the current task with a new message?"),
+            lambda: self._render_interrupt_prompt(
+                chat_id, interrupt_id, message_preview
+            ),
+        )
+
+    async def _render_interrupt_prompt(
+        self,
+        chat_id: str,
+        interrupt_id: str,
+        message_preview: str,
+    ) -> str | None:
         preview = (
             message_preview[:200] if len(message_preview) > 200 else message_preview
         )
@@ -654,11 +1069,13 @@ class TelegramConnector(BaseConnector):
         task.add_done_callback(self._cleanup_tasks.discard)
 
     async def send_typing_indicator(self, chat_id: str) -> None:
+        if not self._foreground(chat_id):
+            return
         if self._app is None:
             return
         try:
             await self._app.bot.send_chat_action(
-                chat_id=int(chat_id), action=ChatAction.TYPING
+                chat_id=self._target(chat_id), action=ChatAction.TYPING
             )
         except Exception:
             logger.exception("telegram_typing_indicator_failed", chat_id=chat_id)
@@ -666,15 +1083,19 @@ class TelegramConnector(BaseConnector):
     async def request_approval(
         self, chat_id: str, approval_id: str, description: str, tool_name: str = ""
     ) -> str | None:
-        if tool_name.startswith("Bash::"):
-            cmd = tool_name.split("::", 1)[1]
-            approve_all_text = f"Approve all '{cmd}' cmds"
-        elif tool_name:
-            approve_all_text = f"Approve all {tool_name}"
-        else:
-            approve_all_text = "Approve all in session"
-
         self._approval_tool_names[approval_id] = tool_name
+        self._prompt_chats[approval_id] = chat_id
+        return await self._raise_prompt(
+            chat_id,
+            approval_id,
+            _summarize_prompt(f"Approve {tool_name or 'a tool call'}"),
+            lambda: self._render_approval(chat_id, approval_id, description, tool_name),
+        )
+
+    async def _render_approval(
+        self, chat_id: str, approval_id: str, description: str, tool_name: str
+    ) -> str | None:
+        approve_all_text = _approve_all_label(tool_name)
 
         buttons = [
             [
@@ -751,7 +1172,7 @@ class TelegramConnector(BaseConnector):
             try:
                 await _retry_on_network_error(
                     lambda: bot.send_photo(
-                        chat_id=int(chat_id),
+                        chat_id=self._target(chat_id),
                         photo=data,
                         filename=path.name,
                         caption=text,
@@ -786,7 +1207,7 @@ class TelegramConnector(BaseConnector):
         try:
             await _retry_on_network_error(
                 lambda: bot.send_document(
-                    chat_id=int(chat_id),
+                    chat_id=self._target(chat_id),
                     document=data,
                     filename=path.name,
                     caption=text,
@@ -850,6 +1271,24 @@ class TelegramConnector(BaseConnector):
         header: str,
         options: list[dict[str, str]],
     ) -> None:
+        self._prompt_chats[interaction_id] = chat_id
+        await self._raise_prompt(
+            chat_id,
+            interaction_id,
+            _summarize_prompt(f"Question: {header or question_text}"),
+            lambda: self._render_question(
+                chat_id, interaction_id, question_text, header, options
+            ),
+        )
+
+    async def _render_question(
+        self,
+        chat_id: str,
+        interaction_id: str,
+        question_text: str,
+        header: str,
+        options: list[dict[str, str]],
+    ) -> None:
         text = f"**{header}**\n{question_text}" if header else question_text
         rows = []
         for idx, opt in enumerate(options):
@@ -881,6 +1320,20 @@ class TelegramConnector(BaseConnector):
         )
 
     async def send_plan_review(
+        self,
+        chat_id: str,
+        interaction_id: str,
+        description: str,
+    ) -> None:
+        self._prompt_chats[interaction_id] = chat_id
+        await self._raise_prompt(
+            chat_id,
+            interaction_id,
+            _summarize_prompt("Plan review — proceed with implementation?"),
+            lambda: self._render_plan_review(chat_id, interaction_id, description),
+        )
+
+    async def _render_plan_review(
         self,
         chat_id: str,
         interaction_id: str,
@@ -954,7 +1407,7 @@ class TelegramConnector(BaseConnector):
             return
 
         user_id = str(update.message.from_user.id)
-        chat_id = str(update.message.chat_id)
+        chat_id = self._router.inbound(str(update.message.chat_id))
         raw = update.message.text or ""
         tokens = raw.split()
         first_token = tokens[0] if tokens else ""
@@ -980,7 +1433,7 @@ class TelegramConnector(BaseConnector):
 
         user_id = str(update.message.from_user.id)
         text = update.message.text
-        chat_id = str(update.message.chat_id)
+        chat_id = self._router.inbound(str(update.message.chat_id))
         message_id = str(update.message.message_id)
 
         logger.info(
@@ -1010,7 +1463,7 @@ class TelegramConnector(BaseConnector):
             return
 
         user_id = str(update.message.from_user.id)
-        chat_id = str(update.message.chat_id)
+        chat_id = self._router.inbound(str(update.message.chat_id))
         caption = update.message.caption or ""
 
         photo = update.message.photo[-1]
@@ -1058,7 +1511,7 @@ class TelegramConnector(BaseConnector):
             return
 
         user_id = str(update.message.from_user.id)
-        chat_id = str(update.message.chat_id)
+        chat_id = self._router.inbound(str(update.message.chat_id))
         caption = update.message.caption or ""
         mime_type = doc.mime_type or ""
 
@@ -1178,6 +1631,10 @@ class TelegramConnector(BaseConnector):
             await self._handle_ws_callback(query, data)
             return
 
+        if data.startswith(_SESSION_PREFIX):
+            await self._handle_session_callback(query, data)
+            return
+
         if data.startswith(_INTERACTION_PREFIX):
             await self._handle_interaction_callback(query, data)
             return
@@ -1247,16 +1704,20 @@ class TelegramConnector(BaseConnector):
             return
 
         if resolved and decision == "all" and self._auto_approve_handler:
-            chat_id = str(query.message.chat_id)
-            self._auto_approve_handler(chat_id, tool_name)
+            self._auto_approve_handler(
+                self._prompt_chat(approval_id, str(query.message.chat_id)), tool_name
+            )
 
         if resolved:
             if decision == "all":
                 if tool_name.startswith("Bash::"):
-                    cmd = tool_name.split("::", 1)[1]
-                    status = f"Approved \u2713 (all future '{cmd}' cmds auto-approved)"
+                    scope = _approve_all_scope(tool_name)
+                    status = (
+                        f"Approved \u2713 (all future '{scope}' cmds auto-approved)"
+                    )
                 elif tool_name:
-                    status = f"Approved \u2713 (all future {tool_name} auto-approved)"
+                    scope = _approve_all_scope(tool_name)
+                    status = f"Approved \u2713 (all future {scope} auto-approved)"
                 else:
                     status = "Approved \u2713 (all future tools auto-approved)"
             elif approved:
@@ -1266,6 +1727,8 @@ class TelegramConnector(BaseConnector):
         else:
             status = "Expired (approval no longer active)"
 
+        self._prompt_chats.pop(approval_id, None)
+        self.discard_prompt(approval_id)
         try:
             await self._append_status(query, status)
             chat_id = str(query.message.chat_id)
@@ -1304,7 +1767,9 @@ class TelegramConnector(BaseConnector):
         if not isinstance(query.message, Message):
             return
 
-        chat_id = str(query.message.chat_id)
+        chat_id = self._prompt_chat(interaction_id, str(query.message.chat_id))
+        self._prompt_chats.pop(interaction_id, None)
+        self.discard_prompt(interaction_id)
 
         if not resolved:
             try:
@@ -1396,7 +1861,9 @@ class TelegramConnector(BaseConnector):
 
         user_id = str(query.from_user.id) if query.from_user else ""
         chat_id = (
-            str(query.message.chat_id) if isinstance(query.message, Message) else ""
+            self._router.inbound(str(query.message.chat_id))
+            if isinstance(query.message, Message)
+            else ""
         )
 
         if not user_id or not chat_id:
@@ -1419,7 +1886,9 @@ class TelegramConnector(BaseConnector):
 
         user_id = str(query.from_user.id) if query.from_user else ""
         chat_id = (
-            str(query.message.chat_id) if isinstance(query.message, Message) else ""
+            self._router.inbound(str(query.message.chat_id))
+            if isinstance(query.message, Message)
+            else ""
         )
 
         if not user_id or not chat_id:
@@ -1440,7 +1909,9 @@ class TelegramConnector(BaseConnector):
 
         user_id = str(query.from_user.id) if query.from_user else ""
         chat_id = (
-            str(query.message.chat_id) if isinstance(query.message, Message) else ""
+            self._router.inbound(str(query.message.chat_id))
+            if isinstance(query.message, Message)
+            else ""
         )
 
         if not user_id or not chat_id:
@@ -1454,6 +1925,47 @@ class TelegramConnector(BaseConnector):
                 await query.edit_message_text(result)
         except Exception:
             logger.exception("telegram_ws_callback_error", chat_id=chat_id)
+
+    async def _handle_session_callback(self, query: CallbackQuery, data: str) -> None:
+        """Route conversation-picker taps to ``/session``.
+
+        The tapped message is retired on success because every action rewrites
+        what it showed — a switch moves the ▸ marker, a new slot adds a row, a
+        terminate removes one — and the command emits the replacement itself.
+        """
+        action = data[len(_SESSION_PREFIX) :]
+        if not action or not self._command_handler:
+            return
+        if not isinstance(query.message, Message):
+            return
+
+        user_id = str(query.from_user.id) if query.from_user else ""
+        telegram_chat_id = str(query.message.chat_id)
+        chat_id = self._router.inbound(telegram_chat_id)
+        if not user_id:
+            return
+
+        verb, _, slot = action.partition(":")
+        args = {
+            "sw": f"switch {slot}",
+            "new": "new",
+            "k": f"confirm-kill {slot}",
+            "kk": f"kill {slot}",
+            "list": "",
+        }.get(verb)
+        if args is None:
+            return
+
+        try:
+            result = await self._command_handler(user_id, "session", args, chat_id, [])
+            if result:
+                await query.edit_message_text(result)
+            else:
+                await self.delete_message(
+                    telegram_chat_id, str(query.message.message_id)
+                )
+        except Exception:
+            logger.exception("telegram_session_callback_error", chat_id=chat_id)
 
     async def _on_error(
         self, update: object, context: ContextTypes.DEFAULT_TYPE

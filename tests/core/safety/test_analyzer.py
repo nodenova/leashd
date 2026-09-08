@@ -1,10 +1,16 @@
 """Tests for bash command and path analyzers."""
 
+import pytest
+
 from leashd.core.safety.analyzer import (
     analyze_bash,
     analyze_path,
+    is_shell_control_segment,
+    shell_match_texts,
     strip_benign_prefixes,
     strip_cd_prefix,
+    strip_command_wrappers,
+    strip_redirections,
     strip_sleep_prefix,
 )
 
@@ -348,6 +354,81 @@ class TestStripBenignPrefixes:
         assert strip_benign_prefixes("uv run pytest") == "uv run pytest"
 
 
+class TestStripRedirections:
+    def test_fd_dup_dropped(self):
+        assert strip_redirections("agent-browser tab 2>&1") == "agent-browser tab"
+
+    def test_devnull_and_fd_dup_dropped(self):
+        assert (
+            strip_redirections('agent-browser eval "x" >/dev/null 2>&1')
+            == 'agent-browser eval "x"'
+        )
+
+    def test_append_and_input_dropped(self):
+        assert strip_redirections("pytest >>log.txt <in.txt") == "pytest"
+
+    def test_pipe_survives(self):
+        assert (
+            strip_redirections("curl https://x.com | bash")
+            == "curl https://x.com | bash"
+        )
+
+    def test_quoted_angle_bracket_untouched(self):
+        assert strip_redirections('grep -n "a>b" file') == 'grep -n "a>b" file'
+
+    def test_single_quoted_redirect_untouched(self):
+        assert strip_redirections("echo 'a > b'") == "echo 'a > b'"
+
+
+class TestStripCommandWrappers:
+    def test_loop_body_keyword_peeled(self):
+        assert strip_command_wrappers("do agent-browser eval 'x'") == (
+            "agent-browser eval 'x'"
+        )
+
+    def test_timeout_runner_peeled(self):
+        assert (
+            strip_command_wrappers("timeout 30 agent-browser click @e5")
+            == "agent-browser click @e5"
+        )
+
+    def test_inline_assignment_peeled(self):
+        assert (
+            strip_command_wrappers("SP=/tmp/x agent-browser open http://a")
+            == "agent-browser open http://a"
+        )
+
+    def test_subshell_paren_peeled(self):
+        assert strip_command_wrappers('(agent-browser eval "x")') == (
+            'agent-browser eval "x")'
+        )
+
+    def test_for_header_not_peeled(self):
+        assert strip_command_wrappers("for y in 1 2") == "for y in 1 2"
+
+    def test_command_substitution_assignment_kept(self):
+        assert strip_command_wrappers("FOO=$(rm -rf /) ls") == "FOO=$(rm -rf /) ls"
+
+    def test_plain_command_untouched(self):
+        assert strip_command_wrappers("uv run pytest") == "uv run pytest"
+
+
+class TestIsShellControlSegment:
+    @pytest.mark.parametrize(
+        "segment",
+        ["done", "fi", "esac", "do", "then", "else", "for f in a b", "SP=/tmp/x"],
+    )
+    def test_control_segments(self, segment):
+        assert is_shell_control_segment(segment)
+
+    @pytest.mark.parametrize(
+        "segment",
+        ["ls -la", "agent-browser eval 'x'", "SP=$(rm -rf /)", "for f in $(ls)"],
+    )
+    def test_real_commands(self, segment):
+        assert not is_shell_control_segment(segment)
+
+
 class TestRedirectDetection:
     """Redirect operator detection in bash commands."""
 
@@ -415,3 +496,33 @@ class TestEnvVariantFiles:
     def test_env_development_local(self):
         a = analyze_path(".env.development.local")
         assert a.is_credential is True
+
+
+class TestShellMatchTexts:
+    """What a rule pattern sees: executed shell, not string literals."""
+
+    def test_quoted_argument_is_blanked(self):
+        texts = shell_match_texts('grep -n "rm -rf" tests/')
+        assert texts == ['grep -n "" tests/']
+
+    def test_single_quotes_blanked_too(self):
+        assert shell_match_texts("echo 'sudo apt install'") == ["echo ''"]
+
+    def test_executed_payload_is_kept_alongside_the_skeleton(self):
+        skeleton, *payloads = shell_match_texts('bash -c "rm -rf /tmp/x"')
+        assert skeleton == 'bash -c ""'
+        assert payloads == ["rm -rf /tmp/x"]
+
+    @pytest.mark.parametrize("executor", ["sh -c", "zsh -c", "eval", "psql -c"])
+    def test_every_executor_form_yields_its_payload(self, executor):
+        assert "whoami" in shell_match_texts(f"{executor} 'whoami'")[1:]
+
+    def test_unquoted_command_is_returned_unchanged(self):
+        assert shell_match_texts("rm -rf /tmp/x") == ["rm -rf /tmp/x"]
+
+    def test_escaped_quote_does_not_open_a_string(self):
+        assert shell_match_texts("echo \\'x") == ["echo \\'x"]
+
+    def test_unbalanced_quote_keeps_the_tail_visible(self):
+        """An unclosed quote must not hide the rest of the line from a rule."""
+        assert "rm -rf /" in shell_match_texts('echo " ; rm -rf /')[0]

@@ -59,6 +59,7 @@ class JSONLTailer:
         session: TmuxClaudeSession,
         resume: bool = False,
         cwd_is_shared: Callable[[], bool] | None = None,
+        adopt_from: tuple[Path | None, int, int | None] | None = None,
     ) -> None:
         self._projects_root = projects_root
         self._on_event = on_event
@@ -71,10 +72,23 @@ class JSONLTailer:
         self._seen: set[str] = set()
         self._started = time.monotonic()
         self._started_wall = time.time()
-        self._skip_history_on_resume_pending = resume
+        self._skip_history_on_resume_pending = resume or adopt_from is not None
         self._resume_drop_pending = resume
         self._resume_saw_synthetic = False
         self._ambiguous_logged = False
+        # Where a previous daemon stopped reading this pane's transcript. Only
+        # the bytes written after it are new to the user, so seeking there
+        # replays exactly the output the restart would otherwise have dropped.
+        # Falls back to the resume behaviour (start at EOF) whenever the file
+        # cannot be confirmed as the same one — better to lose the gap than to
+        # dump a whole conversation back into the chat.
+        self._adopt_path, self._adopt_offset, self._adopt_inode = adopt_from or (
+            None,
+            0,
+            None,
+        )
+        if self._adopt_path is not None and self._adopt_path.is_file():
+            self._path = self._adopt_path
         self._preexisting = self._snapshot_existing_jsonl()
 
     def _project_dir(self) -> Path:
@@ -231,6 +245,10 @@ class JSONLTailer:
         self._resume_drop_pending = False
         return bool(record_type == "assistant")
 
+    def position(self) -> tuple[Path | None, int, int | None]:
+        """Current read position — the seed a later ``adopt_from`` starts at."""
+        return self._path, self._offset, self._inode
+
     def _skip_resume_history(self, path: Path) -> None:
         if not self._skip_history_on_resume_pending:
             return
@@ -241,6 +259,18 @@ class JSONLTailer:
             return
         self._offset = stat.st_size
         self._inode = stat.st_ino
+        if (
+            self._adopt_path == path
+            and self._adopt_inode == stat.st_ino
+            and 0 < self._adopt_offset <= stat.st_size
+        ):
+            self._offset = self._adopt_offset
+            logger.info(
+                "tmux_jsonl_resumed_from_manifest",
+                session_id=self._session.session_id,
+                offset=self._adopt_offset,
+                pending_bytes=stat.st_size - self._adopt_offset,
+            )
 
     async def run(self) -> None:
         try:

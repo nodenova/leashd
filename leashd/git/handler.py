@@ -219,6 +219,10 @@ class GitCommandHandler:
         """Check if a chat has pending text input."""
         return chat_id in self._pending
 
+    def pending_input_chats(self) -> set[str]:
+        """Every conversation currently blocked on typed git input."""
+        return set(self._pending)
+
     async def resolve_input(self, chat_id: str, text: str) -> bool:
         """Resolve pending text input. Returns True if consumed."""
         pending = self._pending.get(chat_id)

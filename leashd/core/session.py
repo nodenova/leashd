@@ -17,6 +17,14 @@ logger = structlog.get_logger()
 
 # Intentionally mutable — SessionManager updates fields in-place for simplicity.
 class Session(BaseModel):
+    """One conversation's state.
+
+    ``is_foreground`` records whether this conversation owns its chat's single
+    message stream. Only meaningful where the connector shows one at a time
+    (Telegram); persisted so a daemon restart reattaches the chat where the
+    user left it instead of silently routing the next message into slot 1.
+    """
+
     session_id: str
     user_id: str
     chat_id: str
@@ -33,6 +41,7 @@ class Session(BaseModel):
     mode_instruction: str | None = None
     plan_origin: Literal["user", "auto", "task", "edit"] | None = None
     is_active: bool = True
+    is_foreground: bool = False
     workspace_name: str | None = None
     workspace_directories: list[str] = Field(default_factory=list)
     task_run_id: str | None = None
@@ -114,6 +123,14 @@ class SessionManager:
     def get(self, user_id: str, chat_id: str) -> Session | None:
         key = self._key(user_id, chat_id)
         return self._sessions.get(key)
+
+    def active_for_user(self, user_id: str) -> list[Session]:
+        """Every cached live session belonging to *user_id*."""
+        return [
+            session
+            for session in self._sessions.values()
+            if session.user_id == user_id and session.is_active
+        ]
 
     async def save(self, session: Session) -> None:
         """Persist current session state to the store (if configured)."""
@@ -254,6 +271,7 @@ class SessionManager:
         session = self._sessions.get(key)
         if session:
             session.is_active = False
+            session.is_foreground = False
         if self._store:
             await self._store.delete(user_id, chat_id)
         logger.info("session_deactivated", user_id=user_id, chat_id=chat_id)

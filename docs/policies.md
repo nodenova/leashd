@@ -106,7 +106,7 @@ leashd ships with three policy files in `policies/`:
 ```mermaid
 flowchart TB
     subgraph Default["default.yaml — Balanced"]
-        d_deny["DENY: credentials, force push, rm -rf, sudo, curl\|bash, DROP/TRUNCATE"]
+        d_deny["DENY: credentials, force push, sudo, curl\|bash, DROP/TRUNCATE"]
         d_allow["ALLOW: agent tools, reads, safe bash, plan files, browser readonly"]
         d_approval["APPROVAL: git mutations, file writes, network bash, browser mutations"]
         d_default["Default: require_approval"]
@@ -122,7 +122,7 @@ flowchart TB
     end
 
     subgraph Permissive["permissive.yaml — Trusted Environments"]
-        p_deny["DENY: credentials, force push, rm -rf, sudo, curl\|bash, DROP/TRUNCATE"]
+        p_deny["DENY: credentials, force push, sudo, curl\|bash, DROP/TRUNCATE"]
         p_allow["ALLOW: agent tools, all reads, all writes, safe bash + npm/pip/python, git add/commit/stash, all browser tools"]
         p_approval["APPROVAL: git mutations only"]
         p_default["Default: require_approval"]
@@ -141,7 +141,8 @@ flowchart TB
 | Git mutations | Approval | Approval | Approval |
 | Browser tools (readonly) | Allow | Approval | Allow |
 | Browser tools (mutation) | Approval | Approval | Allow |
-| rm -rf / sudo | Deny | Deny | Deny |
+| sudo / curl\|bash | Deny | Deny | Deny |
+| rm -rf | Approval | Approval | Deny |
 | Credential files | Deny | Deny | Deny |
 | Approval timeout | 300s | 120s | 600s |
 | Default action | require_approval | require_approval | require_approval |
@@ -212,7 +213,7 @@ The `PolicyEngine` loads rules from each file in order and concatenates them int
 
 ### Why Deny Rules Always Win
 
-Deny rules in `default.yaml` appear before any overlay rules. Because the engine uses first-match-wins evaluation, a command matching a deny pattern (like `rm -rf` or credential file access) is blocked before the overlay rules are ever reached. **Overlays cannot bypass deny rules.**
+Deny rules in `default.yaml` appear before its own allow rules, so a command matching a deny pattern (like `sudo` or credential file access) is blocked before those are reached. Evaluation is strictly first-match-wins in load order, overlays included — a file you list *ahead* of `default.yaml` is consulted first, which is what listing it first means.
 
 ```
 default.yaml deny rules  →  blocked here, overlay never checked

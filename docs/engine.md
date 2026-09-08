@@ -122,6 +122,7 @@ The engine handles twelve commands via `handle_command()`:
 | Command | Effect |
 |---|---|
 | `/dir` | Switch working directory with inline keyboard buttons |
+| `/session` | List, switch, open, and terminate the conversations sharing one chat |
 | `/plan [text]` | Sets `session.mode = "plan"`, disables auto-approve. With text, starts agent immediately. |
 | `/edit [text]` | Sets `session.mode = "edit"`, enables auto-approve for Write and Edit. With text, starts agent immediately. |
 | `/default` | Sets `session.mode = "default"`, disables auto-approve |

@@ -6,9 +6,9 @@ rules:
     tools: [Read, Write, Edit]
     path_patterns:
       - "\\.env$|\\.env\\."
-      - "\\.ssh/|\\.aws/"
-      - "\\.key$|\\.pem$"
-      - "id_rsa|credentials|secrets?"
+      - "\\.ssh/|\\.aws/|\\.gnupg/"
+      - "\\.key$|\\.pem$|\\.p12$|\\.pfx$|\\.keystore$"
+      - "id_rsa|id_ed25519|id_ecdsa|id_dsa|credentials|secrets?|token\\.json$"
     action: deny
     reason: "Credential/sensitive file access blocked"
 
@@ -21,13 +21,80 @@ rules:
   - name: destructive-bash
     tool: Bash
     command_patterns:
-      - "rm\\s.*-.*r.*f|rm\\s+-rf"
       - "\\bsudo\\b"
       - "\\b(curl|wget)\\b.*\\|.*\\b(bash|sh|zsh)\\b"
       - "\\bchmod\\s+777\\b"
       - "\\b(DROP|TRUNCATE)\\s+(TABLE|DATABASE)\\b"
     action: deny
     reason: "Destructive or dangerous command"
+
+  # Recursive delete asks rather than denies: in practice the target is the
+  # agent's own litter (build dirs, caches, logs), and a hard deny ended the
+  # whole job to protect a cache directory. An approval keeps a human in the
+  # loop without ending the work; nothing here runs unattended. `sudo`,
+  # pipe-to-shell, `chmod 777`, SQL `DROP` and force-push stay denied above.
+  - name: recursive-delete
+    tool: Bash
+    command_patterns:
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-\\S*[rR]\\S*[fF]"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-\\S*[fF]\\S*[rR]"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-[rR]\\s+(?:-\\S+\\s+)*-[fF]\\b"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-[fF]\\s+(?:-\\S+\\s+)*-[rR]\\b"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*--recursive\\b"
+    action: require_approval
+    reason: "Recursive delete — confirm the path before it runs"
+    risk_level: high
+
+  # `credential-files` above is scoped to Read/Write/Edit, so it never sees a
+  # shell command: `cat <repo>/.env` and `echo … >> ~/.ssh/authorized_keys` are
+  # otherwise cleared outright by `read-only-bash` below, and claude's native
+  # deny globs — the only thing that used to stop them — are anchored at `~/`
+  # and installed by the tmux runtime alone.
+  #
+  # One credential path per pattern, unanchored, so the tmux runtime mirrors
+  # each as a narrow `permissions.ask` glob (`Bash(*.ssh/*)`) instead of
+  # prompting on every `cat`. Patterns are matched against what the shell
+  # executes, quoting respected, so a path named inside a quoted remote payload
+  # (`ssh host 'ls ~/.ssh/'`) is not a local credential access and does not
+  # match.
+  - name: credential-bash
+    tool: Bash
+    command_patterns:
+      - "\\.env\\b(?!\\.(example|sample|template|dist))"
+      - "\\.ssh/"
+      - "\\.aws/"
+      - "\\.gnupg/"
+      - "authorized_keys"
+      - "\\.pem\\b"
+      - "\\.key\\b"
+      - "\\.p12\\b"
+      - "\\.pfx\\b"
+      - "\\.keystore\\b"
+      - "id_rsa"
+      - "id_ed25519"
+      - "id_ecdsa"
+      - "id_dsa"
+      - "\\.git-credentials\\b"
+      - "credentials\\b"
+      - "secret\\."
+      - "secrets\\."
+      - "token\\.json\\b"
+    action: require_approval
+    description: "Shell access to a credential path"
+    risk_level: critical
+
+  # Matched against the SQL an interpreter is handed, not the shell skeleton:
+  # `sqlite3 db "DROP TABLE users"` passes its statement positionally, which
+  # the floor read as an inert string while the identical `psql -c` form was
+  # denied. Anchored at the start of that payload, which no shell command can
+  # look like — nothing is named `INSERT INTO`.
+  - name: sql-write
+    tool: Bash
+    command_patterns:
+      - "(?i)^\\s*(INSERT\\s+(OR\\s+\\w+\\s+)?INTO|UPDATE\\s+\\S+\\s+SET|DELETE\\s+FROM|REPLACE\\s+INTO|ALTER\\s+(TABLE|DATABASE|INDEX|VIEW)|CREATE\\s+((UNIQUE|TEMP|TEMPORARY)\\s+)*(TABLE|INDEX|DATABASE|VIEW|TRIGGER)|ATTACH\\s|DETACH\\s|VACUUM\\b|REINDEX\\b|PRAGMA\\s+\\w+\\s*=)"
+    action: require_approval
+    description: "SQL statement that writes"
+    risk_level: high
 
   # Allow rules
   - name: agent-internal-tools
@@ -79,22 +146,70 @@ rules:
     action: require_approval
     description: "Privileged agent-browser operation (code install, listener, real-Chrome attach, third-party send)"
 
+  # Every pattern ends in the same tail: any argument text, then only pipes
+  # into a text filter. Reading a page is read-only; `… | curl -d @-` is an
+  # upload of whatever was read, and the rule matching first means nothing
+  # downstream of the pipe is ever examined.
   - name: agent-browser-readonly
     tool: Bash
     command_patterns:
-      - "^agent-browser\\s+(snapshot|screenshot|console|errors|get|is|wait|diff|highlight|react|skills|profiles)\\b"
-      - "^agent-browser\\s+(read|a11y|vitals)\\b(?!.*(https?://|\\bwww\\.))"
-      - "^agent-browser\\s+doctor\\b"
-      - "^agent-browser\\s+session\\b"
-      - "^agent-browser\\s+tab(\\s+list)?(\\s+--\\S+)*\\s*$"
+      - "^agent-browser\\s+(snapshot|screenshot|console|errors|get|is|wait|diff|highlight|react|skills|profiles)\\b[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
+      - "^agent-browser\\s+(read|a11y|vitals)\\b(?!.*(https?://|\\bwww\\.))[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
+      - "^agent-browser\\s+doctor\\b[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
+      - "^agent-browser\\s+session\\b[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
+      - "^agent-browser\\s+tab(\\s+list)?(\\s+--\\S+)*\\s*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
     action: allow
     description: "Read-only agent-browser observation"
+
+  # A dev server the agent just started is the most-approved thing in the
+  # audit: `curl http://127.0.0.1:8091/health` is a read, but it is also
+  # `curl`, so it took a tap every time.
+  #
+  # The lookaheads require, in order: no body/upload flag, no method but
+  # GET/HEAD, and no schemed URL in the segment whose host is not loopback —
+  # so `curl http://evil.com http://127.0.0.1/x` is not laundered and
+  # `127.0.0.1.evil.com` is not loopback. The loopback URL must then be the
+  # last token before an optional pipe into a text filter.
+  #
+  # The host must be visible in the shell skeleton, so a quoted URL is
+  # blanked and still asks — the safe direction.
+  - name: loopback-read
+    tool: Bash
+    command_patterns:
+      - "^(?:curl|wget)\\b(?![^|]*\\s-[a-zA-Z]*[dFT]\\b)(?![^|]*\\s--(?:data|form|upload-file|json|post-data|post-file)\\b)(?![^|]*\\s(?:-X|--request)\\s+(?!GET\\b|HEAD\\b))(?![^|]*\\shttps?://(?!(?:127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0|\\[::1\\])[:/\\s]))[^|]*\\s(?:https?://)?(?:127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0|\\[::1\\])(?::\\d+)?(?:/\\S*)?\\s*(?:\\|\\s*(?:jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr|sed|xargs)\\b[^|]*)*$"
+    action: allow
+    description: "Read-only request to a loopback address"
+
+  # `sql-write` is ordered ahead of this and takes the writing forms.
+  # `sqlite3 db < script.sql` carries no visible statement, so it matches
+  # nothing here and stays an ask.
+  - name: sql-read
+    tool: Bash
+    command_patterns:
+      - "(?i)^\\s*(SELECT\\b|WITH\\b|EXPLAIN\\b|\\.tables\\b|\\.schema\\b|\\.databases\\b|\\.dbinfo\\b|\\.indexes\\b)"
+    action: allow
+    description: "Read-only SQL query"
 
   - name: read-only-bash
     tool: Bash
     command_patterns:
       - "^(cd|ls|cat|head|tail|find|grep|wc|du|df|pwd|echo|date|whoami|which|type|file|stat)\\b"
       - "^git\\s+(-[a-zA-Z]\\s+\\S+\\s+|--[a-z-]+(=\\S+)?\\s+)*?(status|log|diff|show|branch|remote|tag)\\b"
+      # `tee` and `split` are absent because writing files is what they are for.
+      - "^(sort|uniq|cut|tr|column|nl|rev|tac|comm|join|paste|fold|expand|unexpand|fmt|shuf|jq|rg|ag|tree|printf|seq|true|false|test|sleep|yes)\\b"
+      # `base64` is absent: decode-to-shell smuggles an executable payload
+      # past a text allowlist.
+      - "^(basename|dirname|realpath|readlink|diff|cmp|md5|md5sum|shasum|sha1sum|sha256sum|sha512sum|cksum|od|xxd|hexdump|strings)\\b"
+      # `pkill`/`kill` are absent — they act. `env` reaches here only bare:
+      # `env FOO=1 <cmd>` is peeled to `<cmd>` before any rule sees it.
+      - "^(ps|pgrep|pstree|lsof|jobs|uptime|id|groups|hostname|uname|arch|sw_vers|locale|printenv|env)\\b"
+      # No `-i`/`--in-place` (edits the file) and no `-f`/`--file` (a program
+      # leashd cannot see). The program is a payload candidate, so a `w`/`e`
+      # command naming a credential path is taken by `credential-bash` above.
+      - "^sed\\b(?![^|]*\\s-[a-zA-Z]*[if]\\b)(?![^|]*\\s--(?:in-place|file)\\b)"
+      # `\\;` is refused: tmux uses it to chain a second command that the
+      # reporting verb in front would otherwise vouch for.
+      - "^tmux\\b(?![^|]*\\\\;)[^|]*\\s(list-sessions|list-panes|list-windows|list-clients|list-buffers|list-keys|list-commands|capture-pane|display-message|show-options|show-environment|has-session|info)\\b"
     action: allow
 
   - name: plan-file-writes

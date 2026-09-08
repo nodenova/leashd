@@ -172,7 +172,8 @@ The agent spawns `claude` with `--output-format stream-json --input-format strea
 
 ### When to Use
 
-- **`claude-cli`** (default) — lighter dependency footprint, no SDK required, direct CLI protocol
+- **`tmux`** (default) — a real interactive `claude` TUI in a tmux pane; native slash commands and CLI dialogs bridge through to chat
+- **`claude-cli`** — lighter dependency footprint, no SDK required, direct CLI protocol
 - **`claude-code`** — if you need SDK-specific features or prefer the SDK's session management
 
 ### Shared Helpers
@@ -216,10 +217,64 @@ Register the agent with the runtime registry in `agents/registry.py` via `regist
 ```bash
 leashd runtime show              # current runtime
 leashd runtime list              # available runtimes with stability
-leashd runtime set claude-cli    # switch to claude-cli (default)
+leashd runtime set tmux          # switch to tmux (default)
+leashd runtime set claude-cli    # switch to claude-cli (native subprocess)
 leashd runtime set claude-code   # switch to claude-code (SDK)
 leashd runtime set codex         # switch to codex
 ```
 
 The runtime is persisted in `~/.leashd/config.yaml`. The agent is created once at
 daemon startup, so a restart (`leashd restart`) is required after switching.
+
+## Restarting Without Losing Work
+
+On the `tmux` runtime a daemon restart used to end every live agent: panes were
+reaped at shutdown and swept again at startup. Since 1.6.0 they survive it.
+
+A pane runs on a tmux server of its own, on leashd's private socket, so the pane
+and the interactive `claude` in it never needed the daemon to stay alive. What
+did was leashd's half of the binding — the hook secret, the pane-identity token
+map, the Claude session uuid, the transcript read position and the safety
+context a `PreToolUse` hook resolves to all lived in `TmuxSessionManager`'s
+memory. Three pieces of state now cross the restart:
+
+| State | Where it lives |
+|---|---|
+| Hook secret | `~/.leashd/tmux/hook-secret`, minted once (`LEASHD_TMUX_HOOK_SECRET` still overrides) |
+| Per-pane identity, uuid, mode, transcript offset | `~/.leashd/tmux/<session_id>.pane.json` (`tmux_manifest.py`) |
+| The conversation itself | The session row in SQLite, as before |
+
+**Shutdown** (`TmuxSessionManager.shutdown_all(keep_panes=True)`) writes each
+manifest while the session is still live, then releases only what leashd owns:
+the awaited turn, the JSONL tailer, the dialog watcher, and any hook blocked on
+an approval — the last is answered `deny` with an explicit "the daemon
+restarted" reason so a pane cannot sit on its year-long hook timeout waiting for
+a process that has exited.
+
+**Startup** (`Engine.startup` → `TmuxSessionManager.adopt_orphan_panes`) walks
+every `leashd_` session on the socket and adopts the ones it can still *gate*.
+A pane is reaped exactly as before when it has no manifest, a dead pane, an age
+past `LEASHD_TMUX_ADOPT_MAX_AGE_HOURS`, or hook settings that no longer reach
+this daemon — `claude` reads `--settings` once at spawn, so a pane born under a
+different port or an older secret can never call back, and adopting it would
+look connected while nothing gated it.
+
+An adopted pane that was mid-turn keeps its turn open, and the engine
+re-attaches the chat's stream to it: the tailer resumes at the recorded byte
+offset, so the records written while the daemon was down are replayed into the
+chat and the answer lands as a normal reply. A transcript that was rotated or
+compacted in the meantime falls back to the end of the file — losing the gap
+beats replaying a whole conversation into the chat.
+
+Adoption runs after `bind_safety` and before the hook receiver opens, so a
+surviving pane's first hook is never seen as an unroutable orphan.
+
+```bash
+LEASHD_TMUX_PERSIST_PANES=false      # pre-1.6 behaviour: reap at stop and start
+LEASHD_TMUX_ADOPT_MAX_AGE_HOURS=24   # 0 disables the age check
+leashd stop --end-agents             # end the panes on this stop
+```
+
+Grep `tmux_pane_adopted`, `tmux_pane_not_adopted`, `tmux_panes_kept_for_restart`
+and `tmux_jsonl_resumed_from_manifest` in `~/.leashd/logs/app.log` to see what a
+restart reclaimed.

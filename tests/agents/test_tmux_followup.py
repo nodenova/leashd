@@ -177,7 +177,7 @@ async def test_inject_followup_queues_into_live_turn(cfg, monkeypatch):
     agent = TmuxAgent(cfg)
     cs = _session(agent._tsm)
     monkeypatch.setattr(cs, "pane_is_dead", lambda: False)
-    submit = AsyncMock()
+    submit = AsyncMock(return_value=True)
     monkeypatch.setattr(cs, "submit", submit)
     cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
 
@@ -254,7 +254,7 @@ async def test_inject_followup_stages_attachments_before_text(cfg, monkeypatch):
         sent_keys.append((keys, literal))
 
     monkeypatch.setattr(cs, "send_keys", _record)
-    submit = AsyncMock()
+    submit = AsyncMock(return_value=True)
     monkeypatch.setattr(cs, "submit", submit)
     # _stage_attachments writes the file to cwd; stub it out so we don't
     # need an actual cwd or photo bytes — this test only covers the typing
@@ -277,3 +277,366 @@ async def test_inject_followup_stages_attachments_before_text(cfg, monkeypatch):
     assert sent_keys == [("@/work/img1.png ", True)]
     submit.assert_awaited_once_with("look at this")
     assert cs.turn.pending_followups == 1
+
+
+# -- Undelivered follow-ups must not silence the turn -----------------------
+#
+# Regression: the counter was bumped before submit() and never rolled back, so
+# a follow-up whose keystrokes never reached claude left complete() swallowing
+# the turn's own completion signal. The turn hung, and neither the original
+# message nor the follow-up was ever answered.
+
+
+async def test_inject_followup_rolls_back_when_delivery_unconfirmed(cfg, monkeypatch):
+    agent = TmuxAgent(cfg)
+    cs = _session(agent._tsm)
+    monkeypatch.setattr(cs, "pane_is_dead", lambda: False)
+    cleared: list[str] = []
+    monkeypatch.setattr(cs, "send_keys", lambda keys, **_: cleared.append(keys))
+    monkeypatch.setattr(cs, "submit", AsyncMock(return_value=False))
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+    ok = await agent.inject_followup("sess1", "and also run the tests")
+
+    assert ok is False
+    assert turn.pending_followups == 0
+    # The unsent text is wiped so the engine's re-submit is not typed on top.
+    assert cleared == ["C-u"]
+
+
+async def test_undelivered_followup_leaves_turn_completable(cfg, monkeypatch):
+    """The whole point: a lost follow-up must not eat the turn's completion."""
+    agent = TmuxAgent(cfg)
+    cs = _session(agent._tsm)
+    monkeypatch.setattr(cs, "pane_is_dead", lambda: False)
+    monkeypatch.setattr(cs, "send_keys", lambda *a, **k: None)
+    monkeypatch.setattr(cs, "submit", AsyncMock(return_value=False))
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+    assert await agent.inject_followup("sess1", "lost in the composer") is False
+
+    turn.complete()
+    assert turn.stop_event.is_set()
+
+
+async def test_inject_followup_declines_while_human_decision_pending(cfg, monkeypatch):
+    """A dialog on screen owns the keystrokes — typing into it eats the text."""
+    agent = TmuxAgent(cfg)
+    cs = _session(agent._tsm, chat_id="c-human")
+    monkeypatch.setattr(cs, "pane_is_dead", lambda: False)
+    submit = AsyncMock(return_value=True)
+    monkeypatch.setattr(cs, "submit", submit)
+    monkeypatch.setattr(
+        agent._tsm, "has_pending_human", lambda chat_id: chat_id == "c-human"
+    )
+    monkeypatch.setattr(agent._tsm, "pending_human_kind", lambda chat_id: "approval")
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+    ok = await agent.inject_followup("sess1", "never mind, do X instead")
+
+    assert ok is False
+    assert turn.pending_followups == 0
+    submit.assert_not_awaited()
+
+
+async def test_inject_followup_attachment_failure_rolls_back(cfg, monkeypatch):
+    from leashd.connectors.base import Attachment
+
+    agent = TmuxAgent(cfg)
+    cs = _session(agent._tsm)
+    monkeypatch.setattr(cs, "pane_is_dead", lambda: False)
+    monkeypatch.setattr(cs, "send_keys", lambda *a, **k: None)
+    monkeypatch.setattr(cs, "submit", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        agent, "_stage_attachments", lambda atts, _cwd: ["/work/img1.png"]
+    )
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+    ok = await agent.inject_followup(
+        "sess1",
+        "look at this",
+        attachments=[
+            Attachment(filename="img1.png", data=b"x", media_type="image/png")
+        ],
+    )
+
+    assert ok is False
+    assert turn.pending_followups == 0
+
+
+# -- Claude's native queue drain (queue-operation records) -------------------
+
+
+async def test_absorbed_followup_lets_the_single_completion_end_the_turn(cfg):
+    """Measured on CLI 2.1.251: claude folds a queued follow-up into the
+    response already in flight, so the pair finishes on ONE completion signal.
+    pending_followups would swallow it and hang the turn with no reply to
+    either message."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    turn.pending_followups = 1
+    turn.pending_followup_texts = ["also do X"]
+
+    await tsm._dispatch_jsonl_event(
+        cs,
+        {
+            "type": "queue-operation",
+            "operation": "remove",
+            "reason": "absorbed_mid_turn",
+            "content": "also do X",
+        },
+    )
+    assert turn.pending_followups == 0
+    assert not turn.stop_event.is_set()
+
+    turn.complete()
+    assert turn.stop_event.is_set()
+
+
+async def test_dequeued_followup_still_defers_for_its_own_response(cfg):
+    """`dequeue` = run as its own prompt → the extra signal really is coming."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    turn.pending_followups = 1
+    turn.pending_followup_texts = ["also do X"]
+
+    await tsm._dispatch_jsonl_event(
+        cs,
+        {"type": "queue-operation", "operation": "dequeue", "content": "also do X"},
+    )
+    assert turn.pending_followups == 1
+
+    turn.complete()
+    assert not turn.stop_event.is_set()
+    await TmuxSessionManager._process_blocks(turn, [{"type": "text", "text": "B"}])
+    turn.complete()
+    assert turn.stop_event.is_set()
+
+
+async def test_absorb_after_the_completion_was_swallowed_finalizes_the_turn(cfg):
+    """The race: the Stop hook wins, then the queue record lands."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    turn.pending_followups = 1
+    turn.pending_followup_texts = ["also do X"]
+
+    turn.complete()
+    assert not turn.stop_event.is_set()
+    assert turn.pending_followups == 0
+
+    await tsm._dispatch_jsonl_event(
+        cs,
+        {
+            "type": "queue-operation",
+            "operation": "remove",
+            "reason": "absorbed_mid_turn",
+            "content": "also do X",
+        },
+    )
+    assert turn.stop_event.is_set()
+    assert not turn.is_error
+
+
+async def test_absorb_race_during_active_goal_leaves_the_goal_running(cfg):
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    cs.goal_active = True
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    turn.pending_followups = 1
+    turn.pending_followup_texts = ["also do X"]
+
+    turn.complete()
+    assert not turn.stop_event.is_set()
+
+    await tsm._dispatch_jsonl_event(
+        cs,
+        {
+            "type": "queue-operation",
+            "operation": "remove",
+            "reason": "absorbed_mid_turn",
+            "content": "also do X",
+        },
+    )
+    assert not turn.stop_event.is_set()
+
+
+async def test_two_absorbed_followups_release_both_credits(cfg):
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    turn.pending_followups = 2
+    turn.pending_followup_texts = ["also do X", "also do X"]
+
+    for _ in range(2):
+        await tsm._dispatch_jsonl_event(
+            cs,
+            {
+                "type": "queue-operation",
+                "operation": "remove",
+                "reason": "absorbed_mid_turn",
+                "content": "also do X",
+            },
+        )
+    assert turn.pending_followups == 0
+    assert not turn.stop_event.is_set()
+
+    turn.complete()
+    assert turn.stop_event.is_set()
+
+
+async def test_remove_for_an_uncounted_queue_item_is_a_no_op(cfg):
+    """A human attached to the pane can queue and delete text leashd never
+    counted; that must not end a turn mid-response."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+    await tsm._dispatch_jsonl_event(
+        cs,
+        {
+            "type": "queue-operation",
+            "operation": "remove",
+            "reason": "user_deleted",
+            "content": "typed then deleted",
+        },
+    )
+    assert turn.pending_followups == 0
+    assert not turn.stop_event.is_set()
+
+
+async def test_enqueue_records_claudes_delivery_receipt(cfg):
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    assert cs.followup_enqueued_at is None
+
+    await tsm._dispatch_jsonl_event(
+        cs,
+        {"type": "queue-operation", "operation": "enqueue", "content": "also do X"},
+    )
+    assert cs.followup_enqueued_at is not None
+
+
+async def test_queue_operation_without_a_live_turn_is_ignored(cfg):
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+
+    await tsm._dispatch_jsonl_event(
+        cs,
+        {
+            "type": "queue-operation",
+            "operation": "remove",
+            "reason": "absorbed_mid_turn",
+            "content": "also do X",
+        },
+    )
+    assert cs.turn is None
+
+
+async def test_injection_log_reports_claudes_queue_receipt(cfg, monkeypatch):
+    """The pane cannot confirm a mid-turn follow-up, so the log has to carry
+    claude's own `enqueue` receipt instead."""
+    agent = TmuxAgent(cfg)
+    cs = _session(agent._tsm)
+    monkeypatch.setattr(cs, "pane_is_dead", lambda: False)
+    tsm = agent._tsm
+
+    async def _submit(text):
+        await tsm._dispatch_jsonl_event(
+            cs, {"type": "queue-operation", "operation": "enqueue", "content": text}
+        )
+        return True
+
+    monkeypatch.setattr(cs, "submit", _submit)
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+    assert await agent.inject_followup("sess1", "now add tests") is True
+    assert cs.followup_enqueued_at is not None
+
+
+async def test_injection_log_flags_a_missing_queue_receipt(cfg, monkeypatch):
+    agent = TmuxAgent(cfg)
+    cs = _session(agent._tsm)
+    monkeypatch.setattr(cs, "pane_is_dead", lambda: False)
+    monkeypatch.setattr(cs, "submit", AsyncMock(return_value=True))
+    cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+    assert await agent.inject_followup("sess1", "now add tests") is True
+    assert cs.followup_enqueued_at is None
+
+
+async def test_claudes_own_queue_traffic_never_steals_a_followup_credit(cfg):
+    """Claude puts its background `<task-notification>`s through the same queue
+    and drains them `absorbed_mid_turn` too — they outnumber human follow-ups in
+    the transcript corpus. Releasing on one would end the turn with the real
+    follow-up still unanswered."""
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    turn.pending_followups = 1
+    turn.pending_followup_texts = ["also reply SECOND"]
+
+    await tsm._dispatch_jsonl_event(
+        cs,
+        {
+            "type": "queue-operation",
+            "operation": "remove",
+            "reason": "absorbed_mid_turn",
+            "content": "<task-notification>\n<task-id>b9epynu3n</task-id>\n",
+        },
+    )
+    assert turn.pending_followups == 1
+    assert turn.pending_followup_texts == ["also reply SECOND"]
+
+    turn.complete()
+    assert not turn.stop_event.is_set()
+
+
+async def test_injected_text_is_matched_after_whitespace_normalisation(
+    cfg, monkeypatch
+):
+    """The text goes through the composer, so match on normalised whitespace."""
+    agent = TmuxAgent(cfg)
+    cs = _session(agent._tsm)
+    monkeypatch.setattr(cs, "pane_is_dead", lambda: False)
+    monkeypatch.setattr(cs, "submit", AsyncMock(return_value=True))
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+    await agent.inject_followup("sess1", "also  reply\n SECOND")
+    assert turn.pending_followups == 1
+
+    await agent._tsm._dispatch_jsonl_event(
+        cs,
+        {
+            "type": "queue-operation",
+            "operation": "remove",
+            "reason": "absorbed_mid_turn",
+            "content": "also reply SECOND",
+        },
+    )
+    assert turn.pending_followups == 0
+
+    turn.complete()
+    assert turn.stop_event.is_set()
+
+
+async def test_contentless_drain_releases_only_when_nothing_to_match(cfg):
+    tsm = TmuxSessionManager(cfg)
+    cs = _session(tsm)
+    turn = cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+    turn.pending_followups = 1
+    turn.pending_followup_texts = ["also reply SECOND"]
+
+    await tsm._dispatch_jsonl_event(
+        cs, {"type": "queue-operation", "operation": "remove", "content": None}
+    )
+    assert turn.pending_followups == 1
+
+    turn.pending_followup_texts = []
+    await tsm._dispatch_jsonl_event(
+        cs, {"type": "queue-operation", "operation": "remove", "content": None}
+    )
+    assert turn.pending_followups == 0

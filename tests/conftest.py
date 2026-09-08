@@ -41,8 +41,13 @@ def _isolate_env(monkeypatch, tmp_path):
 class MockConnector(BaseConnector):
     """In-memory connector for testing."""
 
-    def __init__(self, *, support_streaming: bool = False) -> None:
+    def __init__(
+        self, *, support_streaming: bool = False, chat_sessions: bool = False
+    ) -> None:
         super().__init__()
+        self.activated_chat_sessions: list[str] = []
+        self.flushed_chat_sessions: list[tuple[str, int]] = []
+        self._chat_sessions = chat_sessions
         self.sent_messages: list[dict] = []
         self.approval_requests: list[dict] = []
         self.typing_indicators: list[str] = []
@@ -116,6 +121,20 @@ class MockConnector(BaseConnector):
             {"chat_id": chat_id, "text": text, "message_id": msg_id}
         )
         return msg_id
+
+    def supports_chat_sessions(self, chat_id: str) -> bool:
+        return self._chat_sessions
+
+    async def activate_chat_session(self, chat_id: str) -> None:
+        self.activated_chat_sessions.append(chat_id)
+
+    def chat_session_visible(self, chat_id: str) -> bool:
+        if not self._chat_sessions or not self.activated_chat_sessions:
+            return True
+        return self.activated_chat_sessions[-1] == chat_id
+
+    async def flush_chat_session_prompts(self, chat_id: str) -> None:
+        self.flushed_chat_sessions.append((chat_id, len(self.sent_messages)))
 
     async def edit_message(self, chat_id: str, message_id: str, text: str) -> None:
         self.edited_messages.append(

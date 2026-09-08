@@ -379,7 +379,14 @@ def build_engine(
     # build_engine() whose config leaves tmux_socket_dir at its default would
     # otherwise reap the *live* daemon's panes. Only the daemon entrypoints in
     # main.py own that lifecycle, so only they pass True.
-    if reap_orphan_tmux:
+    #
+    # With `tmux_persist_panes` the sweep moves to `Engine.startup()`, which
+    # adopts what it can before killing the rest — it runs after `bind_safety`
+    # below, so an adopted pane comes back with a working gate, and it is async,
+    # so it can restart each pane's tailer and dialog watcher.
+    if reap_orphan_tmux and not (
+        config.agent_runtime == "tmux" and config.tmux_persist_panes
+    ):
         tsm.kill_owned_sessions()
     # Install + register the opt-in security-guidance plugin once per daemon,
     # runtime-agnostic (no-op unless LEASHD_SECURITY_GUIDANCE_ENABLED). The

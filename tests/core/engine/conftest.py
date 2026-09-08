@@ -57,4 +57,5 @@ def engine(config, fake_agent, policy_engine, audit_logger):
 def _make_git_handler_mock():
     handler = AsyncMock()
     handler.has_pending_input = lambda _chat_id: False
+    handler.pending_input_chats = set
     return handler

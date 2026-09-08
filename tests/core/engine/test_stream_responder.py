@@ -775,3 +775,213 @@ class TestActiveRespondersLifecycle:
 
         await eng.handle_message("user1", "hello", "chat1")
         assert "chat1" not in eng._active_responders
+
+
+def _rendered_chat(connector) -> list[str]:
+    """Final visible text of every message, in send order — what a user sees."""
+    order: list[str] = []
+    text_by_id: dict[str, str] = {}
+    for msg in connector.sent_messages:
+        mid = msg.get("message_id")
+        if mid is None:
+            continue
+        if mid not in text_by_id:
+            order.append(mid)
+        text_by_id[mid] = msg["text"]
+    for edit in connector.edited_messages:
+        mid = edit["message_id"]
+        if mid not in text_by_id:
+            order.append(mid)
+        text_by_id[mid] = edit["text"]
+    for deleted in connector.deleted_messages:
+        mid = deleted["message_id"]
+        if mid in text_by_id:
+            del text_by_id[mid]
+            order.remove(mid)
+    return [text_by_id[mid] for mid in order]
+
+
+class TestFinalizeAfterOverflow:
+    """A final text longer than the streamed buffer must not repeat windows
+    already committed to earlier overflow messages."""
+
+    @staticmethod
+    async def _overflowing_responder(connector, body: str):
+        from leashd.core.engine import _StreamingResponder
+
+        responder = _StreamingResponder(connector, "chat1", throttle_seconds=0)
+        for i in range(0, len(body), 250):
+            await responder.on_chunk(body[i : i + 250])
+        return responder
+
+    async def test_longer_final_text_does_not_duplicate_committed_windows(self):
+        from leashd.core.engine import _MAX_STREAMING_DISPLAY
+        from tests.conftest import MockConnector
+
+        connector = MockConnector(support_streaming=True)
+        body = "".join(f"line-{i:04d} {'x' * 40}\n" for i in range(130))
+        responder = await self._overflowing_responder(connector, body)
+        assert len(responder.all_message_ids) > 1
+
+        final_text = body + "\n\n\U0001f9f0 Bash x2"
+        assert await responder.finalize(final_text) is True
+
+        chat = _rendered_chat(connector)
+        head = body[:200]
+        assert sum(1 for text in chat if text.startswith(head)) == 1
+        assert all(len(text) <= _MAX_STREAMING_DISPLAY for text in chat)
+
+    async def test_longer_final_text_delivered_exactly_once_in_order(self):
+        from tests.conftest import MockConnector
+
+        connector = MockConnector(support_streaming=True)
+        body = "".join(f"line-{i:04d} {'x' * 40}\n" for i in range(130))
+        responder = await self._overflowing_responder(connector, body)
+
+        final_text = body + "\n\n\U0001f9f0 Bash x2"
+        await responder.finalize(final_text)
+
+        assert "".join(_rendered_chat(connector)) == final_text
+
+    async def test_no_untracked_message_is_left_behind(self):
+        from tests.conftest import MockConnector
+
+        connector = MockConnector(support_streaming=True)
+        body = "".join(f"line-{i:04d} {'x' * 40}\n" for i in range(130))
+        responder = await self._overflowing_responder(connector, body)
+
+        await responder.finalize(body + "\n\n\U0001f9f0 Bash x2")
+
+        assert not [m for m in connector.sent_messages if m.get("message_id") is None]
+        rendered = {m["message_id"] for m in connector.sent_messages}
+        assert rendered == set(responder.all_message_ids)
+
+    async def test_surplus_messages_are_deleted_when_final_text_needs_fewer(self):
+        from tests.conftest import MockConnector
+
+        connector = MockConnector(support_streaming=True)
+        marker_heavy_body = "".join(
+            f"[[leashd:file f{i:04d}.txt]] k\n" for i in range(500)
+        )
+        body = marker_heavy_body
+        responder = await self._overflowing_responder(connector, body)
+        assert len(responder.all_message_ids) >= 3
+
+        final_text = "the whole answer, restated\n" * 60 + "\n\U0001f9f0 Bash"
+        assert await responder.finalize(final_text) is True
+
+        chat = _rendered_chat(connector)
+        assert chat == [final_text]
+        assert responder.all_message_ids == [
+            connector.completed_streams[-1]["message_id"]
+        ]
+        assert len(connector.deleted_messages) >= 2
+
+    async def test_buffer_branch_still_edits_only_the_last_message(self):
+        from tests.conftest import MockConnector
+
+        connector = MockConnector(support_streaming=True)
+        body = "".join(f"line-{i:04d} {'x' * 40}\n" for i in range(130))
+        responder = await self._overflowing_responder(connector, body)
+        first_id = responder.all_message_ids[0]
+        connector.edited_messages.clear()
+
+        await responder.finalize(body[: len(body) // 2])
+
+        assert first_id not in {e["message_id"] for e in connector.edited_messages}
+
+    async def test_single_message_turn_is_unaffected(self):
+        from tests.conftest import MockConnector
+
+        connector = MockConnector(support_streaming=True)
+        responder = await self._overflowing_responder(connector, "short answer")
+        assert len(responder.all_message_ids) == 1
+
+        await responder.finalize("short answer\n\n\U0001f9f0 Bash")
+
+        assert _rendered_chat(connector) == ["short answer\n\n\U0001f9f0 Bash"]
+
+
+class TransientThenSuccessfulAgent(BaseAgent):
+    """Streams a fragment, fails transiently, then streams the whole answer."""
+
+    def __init__(self, fragment: str, answer: str):
+        self._fragment = fragment
+        self._answer = answer
+        self.attempts = 0
+
+    async def execute(self, prompt, session, *, on_text_chunk=None, **kwargs):
+        self.attempts += 1
+        if self.attempts == 1:
+            if on_text_chunk:
+                await on_text_chunk(self._fragment)
+            return AgentResponse(
+                content="Service temporarily unavailable",
+                session_id="s1",
+                is_error=True,
+            )
+        if on_text_chunk:
+            await on_text_chunk(self._answer)
+        return AgentResponse(content=self._answer, session_id="s1")
+
+    async def cancel(self, session_id):
+        pass
+
+    async def shutdown(self):
+        pass
+
+
+class TestTransientRetryLeavesNoDuplicate:
+    """The retried turn must not stack its answer on the failed attempt's.
+
+    Resetting the responder without taking the first attempt's messages down
+    left the fragment in the chat and streamed the full answer into fresh
+    messages underneath it, so the reply read twice.
+    """
+
+    @staticmethod
+    def _engine(config, policy_engine, audit_logger, connector, agent):
+        return Engine(
+            connector=connector,
+            agent=agent,
+            config=config,
+            session_manager=SessionManager(),
+            policy_engine=policy_engine,
+            audit=audit_logger,
+        )
+
+    async def _run(self, config, policy_engine, audit_logger, monkeypatch):
+        from tests.conftest import MockConnector
+
+        real_sleep = asyncio.sleep
+        monkeypatch.setattr(asyncio, "sleep", lambda _d: real_sleep(0))
+
+        connector = MockConnector(support_streaming=True)
+        agent = TransientThenSuccessfulAgent(
+            "The remaining items are", "The remaining items are: one, two, three."
+        )
+        engine = self._engine(config, policy_engine, audit_logger, connector, agent)
+
+        await engine.handle_message("u1", "what is left", "chat1")
+        return connector, agent
+
+    async def test_the_failed_attempt_is_withdrawn(
+        self, config, policy_engine, audit_logger, monkeypatch
+    ):
+        connector, agent = await self._run(
+            config, policy_engine, audit_logger, monkeypatch
+        )
+
+        assert agent.attempts == 2
+        assert connector.deleted_messages
+
+    async def test_only_the_retry_is_left_in_the_chat(
+        self, config, policy_engine, audit_logger, monkeypatch
+    ):
+        connector, _ = await self._run(config, policy_engine, audit_logger, monkeypatch)
+
+        withdrawn = {d["message_id"] for d in connector.deleted_messages}
+        surviving = [
+            m for m in connector.sent_messages if m.get("message_id") not in withdrawn
+        ]
+        assert len(surviving) == 1

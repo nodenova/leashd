@@ -6,9 +6,9 @@ rules:
     tools: [Read, Write, Edit]
     path_patterns:
       - "\\.env$|\\.env\\."
-      - "\\.ssh/|\\.aws/"
-      - "\\.key$|\\.pem$"
-      - "id_rsa|credentials|secrets?"
+      - "\\.ssh/|\\.aws/|\\.gnupg/"
+      - "\\.key$|\\.pem$|\\.p12$|\\.pfx$|\\.keystore$"
+      - "id_rsa|id_ed25519|id_ecdsa|id_dsa|credentials|secrets?|token\\.json$"
     action: deny
     reason: "Credential/sensitive file access blocked"
 
@@ -21,12 +21,66 @@ rules:
   - name: destructive-bash
     tool: Bash
     command_patterns:
-      - "rm\\s.*-.*r.*f|rm\\s+-rf"
       - "\\bsudo\\b"
       - "\\b(curl|wget)\\b.*\\|.*\\b(bash|sh|zsh)\\b"
       - "\\b(DROP|TRUNCATE)\\s+(TABLE|DATABASE)\\b"
     action: deny
     reason: "Destructive command blocked"
+
+  # Recursive delete asks rather than denies: in practice the target is the
+  # agent's own litter (build dirs, caches, logs), and a hard deny ended the
+  # whole job to protect a cache directory. An approval keeps a human in the
+  # loop without ending the work; nothing here runs unattended. `sudo`,
+  # pipe-to-shell, SQL `DROP` and force-push stay denied above.
+  - name: recursive-delete
+    tool: Bash
+    command_patterns:
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-\\S*[rR]\\S*[fF]"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-\\S*[fF]\\S*[rR]"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-[rR]\\s+(?:-\\S+\\s+)*-[fF]\\b"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-[fF]\\s+(?:-\\S+\\s+)*-[rR]\\b"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*--recursive\\b"
+    action: require_approval
+    reason: "Recursive delete — confirm the path before it runs"
+    risk_level: high
+
+  # `credential-files` above is scoped to Read/Write/Edit, so it never sees a
+  # shell command: `cat <repo>/.env` and `echo … >> ~/.ssh/authorized_keys` are
+  # otherwise cleared outright by `safe-bash` below, and claude's native deny
+  # globs — the only thing that used to stop them — are anchored at `~/` and
+  # installed by the tmux runtime alone.
+  #
+  # One credential path per pattern, unanchored, so the tmux runtime mirrors
+  # each as a narrow `permissions.ask` glob (`Bash(*.ssh/*)`) instead of
+  # prompting on every `cat`. Patterns are matched against what the shell
+  # executes, quoting respected, so a path named inside a quoted remote payload
+  # (`ssh host 'ls ~/.ssh/'`) is not a local credential access and does not
+  # match.
+  - name: credential-bash
+    tool: Bash
+    command_patterns:
+      - "\\.env\\b(?!\\.(example|sample|template|dist))"
+      - "\\.ssh/"
+      - "\\.aws/"
+      - "\\.gnupg/"
+      - "authorized_keys"
+      - "\\.pem\\b"
+      - "\\.key\\b"
+      - "\\.p12\\b"
+      - "\\.pfx\\b"
+      - "\\.keystore\\b"
+      - "id_rsa"
+      - "id_ed25519"
+      - "id_ecdsa"
+      - "id_dsa"
+      - "\\.git-credentials\\b"
+      - "credentials\\b"
+      - "secret\\."
+      - "secrets\\."
+      - "token\\.json\\b"
+    action: require_approval
+    description: "Shell access to a credential path"
+    risk_level: critical
 
   # Allow rules
   - name: agent-internal-tools
@@ -71,9 +125,13 @@ rules:
     action: require_approval
     description: "Privileged agent-browser operation (code install, listener, real-Chrome attach, third-party send)"
 
+  # Permissive clears every agent-browser subcommand, but the pipe target is
+  # not an agent-browser operation: `… | curl -d @-` uploads whatever the page
+  # read, and a matching allow rule means nothing after the pipe is examined.
   - name: agent-browser-all
     tool: Bash
-    command_patterns: ["^agent-browser\\b"]
+    command_patterns:
+      - "^agent-browser\\b[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
     action: allow
     description: "Agent-browser tools (permissive mode)"
 

@@ -187,6 +187,7 @@ class InteractionCoordinator:
                 return PermissionDeny(message="No response received")
             finally:
                 self.pending.pop(interaction_id, None)
+                self.connector.discard_prompt(interaction_id)
                 if self._chat_index.get(chat_id) == interaction_id:
                     self._chat_index.pop(chat_id, None)
 
@@ -245,6 +246,7 @@ class InteractionCoordinator:
             return PermissionDeny(message="Plan review timed out")
         finally:
             self.pending.pop(interaction_id, None)
+            self.connector.discard_prompt(interaction_id)
             if self._chat_index.get(chat_id) == interaction_id:
                 self._chat_index.pop(chat_id, None)
 
@@ -413,6 +415,14 @@ class InteractionCoordinator:
         interaction_id = self._chat_index.get(chat_id)
         return interaction_id is not None and interaction_id in self.pending
 
+    def pending_chats(self) -> set[str]:
+        """Every conversation currently blocked on a question or plan review."""
+        return {
+            chat_id
+            for chat_id, interaction_id in self._chat_index.items()
+            if interaction_id in self.pending
+        }
+
     def pending_kind(self, chat_id: str) -> str | None:
         """Kind ('question' | 'plan_review') of the interaction awaiting this
         chat, or None — lets a caller describe the wait/resume by what the user
@@ -428,6 +438,7 @@ class InteractionCoordinator:
                 pending.event.set()
                 cancelled.append(iid)
                 self.pending.pop(iid, None)
+                self.connector.discard_prompt(iid)
         self._chat_index.pop(chat_id, None)
         if cancelled:
             logger.info("interactions_cancelled", chat_id=chat_id, count=len(cancelled))

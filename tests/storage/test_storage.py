@@ -1,5 +1,7 @@
 """Tests for session storage backends."""
 
+import sqlite3
+
 import pytest
 
 from leashd.core.session import Session, SessionManager
@@ -103,6 +105,24 @@ class TestSqliteSessionStore:
             assert await store.load("u1", "c1") is None
         finally:
             await store.teardown()
+
+    async def test_delete_clears_the_foreground_flag(self, tmp_path):
+        """A conversation that is gone cannot be the one its chat is showing."""
+        db = tmp_path / "test.db"
+        store = SqliteSessionStore(db)
+        await store.setup()
+        try:
+            await store.save(_make_session(chat_id="c1:s2", is_foreground=True))
+            await store.delete("u1", "c1:s2")
+        finally:
+            await store.teardown()
+
+        with sqlite3.connect(db) as conn:
+            row = conn.execute(
+                "SELECT is_active, is_foreground FROM sessions WHERE chat_id = ?",
+                ("c1:s2",),
+            ).fetchone()
+        assert row == (0, 0)
 
     async def test_writes_noop_after_teardown(self, tmp_path):
         # Graceful-shutdown race: a turn finalizing (save / save_message) after

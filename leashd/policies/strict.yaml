@@ -6,9 +6,9 @@ rules:
     tools: [Read, Write, Edit]
     path_patterns:
       - "\\.env$|\\.env\\."
-      - "\\.ssh/|\\.aws/"
-      - "\\.key$|\\.pem$"
-      - "id_rsa|credentials|secrets?"
+      - "\\.ssh/|\\.aws/|\\.gnupg/"
+      - "\\.key$|\\.pem$|\\.p12$|\\.pfx$|\\.keystore$"
+      - "id_rsa|id_ed25519|id_ecdsa|id_dsa|credentials|secrets?|token\\.json$"
     action: deny
     reason: "Credential/sensitive file access blocked"
 

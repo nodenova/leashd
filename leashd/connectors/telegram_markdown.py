@@ -317,7 +317,18 @@ def _record_table(rows: list[list[str]]) -> str:
     return "\n\n".join(records)
 
 
-def _collect_table(lines: list[str], start: int) -> tuple[str, int]:
+def _compact_table(rows: list[list[str]]) -> str:
+    """Lay a table out unpadded, for when alignment will not fit the message.
+
+    Padding every cell out to its column width is what makes a rendered table
+    longer than its source. Dropping it — and the separator row with it — puts
+    the table back under its own source length, at the cost of alignment.
+    """
+    plain = [[_plain_inline(cell) for cell in row] for row in rows]
+    return _pre_block("\n".join(" | ".join(row) for row in plain), "")
+
+
+def _collect_table(lines: list[str], start: int, compact: bool) -> tuple[str, int]:
     rows: list[list[str]] = []
     i = start
     while i < len(lines) and "|" in lines[i] and lines[i].strip():
@@ -326,13 +337,19 @@ def _collect_table(lines: list[str], start: int) -> tuple[str, int]:
         i += 1
     if not rows:
         return "", i
+    if compact:
+        return _compact_table(rows), i
     if len(rows) == 1:
         return _aligned_table(rows) or _pre_block(" ".join(rows[0]), ""), i
     return (_aligned_table(rows) or _record_table(rows)), i
 
 
-def to_html(text: str) -> str:
-    """Render Markdown as Telegram-parseable HTML."""
+def to_html(text: str, *, compact: bool = False) -> str:
+    """Render Markdown as Telegram-parseable HTML.
+
+    ``compact`` renders tables without column padding, giving a caller that
+    cannot split its text a rendering no longer than the source it came from.
+    """
     if not text:
         return ""
 
@@ -346,7 +363,7 @@ def to_html(text: str) -> str:
             out.append(_pre_block("\n".join(body), fence.group("lang")))
             continue
         if _is_table(lines, i):
-            block, i = _collect_table(lines, i)
+            block, i = _collect_table(lines, i, compact)
             out.append(block)
             continue
         if _QUOTE_RE.match(lines[i]):
@@ -443,9 +460,16 @@ def render_one(text: str, limit: int) -> Chunk:
 
     Truncation happens on the source: cutting rendered HTML would sever a tag
     and produce markup Telegram refuses to parse.
+
+    This caller is editing one existing message and cannot be handed a second,
+    so an over-long rendering sheds table alignment before it sheds markup
+    altogether. A table padded 33 characters past the ceiling used to cost the
+    whole message every heading, bold run and code span it had.
     """
     source = text[:limit]
     rendered = to_html(source)
+    if visible_length(rendered) > TELEGRAM_TEXT_LIMIT:
+        rendered = to_html(source, compact=True)
     if visible_length(rendered) > TELEGRAM_TEXT_LIMIT:
         return Chunk(source, escape(source))
     return Chunk(source, rendered)

@@ -30,7 +30,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import structlog
 
@@ -40,11 +40,20 @@ from leashd.agents.runtimes._helpers import (
     describe_tool,
     safe_callback,
 )
+from leashd.agents.runtimes.tmux_manifest import (
+    TMUX_NAME_PREFIX,
+    PaneManifest,
+    delete_manifest,
+    prune_manifests,
+    read_manifest,
+    session_id_from_tmux_name,
+    write_manifest,
+)
 from leashd.core.safety.gatekeeper import FILE_EDIT_TOOLS, normalize_tool_name
 from leashd.exceptions import AgentError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine, Iterable
+    from collections.abc import Callable, Coroutine, Iterable, Sequence
 
     from leashd.core.config import LeashdConfig
     from leashd.core.events import EventBus
@@ -139,28 +148,72 @@ def _parse_version(text: str) -> tuple[int, ...] | None:
     return tuple(int(g) for g in m.groups() if g is not None)
 
 
+# No glob here has a `**` (or any wildcard) followed by another literal path
+# segment. Claude Code 2.1.x resolves a Read/Edit deny glob shaped like
+# "wildcard, then a later literal" — an unanchored `**/foo`, or `~/**/foo`
+# with the `**` in the middle — not just against a Read/Edit tool's path
+# argument, but ALSO, via its own undocumented Bash heuristic, as a raw
+# substring search over a Bash command's full text — including text nested
+# inside a quoted SSH remote-command payload meant for a DIFFERENT host's
+# shell. Verified live 2026-09-03: `ssh host 'ls -la ~/.ssh/'` and
+# `ssh host 'cat ~/.git-credentials'` were denied outright, never reaching
+# leashd's own PreToolUse hook (the hook call timed out uncalled), because the
+# SSH payload merely *mentioned* a matching path — nothing was ever read
+# locally. That silently broke all remote administration whose command text
+# happens to reference `.ssh`, `credentials`, `secret`, `id_rsa`, etc. on the
+# far end. A *trailing* wildcard with nothing after it — `~/.ssh/**`, or a
+# lone `*` closing out a filename glob like `~/*credentials*` — does NOT get
+# swept this way (also verified live): claude can resolve "starts with this
+# literal prefix" or "matches this one path segment" directly against a real
+# tool argument, with no text search required. So every pattern below is
+# anchored at `~/` (killing the "could be anywhere on disk" reading that
+# provoked the sweep) AND every wildcard is terminal.
+#
+# The trade-off this makes deliberately: `~/*credentials*` only catches a
+# credential-shaped file directly in $HOME, not one nested arbitrarily deep in
+# a project tree (`~/projects/x/config/secrets.yaml` is not covered here).
+# That gap is real but narrow — `.ssh`/`.aws`/`.gnupg` (where secrets
+# overwhelmingly actually live) keep full "anything below" coverage via their
+# trailing `**`. Depth-agnostic matching for the rest is still the job of the
+# `credential-files` rule in the policy YAML (`core/safety/policy.py`) for
+# Read/Edit calls specifically — that rule's `path_patterns` are plain regexes
+# or matched with `re.search`, so nesting never matters there — but that rule
+# is NOT a Bash protection: it is scoped to `tools: [Read, Write, Edit]` only,
+# same as this floor (see `_CREDENTIAL_DENY_TOOLS` below), so a Bash command
+# that locally `cat`s a credential file nested more than one path segment
+# under home has no independent leashd-side check today — it relied entirely
+# on this list's old, over-broad glob shape catching it as an accidental side
+# effect of the very bug this fix removes. Closing that residual Bash gap
+# needs its own argument-aware analysis (distinguishing a real local file
+# argument from text inside a remote/subshell payload) — deliberately out of
+# scope here to avoid reintroducing exactly this incident.
 _CREDENTIAL_DENY_GLOBS: tuple[str, ...] = (
-    "**/.env",
-    "**/.env.*",
-    "**/.ssh/**",
+    "~/.env",
+    "~/.env.*",
     "~/.ssh/**",
-    "**/.aws/**",
     "~/.aws/**",
-    "**/.gnupg/**",
     "~/.gnupg/**",
-    "**/*.key",
-    "**/*.pem",
-    "**/*.p12",
-    "**/*.pfx",
-    "**/*.keystore",
-    "**/*id_rsa*",
-    "**/*id_ed25519*",
-    "**/*credentials*",
-    "**/*secret.*",
-    "**/*secrets.*",
-    "**/*token.json",
+    "~/*.key",
+    "~/*.pem",
+    "~/*.p12",
+    "~/*.pfx",
+    "~/*.keystore",
+    "~/*id_rsa*",
+    "~/*id_ed25519*",
+    "~/*id_ecdsa*",
+    "~/*id_dsa*",
+    "~/*credentials*",
+    "~/*secret.*",
+    "~/*secrets.*",
+    "~/*token.json",
 )
-_CREDENTIAL_DENY_TOOLS: tuple[str, ...] = ("Read", "Edit", "Write")
+# `Write` is deliberately absent. Claude Code resolves file permission checks
+# against `Edit(path)` and `Read(path)` rules ONLY — a `Write(path)` rule is
+# accepted, never consulted, and emits a startup warning per rule ("… is not
+# matched by file permission checks"). `Edit` already covers every file-editing
+# tool (Write, NotebookEdit, MultiEdit), and since 2.1.228 a `Read` deny blocks
+# writes to the same path too, so dropping it loses no coverage.
+_CREDENTIAL_DENY_TOOLS: tuple[str, ...] = ("Read", "Edit")
 
 
 def _credential_deny_rules() -> list[str]:
@@ -243,6 +296,231 @@ def native_allow_rules(
         elif key != "Bash":
             allow.append(key)
     return sorted(dict.fromkeys(allow))
+
+
+# No bare `.` — that is the regex "any character", and reading it literally
+# leaked a `.` into the emitted glob (`Bash(*git push.*)`). An escaped `\.` is
+# a literal and is handled by _ASK_ESCAPED_LITERAL instead.
+_ASK_LITERAL_CHAR = re.compile(r"[A-Za-z0-9_:@=/-]")
+_ASK_ESCAPED_LITERAL = frozenset(".-+*?()[]|/$^{}")
+_SKIPPABLE_QUANTIFIERS = ("*?", "??", "*", "?")
+_GREEDY_QUANTIFIERS = ("+?", "+")
+_NATIVE_GATE_ACTIONS = frozenset({"deny", "require_approval"})
+
+
+def _read_group(pattern: str, start: int) -> tuple[str | None, int]:
+    """Body and end offset of the ``(...)`` group at *start*, or ``(None, start)``.
+
+    ``None`` for a group leashd will not read literally — a lookaround or any
+    other ``(?...)`` extension. The end offset is still correct there, so a
+    caller can step over the group even when it cannot read inside it.
+
+    Escaped parens and parens inside a character class are not nesting: both
+    appear in the command-position anchors the deny rules use, and counting
+    them ran the scan off the end of the pattern.
+    """
+    depth = 0
+    i = start
+    in_class = False
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_class:
+            in_class = ch != "]"
+        elif ch == "[":
+            in_class = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                body = pattern[start + 1 : i]
+                return (None, i + 1) if body.startswith("?") else (body, i + 1)
+        i += 1
+    return None, start
+
+
+def _read_quantifier(pattern: str, end: int) -> tuple[int, bool]:
+    """End offset past any quantifier at *end*, and whether it can match empty."""
+    for quant in (*_SKIPPABLE_QUANTIFIERS, *_GREEDY_QUANTIFIERS):
+        if pattern.startswith(quant, end):
+            return end + len(quant), quant in _SKIPPABLE_QUANTIFIERS
+    return end, False
+
+
+def _literal_branches(body: str) -> list[str] | None:
+    """Top-level alternation of *body* when every branch is plain literal text."""
+    branches: list[str] = []
+    depth = 0
+    current = ""
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "|" and depth == 0:
+            branches.append(current)
+            current = ""
+            continue
+        current += ch
+    branches.append(current)
+    for branch in branches:
+        if not branch or not all(_ASK_LITERAL_CHAR.fullmatch(c) for c in branch):
+            return None
+    return branches
+
+
+def _skip_command_position_anchor(pattern: str, start: int) -> int:
+    """Step over a leading "at a command position" group, e.g. ``(?:^|[;&|]|\\$\\()``.
+
+    It matches no text of its own, so the literal walk should read straight
+    through to the command name. Left unhandled the walk stops on the group and
+    the rule emits no ask entry at all — a deny that claude's auto mode then
+    never stops for.
+    """
+    if start >= len(pattern) or pattern[start] != "(":
+        return start
+    _, end = _read_group(pattern, start)
+    if end == start or "^" not in pattern[start:end]:
+        return start
+    after, _ = _read_quantifier(pattern, end)
+    return after
+
+
+def literal_command_prefixes(pattern: str) -> tuple[list[str], bool]:
+    """Command prefixes a policy ``command_patterns`` regex requires.
+
+    Returns ``(prefixes, anchored)``. The walk reads the regex left to right and
+    stops at the first construct it cannot resolve to literal text, so every
+    prefix returned is a PREFIX of what the regex matches and never narrower
+    than it. Over-broad is the safe direction: these become ``permissions.ask``
+    entries, which decide only whether leashd is *consulted*, not what leashd
+    answers — the policy's own regex still makes the call on the
+    ``PermissionRequest`` leg.
+    """
+    anchored = pattern.startswith("^")
+    i = 1 if anchored else 0
+    i = _skip_command_position_anchor(pattern, i)
+    prefixes = [""]
+    while i < len(pattern):
+        ch = pattern[i]
+        if _ASK_LITERAL_CHAR.fullmatch(ch):
+            prefixes = [p + ch for p in prefixes]
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(pattern):
+            escaped = pattern[i + 1]
+            if escaped == "s":
+                i, _ = _read_quantifier(pattern, i + 2)
+                prefixes = [p + " " for p in prefixes]
+                continue
+            if escaped == "b":
+                # A leading word boundary just anchors the literal that follows;
+                # a trailing one ends it.
+                if any(prefixes):
+                    break
+                i += 2
+                continue
+            if escaped in _ASK_ESCAPED_LITERAL:
+                prefixes = [p + escaped for p in prefixes]
+                i += 2
+                continue
+            break
+        if ch == "(":
+            body, end = _read_group(pattern, i)
+            if end == i:
+                break
+            after, skippable = _read_quantifier(pattern, end)
+            # An optional group requires nothing, so reading past it keeps the
+            # prefix valid — and wider, which is the safe direction here. This
+            # is checked before the unreadable-body bail so `(?:sudo\s+)?` does
+            # not stop the walk before it reaches the command name.
+            if skippable:
+                i = after
+                continue
+            if body is None:
+                break
+            branches = _literal_branches(body)
+            if branches is None:
+                break
+            prefixes = [p + b for p in prefixes for b in branches]
+            i = after
+            continue
+        break
+    resolved = [p.lstrip() for p in prefixes if p.strip()]
+    return sorted(dict.fromkeys(resolved)), anchored
+
+
+def _bash_ask_glob(prefix: str, anchored: bool) -> str:
+    """A claude Bash rule matching *prefix*, positioned by how the regex anchored."""
+    if anchored:
+        return f"Bash({prefix}*)" if prefix.endswith(" ") else f"Bash({prefix} *)"
+    return f"Bash(*{prefix}*)"
+
+
+def native_ask_rules(policy_rules: Iterable[Any]) -> tuple[list[str], list[str]]:
+    """Native claude ``permissions.ask`` rules for everything leashd gates.
+
+    THE fix for the auto-mode gating bypass. In ``auto`` mode claude does not
+    block on the synchronous ``PreToolUse`` hook — verified live: a ``deny`` and
+    a ``require_approval`` both ran to completion while leashd was still waiting
+    on the human, and leashd then retired its own gate as a phantom "rejected".
+    An explicit ``permissions.ask`` rule IS honoured there: it is evaluated
+    *before* the classifier and forces a permission decision, which raises the
+    ``PermissionRequest`` hook — the one leashd already implements and the one
+    claude does block on.
+
+    So an ask rule is a TRIGGER, not a verdict. It only has to be a superset of
+    what the policy gates: an over-broad entry costs one extra hook round trip
+    and nothing else, because leashd's own regex still answers on the
+    ``PermissionRequest`` leg and can allow silently. Under-triggering is the
+    bug being fixed, so :func:`literal_command_prefixes` deliberately widens
+    rather than narrows.
+
+    ``deny`` rules are mirrored here too rather than into ``permissions.deny``:
+    a native deny is absolute and cannot be walked back by the hook, so a lossy
+    regex→glob widening would block commands the policy allows. Routing them
+    through ``ask`` keeps the *precise* verdict in leashd's hands while still
+    guaranteeing claude stops for one. The credential floor stays in
+    ``permissions.deny`` — its path globs are exact, and it must hold even if
+    the hook itself fails.
+
+    Returns ``(rules, mirrored_rule_names)``. The names tell
+    :meth:`ToolGatekeeper.check_auto_gated` which verdicts it may hand to the
+    native prompt instead of blocking on a hook claude ignores.
+    """
+    rules: list[str] = []
+    names: list[str] = []
+    for rule in policy_rules:
+        action = getattr(rule, "action", None)
+        if getattr(action, "value", action) not in _NATIVE_GATE_ACTIONS:
+            continue
+        name = getattr(rule, "name", None)
+        emitted: list[str] = []
+        for pattern in getattr(rule, "command_patterns", None) or []:
+            prefixes, anchored = literal_command_prefixes(
+                getattr(pattern, "pattern", str(pattern))
+            )
+            emitted += [_bash_ask_glob(p, anchored) for p in prefixes]
+        if not getattr(rule, "command_patterns", None) and not getattr(
+            rule, "path_patterns", None
+        ):
+            # A tool-only rule maps exactly. Bare `Bash` never does — it would
+            # prompt on every shell command in the session.
+            emitted += [
+                tool
+                for tool in getattr(rule, "tools", None) or []
+                if isinstance(tool, str) and tool and tool != "Bash"
+            ]
+        # A path-pattern rule (the credential floor) is skipped: gitignore globs
+        # cannot express the analyzer's regexes, and `permissions.deny` already
+        # carries that floor exactly.
+        if emitted and isinstance(name, str) and name:
+            rules += emitted
+            names.append(name)
+    return sorted(dict.fromkeys(rules)), sorted(dict.fromkeys(names))
 
 
 TYPING_MODE_TYPE = "type"
@@ -411,6 +689,8 @@ _NATIVE_DIALOG_SKIP_SETS: tuple[tuple[str, ...], ...] = (
 # Numbered-option row: optional ``❯`` highlight, then ``N.`` then label.
 _NATIVE_DIALOG_OPTION_RE = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.+?)\s*$")
 
+_NATIVE_DIALOG_CURSOR_RE = re.compile(r"^(\s+)❯\s+(\S.*?)\s*$")
+
 _SESSION_SCOPED_CONFIRM_MARKER = "s to use this session only"
 _MODEL_SWITCH_CONFIRM_MARKER = "No, go back"
 _MODEL_SWITCH_YES_PREFIX = "Yes,"
@@ -421,6 +701,10 @@ _STRAY_DIALOG_WAIT_S = 4.0
 _DIALOG_NAV_MAX_STEPS = 14
 _DIALOG_NAV_STEP_DELAY_S = 0.3
 _DIALOG_REBRIDGE_COOLDOWN_S = 60.0
+_PERM_SELECTOR_MAX_PRESSES = 3
+_PERM_SELECTOR_LOOKBACK_LINES = 12
+_PERM_SELECTOR_APPEAR_TIMEOUT_S = 3.0
+_PERM_SELECTOR_REPRESS_AFTER_S = 2.0
 
 
 def _composer_region(screen: str) -> str:
@@ -446,17 +730,24 @@ def _composer_region(screen: str) -> str:
 class NativeDialogMatch:
     """A detected actionable native claude TUI dialog.
 
-    ``options`` is the verbatim numbered list pulled from the pane, in
-    pane order. ``selected_row_index`` is 0-based — the row claude
-    rendered with the highlight cursor (default-pick). ``fingerprint``
-    is a stable string the watcher uses to dedup repeated polls of the
-    same on-screen dialog.
+    ``options`` is the verbatim option list pulled from the pane, in pane
+    order. ``selected_row_index`` is 0-based — the row claude rendered with
+    the highlight cursor (default-pick). ``fingerprint`` is a stable string
+    the watcher uses to dedup repeated polls of the same on-screen dialog.
+
+    ``numbered`` says how the pane will accept the pick. Claude renders two
+    shapes behind the same ``Enter to confirm · Esc to cancel`` hint: a
+    numbered list (``/model``), whose row digit commits it from anywhere, and
+    a cursor-only list (``/chrome``), which has no digits and only moves under
+    the arrow keys. Driving the second as if it were the first types a stray
+    digit into the dialog and leaves it open.
     """
 
     __slots__ = (
         "fingerprint",
         "header",
         "name",
+        "numbered",
         "options",
         "question",
         "selected_row_index",
@@ -471,6 +762,7 @@ class NativeDialogMatch:
         options: list[dict[str, str]],
         fingerprint: str,
         selected_row_index: int,
+        numbered: bool = True,
     ) -> None:
         self.name = name
         self.question = question
@@ -478,6 +770,7 @@ class NativeDialogMatch:
         self.options = options
         self.fingerprint = fingerprint
         self.selected_row_index = selected_row_index
+        self.numbered = numbered
 
 
 def _native_dialog_should_skip(screen: str) -> bool:
@@ -499,6 +792,159 @@ def _parse_numbered_options(
         if m:
             rows.append((int(m.group(2)), m.group(1) is not None, m.group(3).strip()))
     return rows
+
+
+_SELECTOR_CONFIRM_HINTS = (
+    "Enter to confirm",
+    "Esc to cancel",
+    "Enter to choose",
+    _SESSION_SCOPED_CONFIRM_MARKER,
+)
+
+
+def _selector_block_options(screen: str) -> list[tuple[int, bool, str]]:
+    """Numbered rows that actually form a rendered selector, else empty.
+
+    A claude selector is a contiguous run of rows numbered from 1, with its
+    keyboard hint on a line BELOW them. A numbered list in the agent's own
+    prose satisfies none of that once it is checked, which is the whole point:
+    ``_parse_numbered_options`` alone matched any "1." in any message and made
+    a normal reply look like a dialog.
+
+    Rows may be more than one line apart — a long option label wraps — but only
+    across CONTINUATION lines. Prose separates its list items with a blank
+    line, a selector never does, and that is the difference that decides it.
+    """
+    lines = screen.splitlines()
+    numbered: list[tuple[int, int, bool, str]] = []
+    for i, line in enumerate(lines):
+        m = _NATIVE_DIALOG_OPTION_RE.match(line)
+        if m:
+            numbered.append(
+                (i, int(m.group(2)), m.group(1) is not None, m.group(3).strip())
+            )
+    if not numbered:
+        return []
+
+    # Take the LAST contiguous run — a dialog is the bottom-most thing drawn,
+    # anything above it is transcript.
+    run: list[tuple[int, int, bool, str]] = [numbered[-1]]
+    for prev in reversed(numbered[:-1]):
+        head = run[0]
+        wrapped = all(lines[j].strip() for j in range(prev[0] + 1, head[0]))
+        if prev[1] == head[1] - 1 and wrapped:
+            run.insert(0, prev)
+        else:
+            break
+    # A real selector offers a choice: one row is prose, not a dialog.
+    if len(run) < 2 or run[0][1] != 1:
+        return []
+    if not any(
+        hint in "\n".join(lines[run[-1][0] + 1 :]) for hint in _SELECTOR_CONFIRM_HINTS
+    ):
+        return []
+    return [(num, hl, label) for _, num, hl, label in run]
+
+
+def _dialog_title(screen: str, first_label: str) -> str | None:
+    """The heading a cursor-list dialog is drawn under, if there is one.
+
+    Claude opens these panels with a full-width rule and puts the title on the
+    line straight after it, so the title is the first content line above the
+    options once the rule is crossed. The line directly above the list is a
+    detail row (``Extension: Installed``) and makes a poor question.
+    """
+    lines = screen.splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines) if ln.strip().endswith(first_label)), None
+    )
+    if start is None:
+        return None
+    title: str | None = None
+    for line in reversed(lines[:start]):
+        text = line.strip()
+        if not text:
+            continue
+        if all(c in "─▔▁_=*" for c in text):
+            return title
+        title = text
+    return None
+
+
+def _cursor_block_options(screen: str) -> list[tuple[int, bool, str]]:
+    """Rows of a cursor-only selector (no row numbers), else empty.
+
+    ``/chrome`` renders its actions as a plain indented list with a single
+    ``❯`` marking the highlight and no digits anywhere::
+
+           ❯ Select browser…
+             Manage permissions
+             Reconnect extension
+
+    ``_selector_block_options`` sees nothing here, so the dialog was never
+    bridged: the pane sat on an open dialog nobody in Telegram could answer,
+    and the next turn died on ``tmux_prompt_submit_unconfirmed``.
+
+    The block is anchored on the cursor row and grown through its contiguous
+    neighbours that start in the same column — the alignment claude uses to
+    draw the list, and the thing prose never reproduces. A rule or the
+    keyboard hint under the list ends the block rather than joining it.
+
+    ``_NATIVE_DIALOG_CURSOR_RE`` requires the row to be indented: claude's own
+    composer prompt is a bare ``❯`` in column 0, and reading that as an option
+    row would turn every idle pane into a dialog.
+    """
+    lines = screen.splitlines()
+    anchor = None
+    for i in range(len(lines) - 1, -1, -1):
+        m = _NATIVE_DIALOG_CURSOR_RE.match(lines[i])
+        if m and not _NATIVE_DIALOG_OPTION_RE.match(lines[i]):
+            anchor = (i, len(m.group(1)) + 2, m.group(2))
+            break
+    if anchor is None:
+        return []
+    idx, col, label = anchor
+
+    def sibling(line: str) -> str | None:
+        if len(line) <= col or not line[:col].isspace() or line[col].isspace():
+            return None
+        text = line[col:].strip()
+        if not text or all(c in "─-_=*·" for c in text):
+            return None
+        return text
+
+    rows = [(True, label)]
+    for j in range(idx - 1, -1, -1):
+        text = sibling(lines[j])
+        if text is None or _NATIVE_DIALOG_CURSOR_RE.match(lines[j]):
+            break
+        rows.insert(0, (False, text))
+    last = idx
+    for j in range(idx + 1, len(lines)):
+        text = sibling(lines[j])
+        if text is None or _NATIVE_DIALOG_CURSOR_RE.match(lines[j]):
+            break
+        rows.append((False, text))
+        last = j
+    if len(rows) < 2:
+        return []
+    if not any(
+        hint in "\n".join(lines[last + 1 :]) for hint in _SELECTOR_CONFIRM_HINTS
+    ):
+        return []
+    return [(n + 1, hl, text) for n, (hl, text) in enumerate(rows)]
+
+
+def _dialog_block_options(screen: str) -> tuple[list[tuple[int, bool, str]], bool]:
+    """The dialog's option rows plus whether the pane numbers them.
+
+    Numbered wins: it is the shape whose digits commit a pick from anywhere,
+    so it must keep its existing drive even when a stray ``❯`` is on screen.
+    """
+    rows = _selector_block_options(screen)
+    if rows:
+        return rows, True
+    return _cursor_block_options(screen), False
 
 
 def _detect_native_dialog(screen: str) -> NativeDialogMatch | None:
@@ -561,13 +1007,20 @@ def _detect_native_dialog(screen: str) -> NativeDialogMatch | None:
 
     # Generic fallback: any pane state with a numbered-option list and a
     # known confirm-keyboard hint we don't already handle.
+    #
+    # Both halves must belong to the SAME rendered block. Matching a numbered
+    # list anywhere on screen against a hint anywhere on screen made ordinary
+    # assistant prose a dialog: a reply containing "1. …" / "2. …" under a
+    # lingering "Esc to cancel" was bridged as a question, blocked the turn on
+    # an answer nobody could give, stored the scraped prose as a user message,
+    # and then drove its "chosen row" as a keystroke into the live agent.
     has_confirm_hint = (
         "Enter to confirm" in screen
         or "Esc to cancel" in screen
         or "Enter to choose" in screen
         or _SESSION_SCOPED_CONFIRM_MARKER in screen
     )
-    rows = _parse_numbered_options(screen)
+    rows, numbered = _dialog_block_options(screen)
     if has_confirm_hint and rows:
         options = [{"label": label} for _, _, label in rows]
         selected = next((i for i, (_, hl, _) in enumerate(rows) if hl), 0)
@@ -583,6 +1036,8 @@ def _detect_native_dialog(screen: str) -> NativeDialogMatch | None:
                 if candidate and not all(c in "─-_=*" for c in candidate):
                     question = candidate
                 break
+        else:
+            question = _dialog_title(screen, rows[0][2]) or question
         labels_fp = "|".join(o["label"] for o in options)
         return NativeDialogMatch(
             name="generic_native_dialog",
@@ -591,9 +1046,29 @@ def _detect_native_dialog(screen: str) -> NativeDialogMatch | None:
             options=options,
             fingerprint=f"generic:{labels_fp}",
             selected_row_index=selected,
+            numbered=numbered,
         )
 
     return None
+
+
+@dataclass(frozen=True)
+class PolicyBlock:
+    """The tool call leashd denied, kept so the turn it ended can name it.
+
+    Claude Code answers a hook ``deny`` by aborting the WHOLE turn — the model
+    is handed "the tool use was rejected ... STOP what you are doing and wait
+    for the user" plus a ``[Request interrupted by user for tool use]`` marker
+    — so a policy deny and a stray keystroke reach the user as the same
+    truncated reply. Without this record leashd cannot tell them apart either,
+    and reports a decision the user's own policy made as an anonymous
+    interruption.
+    """
+
+    tool_name: str
+    description: str
+    reason: str
+    inline: bool = False
 
 
 class TmuxTurn:
@@ -626,6 +1101,8 @@ class TmuxTurn:
         # leashd turn, so the follow-up's response merges into this same turn.
         # See TmuxAgent.inject_followup and complete() below.
         self.pending_followups: int = 0
+        self.pending_followup_texts: list[str] = []
+        self._followup_release_owed: bool = False
         # Per-response dedup: the Stop hook AND the JSONL `result` line both
         # fire for one response, both routing through complete(). This flips
         # True on the first completion signal of a response and back to False
@@ -704,8 +1181,75 @@ class TmuxTurn:
         self._activity_claims_jsonl[key] = self._activity_claims_jsonl.get(key, 0) + 1
         return True
 
+    def _claim_followup_text(self, content: str | None) -> bool:
+        """True when this drained queue item is one leashd injected, claiming
+        it so a repeat cannot claim it twice.
+
+        A drain with no text at all is claimed only when leashd is holding a
+        credit and has nothing to match against — the hang this guards is worse
+        than the early finalize, and every ``remove`` measured so far carries
+        its content.
+        """
+        normalized = " ".join(content.split()) if content else ""
+        if not normalized:
+            return not self.pending_followup_texts
+        for i, pending in enumerate(self.pending_followup_texts):
+            if pending == normalized:
+                del self.pending_followup_texts[i]
+                return True
+        return False
+
+    def release_followup(self, content: str | None) -> bool:
+        """Give back one ``pending_followups`` credit: claude drained a queued
+        follow-up without starting a response of its own for it.
+
+        ``content`` is the drained item's text. Claude puts its own traffic
+        through the same queue — every background ``<task-notification>`` is
+        enqueued and drained the same way, and those outnumber human follow-ups
+        in the transcript corpus — so a credit is only given back for text
+        leashd actually injected. An unmatched drain is claude's own and is
+        ignored; releasing on it would end the turn while the real follow-up
+        was still unanswered.
+
+        Claude Code empties its native queue two ways, and only one of them
+        matches what ``inject_followup`` bet on. ``dequeue`` runs the item as
+        its own prompt, so it does produce the extra completion signal the
+        counter is holding a slot for. ``remove`` does not — with
+        ``reason: absorbed_mid_turn`` claude folds the text into the response
+        already in flight, so the whole pair finishes on ONE signal. Left
+        uncorrected the counter swallows that signal, ``stop_event`` is never
+        set, and the turn hangs until a backstop or ``/stop`` — the chat gets
+        no reply to either the original message or the follow-up (measured
+        live on CLI 2.1.251).
+
+        Returns True when the caller should finalize the turn: with no credit
+        left to give back and a completion already spent on this response, the
+        queue record lost the race with the Stop hook and nothing else is
+        coming. A live ``/goal`` is the exception — it owns the deferral and
+        starts its own next turn, so finalizing there would cut the run short.
+        """
+        if self.stop_event.is_set():
+            return False
+        if not self._claim_followup_text(content):
+            return False
+        if self.pending_followups > 0:
+            self.pending_followups -= 1
+            return False
+        if self._completion_seen_this_response and not (
+            self.goal_active_cb is not None and self.goal_active_cb()
+        ):
+            self._followup_release_owed = True
+            return True
+        return False
+
     def complete(self, *, is_error: bool = False) -> None:
         if self.stop_event.is_set():
+            return
+        if self._followup_release_owed:
+            self._followup_release_owed = False
+            self.is_error = self.is_error or is_error
+            self.duration_ms = int((time.monotonic() - self._started) * 1000)
+            self.stop_event.set()
             return
         if not is_error:
             # The Stop hook AND the JSONL `result` line both fire for one
@@ -787,6 +1331,12 @@ class TmuxClaudeSession:
         # the reuse path on subsequent turns picks the right system-prompt
         # banner without re-deriving the model.
         self.native_auto_active: bool = False
+        # Policy rule names mirrored into this pane's ``permissions.ask``. A
+        # verdict from one of these may be handed to claude's native prompt
+        # instead of blocking on the PreToolUse hook it ignores under `auto`.
+        # Pinned at spawn because the settings file is written once, there: an
+        # in-flight pane keeps the rules it was actually started with.
+        self.native_ask_rules: frozenset[str] = frozenset()
         # True while a Claude Code ``/goal`` runs in this pane. Seeded
         # optimistically by TmuxAgent.inject_goal (leashd owns all pane input,
         # so it authoritatively knows when a goal starts) and cleared by the
@@ -802,6 +1352,7 @@ class TmuxClaudeSession:
         # task_description (parity with the engine, which passes the user
         # message text; see engine handle_message task_description=text).
         self.last_prompt = ""
+        self.followup_enqueued_at: float | None = None
         self._typing = typing or HumanTypingProfile()
         self._rng = random.Random(self._typing.seed)  # noqa: S311
         self.tmux_name = tmux_name
@@ -818,6 +1369,12 @@ class TmuxClaudeSession:
         self._tmux_session: Any = None  # libtmux.Session
         self._pane: Any = None  # libtmux.Pane
         self.jsonl_task: asyncio.Task[None] | None = None
+        # The tailer behind ``jsonl_task``. Kept so a shutdown can persist the
+        # read position into the pane manifest and the next daemon can resume
+        # the transcript where this one stopped instead of replaying it.
+        self.jsonl_tailer: Any = None
+        # True for a session rebuilt from a manifest rather than spawned here.
+        self.adopted: bool = False
         # In-flight tool-decision registry — collapses the PreToolUse +
         # PermissionRequest double-gate. Claude Code 2.1.144 fires BOTH hooks
         # for one tool whenever its own classifier routes the call through the
@@ -834,6 +1391,13 @@ class TmuxClaudeSession:
         self._question_drive_active = False
         # Same guard for the ExitPlanMode plan-approval dialog drive.
         self._plan_drive_active = False
+        # Same guard for the native permission selector drive.
+        self._perm_drive_active = False
+        # The policy deny that ended this turn, if the turn ended on one. Set
+        # by every tool decision (a deny records, anything else clears), so it
+        # survives only while the block really is the LAST thing that happened
+        # — an agent that went on to run more tools was not stopped by it.
+        self.policy_block: PolicyBlock | None = None
         # The --append-system-prompt the live claude was spawned with. It is
         # fixed for the process lifetime, so the agent re-delivers a changed
         # instruction in-band (see TmuxAgent.execute reused-pane branch).
@@ -1094,17 +1658,35 @@ class TmuxClaudeSession:
             self.last_screen_at = time.monotonic()
         return screen
 
-    # Claude Code TUI is interactive once the composer hint line is drawn.
-    # Includes the bypass-mode footer ``⏵⏵ bypass permissions on`` so a tmux
-    # session spawned with ``--permission-mode bypassPermissions`` is
-    # detected as ready.
-    _READY_MARKERS = (
-        "shift+tab to cycle",
-        "for shortcuts",
-        "esc to interrupt",
-        "bypass permissions on",
+    _MODE_INDICATOR_RE = re.compile(r"(?:⏵⏵|⏸)\s+[A-Za-z][A-Za-z ]*\bon\b")
+    _FOOTER_SCAN_LINES = 3
+    # claude's folder-trust gate, across both wordings the CLI has shipped:
+    # the legacy "Do you trust the files in this folder?" prompt and the
+    # 2.1.2xx "Accessing workspace / Quick safety check" workspace dialog that
+    # additionally enumerates what ``.claude/settings.local.json`` pre-approves.
+    #
+    #     ❯ No, exit
+    #       Yes, I trust this folder
+    #     Enter to confirm · Esc to cancel
+    #
+    # Two things about that dialog are load-bearing. Its rows carry **no
+    # numeric prefixes**, so the digit-then-Enter drive used for the bypass
+    # dialog cannot reach the affirmative row; and the highlighted default is
+    # **"No, exit"**, so a blind Enter — what leashd sent while the older
+    # wording was the only one it knew — quits claude instead of proceeding.
+    # Escape is the same exit by another name. So the drive here moves the
+    # cursor onto the affirmative row and confirms only once it has *seen* it
+    # land there (:meth:`accept_trust_prompt`), and the stray-dialog escape
+    # hatch refuses to touch this dialog at all.
+    _TRUST_MARKERS = (
+        "Do you trust the files",
+        "trust the files in this folder",
+        "Yes, I trust this folder",
+        "Quick safety check",
     )
-    _TRUST_MARKERS = ("Do you trust the files", "trust the files in this folder")
+    _TRUST_AFFIRMATIVE_MARKERS = ("Yes, I trust this folder", "Yes, proceed")
+    _OPTION_CURSOR = "❯"
+    _TRUST_MAX_MOVES = 6
     # claude TUI shows a one-time consent dialog the first time the CLI runs
     # in ``--permission-mode bypassPermissions``:
     #
@@ -1126,6 +1708,84 @@ class TmuxClaudeSession:
     _RESUME_PICKER_MARKERS = ("Resume from summary", "Resume full session as-is")
     _IDLE_MARKERS = ("shift+tab to cycle", "for shortcuts", "bypass permissions on")
 
+    def composer_footer_present(self, screen: str) -> bool:
+        """Is the composer's footer line on screen — the pane's "I can take a
+        prompt" signal?
+
+        Keying this on the footer's *hints* is what made a healthy pane look
+        dead. claude budgets that line, and a running background shell spends
+        the budget: ``⏵⏵ auto mode on (shift+tab to cycle) · ← for agents``
+        becomes ``⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage`` —
+        the hint every marker matched on is gone, in every permission mode
+        (``manual`` loses ``? for shortcuts`` the same way). The pane is idle
+        at an empty composer, but ``await_ready`` spun for its whole timeout
+        and the user's message was dropped with "never reached the prompt".
+
+        The mode indicator is the one segment that survives every variant, so
+        match that, scanning only the footer region: a dialog *replaces* the
+        footer with its own ``Esc to cancel`` line, and that must keep reading
+        as not-a-composer or leashd types prompt text into a selector. The
+        literal hints stay as the fallback for wordings that draw no indicator.
+        """
+        if any(m in screen for m in self._IDLE_MARKERS):
+            return True
+        lines = [ln for ln in screen.splitlines() if ln.strip()]
+        return any(
+            self._MODE_INDICATOR_RE.search(ln)
+            for ln in lines[-self._FOOTER_SCAN_LINES :]
+        )
+
+    def trust_prompt_present(self, screen: str | None = None) -> bool:
+        """Is claude's folder-trust gate on screen?
+
+        Answering it wrong — Enter on the default row, or Escape — exits
+        claude, so every drive that types into the pane has to be able to
+        recognise it.
+        """
+        s = self.capture() if screen is None else screen
+        return any(m in s for m in self._TRUST_MARKERS)
+
+    def _cursor_on_affirmative(self, screen: str, affirmatives: Sequence[str]) -> bool:
+        """Is the selection cursor sitting on an affirmative option row?
+
+        ``capture-pane -p`` drops terminal attributes, so the ``❯`` glyph is
+        the only surviving evidence of which row is selected. No cursor found
+        means "cannot tell", which reads the same as "not on the affirmative
+        row" — a caller must never confirm on that.
+        """
+        for line in screen.splitlines():
+            if self._OPTION_CURSOR in line:
+                return any(a in line for a in affirmatives)
+        return False
+
+    async def accept_trust_prompt(self) -> bool:
+        """Move the trust dialog's cursor onto "yes" and confirm.
+
+        Confirms only from a re-read screen that shows the cursor on the
+        affirmative row; if it never gets there the dialog is left untouched
+        and the pane stays alive for the ready-timeout to report. Pressing
+        Enter hopefully, or Escaping to get the dialog out of the way, both
+        mean ``claude`` exits and the turn dies as
+        ``paste-buffer failed: target pane has exited``.
+        """
+        for _ in range(self._TRUST_MAX_MOVES):
+            screen = self.capture()
+            if not self.trust_prompt_present(screen):
+                return True
+            if self._cursor_on_affirmative(screen, self._TRUST_AFFIRMATIVE_MARKERS):
+                self.send_keys("Enter", literal=False)
+                logger.info("tmux_trust_prompt_accepted", tmux_name=self.tmux_name)
+                await asyncio.sleep(1.0)
+                return True
+            self.send_keys("Down", literal=False)
+            await asyncio.sleep(0.4)
+        logger.warning(
+            "tmux_trust_prompt_unresolved",
+            tmux_name=self.tmux_name,
+            working_directory=self.working_directory,
+        )
+        return False
+
     async def await_ready(self, timeout: float) -> bool:
         """Block until the Claude Code TUI can accept a prompt.
 
@@ -1138,12 +1798,15 @@ class TmuxClaudeSession:
         deadline = time.monotonic() + timeout
         bypass_handled = False
         resume_handled = False
+        trust_handled = False
         while time.monotonic() < deadline:
             screen = self.capture()
-            if any(m in screen for m in self._TRUST_MARKERS):
-                # Accept the trust prompt (default highlighted = proceed).
-                self.send_keys("Enter", literal=False)
-                await asyncio.sleep(0.6)
+            if self.trust_prompt_present(screen):
+                if not trust_handled:
+                    trust_handled = True
+                    await self.accept_trust_prompt()
+                    continue
+                await asyncio.sleep(0.4)
                 continue
             if not resume_handled and all(
                 m in screen for m in self._RESUME_PICKER_MARKERS
@@ -1160,8 +1823,9 @@ class TmuxClaudeSession:
                 await asyncio.sleep(1.0)
                 while time.monotonic() < deadline:
                     drained = self.capture()
-                    if "esc to interrupt" not in drained and any(
-                        m in drained for m in self._IDLE_MARKERS
+                    if (
+                        "esc to interrupt" not in drained
+                        and self.composer_footer_present(drained)
                     ):
                         break
                     await asyncio.sleep(0.4)
@@ -1182,10 +1846,15 @@ class TmuxClaudeSession:
                 bypass_handled = True
                 await asyncio.sleep(1.5)
                 continue
-            if any(m in screen for m in self._READY_MARKERS):
+            if "esc to interrupt" in screen or self.composer_footer_present(screen):
                 return True
             await asyncio.sleep(0.4)
-        logger.warning("tmux_pane_ready_timeout", tmux_name=self.tmux_name)
+        logger.warning(
+            "tmux_pane_ready_timeout",
+            tmux_name=self.tmux_name,
+            trust_prompt=self.trust_prompt_present(),
+            **self.death_report(),
+        )
         return False
 
     def _composer_accepts_input(self, screen: str) -> bool:
@@ -1211,6 +1880,13 @@ class TmuxClaudeSession:
         permission / plan) are never escaped — they belong to a pending
         human flow the engine gates messages behind; a stuck one is only
         logged, matching the previous behaviour.
+
+        Neither is the folder-trust gate, and for a harder reason: Escape
+        there is "cancel", which is how ``claude`` is asked to quit. A pane
+        that reached this point still showing it has already failed
+        ``await_ready``; escaping it turns a recoverable "not ready" into a
+        dead pane, which is exactly how an untrusted working directory came
+        back as ``paste-buffer failed: target pane has exited``.
         """
         deadline = time.monotonic() + _STRAY_DIALOG_WAIT_S
         while time.monotonic() < deadline:
@@ -1221,6 +1897,13 @@ class TmuxClaudeSession:
         for _ in range(2):
             screen = self.capture()
             if self._composer_accepts_input(screen):
+                return
+            if self.trust_prompt_present(screen):
+                logger.warning(
+                    "tmux_submit_with_trust_prompt_on_screen",
+                    tmux_name=self.tmux_name,
+                    working_directory=self.working_directory,
+                )
                 return
             if self.dedicated_selector_present(screen):
                 logger.warning(
@@ -1234,7 +1917,16 @@ class TmuxClaudeSession:
 
     async def submit(
         self, text: str, *, max_enter_presses: int = 5, plain_keys: bool = False
-    ) -> None:
+    ) -> bool:
+        """Type a prompt into the composer and send it. True when claude has it.
+
+        False means the text is still sitting in the composer after every
+        Enter press — claude never received it. A caller that changed state on
+        the assumption the prompt was queued has to undo that: a mid-turn
+        follow-up counted in ``TmuxTurn.pending_followups`` would otherwise
+        swallow the turn's own completion signal waiting for a response to a
+        prompt claude was never given, and the turn goes mute for good.
+        """
         await self._dismiss_stray_dialog()
         self._maybe_update_goal_state(text)
         if plain_keys:
@@ -1248,7 +1940,8 @@ class TmuxClaudeSession:
                 logger.warning(
                     "tmux_prompt_submit_unconfirmed", tmux_name=self.tmux_name
                 )
-            return
+                return False
+            return True
         logger.warning(
             "tmux_prompt_delivery_lost_retyping",
             tmux_name=self.tmux_name,
@@ -1261,6 +1954,18 @@ class TmuxClaudeSession:
         await asyncio.sleep(0.5)
         if await self._drive_submission(text, max_enter_presses) is not True:
             logger.warning("tmux_prompt_submit_unconfirmed", tmux_name=self.tmux_name)
+            return False
+        return True
+
+    def clear_composer(self) -> None:
+        """Wipe an unsent prompt out of the composer.
+
+        Used where a submit is abandoned and the text will be delivered again
+        as its own turn: left behind, it is typed on top of and claude receives
+        the two runs concatenated.
+        """
+        with contextlib.suppress(Exception):
+            self.send_keys("C-u", literal=False)
 
     async def _drive_submission(self, text: str, max_enter_presses: int) -> bool | None:
         """Press Enter and verify the prompt actually went somewhere.
@@ -1314,6 +2019,8 @@ class TmuxClaudeSession:
     # as not run and continues, which matches a leashd deny.
     _PERM_ACCEPT_ROW_MARKERS = ("❯ 1.", "❯ 1. Yes", "1. Yes")
 
+    _PERM_OPTION_ROW_RE = re.compile(r"^\s*(?:❯\s*)?\d+\.\s")
+
     def perm_selector_present(self, screen: str | None = None) -> bool:
         """Is claude's native in-pane permission selector currently shown?"""
         s = self.capture() if screen is None else screen
@@ -1323,7 +2030,70 @@ class TmuxClaudeSession:
         # echoes "Do you want to proceed?" is not mistaken for the selector.
         return ("1. Yes" in s or "❯ 1." in s) and ("2. No" in s or "2. " in s)
 
-    async def answer_perm_selector(self, *, allow: bool, timeout: float = 8.0) -> bool:
+    def perm_selector_signature(self, screen: str | None = None) -> str | None:
+        """Which permission dialog is on screen, or None if none is.
+
+        The dialog block is the run of non-empty lines around the question
+        line, ending at its last numbered option row: the header, the command
+        under review, its description, the question and the options. That body
+        is what tells one rendered dialog from the next, and none of it ticks —
+        so the same live dialog keeps one signature across polls while two tool
+        calls never share one. The highlight arrow is dropped so moving the
+        selection is not a new dialog.
+
+        This is the only thing that separates a live dialog from the dismissed
+        one still painted in the pane behind it, which ``perm_selector_present``
+        cannot: both read as present.
+        """
+        s = self.capture() if screen is None else screen
+        if not self.perm_selector_present(s):
+            return None
+        lines = s.splitlines()
+        anchor = next(
+            (
+                i
+                for i, ln in enumerate(lines)
+                if any(m in ln for m in self._PERM_SELECTOR_MARKERS)
+            ),
+            None,
+        )
+        if anchor is None:
+            return None
+        floor = max(0, anchor - _PERM_SELECTOR_LOOKBACK_LINES)
+        start = anchor
+        while start > floor and lines[start - 1].strip():
+            start -= 1
+        end = anchor
+        for i in range(anchor + 1, len(lines)):
+            if not lines[i].strip():
+                break
+            if self._PERM_OPTION_ROW_RE.match(lines[i]):
+                end = i
+        return "\n".join(ln.replace("❯", " ").strip() for ln in lines[start : end + 1])
+
+    @property
+    def answer_drive_active(self) -> bool:
+        """Is leashd currently typing a human decision into a native dialog?
+
+        The pane reads as an idle composer for the fraction of a second between
+        dismissing one dialog page and submitting the next answer, and the JSONL
+        emits nothing for keystrokes leashd sends itself. Without this the turn
+        watchdog reads that gap as a finished turn and force-completes it,
+        dropping everything claude goes on to do with the answer.
+        """
+        return (
+            self._question_drive_active
+            or self._plan_drive_active
+            or self._perm_drive_active
+        )
+
+    async def answer_perm_selector(
+        self,
+        *,
+        allow: bool,
+        timeout: float = 8.0,
+        appear_timeout: float = _PERM_SELECTOR_APPEAR_TIMEOUT_S,
+    ) -> bool:
         """Drive the native permission selector to match leashd's decision.
 
         Idempotent and screen-gated: only acts while the selector is actually
@@ -1332,36 +2102,145 @@ class TmuxClaudeSession:
         harmless no-op. ``allow`` → press Enter on the highlighted accept row;
         deny → Escape (cancel). Returns True iff it observed and answered the
         selector. Mirrors the ``await_ready`` trust-prompt drive pattern.
+
+        One keystroke per *rendered dialog*, keyed on
+        ``perm_selector_signature``, never one per invocation. A dismissed
+        dialog stays painted in the visible pane, so presence alone keeps
+        reading True after it is answered, and re-pressing on that reading does
+        not reach a dialog — it reaches the live agent, where Escape interrupts
+        the turn. Signatures separate the two: the same block is pressed once,
+        a different block is a different dialog and gets its own press. The one
+        exception, an allow whose dialog is still modal seconds later, is
+        :meth:`_perm_press_due`.
+
+        Pressing once per *invocation* instead is what wedged a turn for 67
+        minutes. This drive starts within milliseconds of the hook verdict,
+        before claude has painted the dialog for THIS call, so the single press
+        was spent on the previous call's leftover block; the real dialog
+        rendered a beat later into a drive that had already retired itself, and
+        claude blocked on a keystroke nobody would ever send. ``defer`` makes
+        that the norm, not a corner: claude owns the prompt and renders it.
+
+        ``_PERM_SELECTOR_MAX_PRESSES`` caps the whole invocation regardless, so
+        a screen that somehow keeps changing costs two keystrokes rather than
+        the 13-18 Escapes of the storm this replaced.
+
+        ``appear_timeout`` bounds the wait for the FIRST dialog, separately
+        from the total window. Claude paints this call's dialog concurrently
+        with the hook, so a dialog that first appears long after the verdict
+        belongs to a LATER tool call, and pressing it is a decision leashd
+        never made. A denied tool is usually never prompted for at all, so the
+        drive sat out its whole window and then spent its Escape on the next
+        call's dialog — the interrupt read back as "the agent stopped
+        mid-turn", 8s after a tool leashd had already stopped. Retiring
+        unpressed is free for a deny (the hook already blocked the tool) and
+        the safe side of the trade for an allow (a keystroke on someone else's
+        dialog approves a call nobody reviewed).
+
+        Guarded against the PreToolUse + PermissionRequest double-fire, like
+        the plan and question drives. BOTH hooks spawn a drive for one tool
+        call — ``on_pre_tool`` for the decision it made, ``on_permission_request``
+        for the same decision it deduped — and the press bookkeeping is local to
+        one invocation, so two concurrent drives each held their own and each
+        pressed. The second Escape lands after claude dismissed the dialog, so
+        it reaches the live agent and interrupts the turn.
         """
-        deadline = time.monotonic() + timeout
-        answered = False
-        while time.monotonic() < deadline:
-            screen = self.capture()
-            if not self.perm_selector_present(screen):
-                # Either it never rendered (hook alone sufficed) or we already
-                # answered it — both are success once we've acted, otherwise
-                # keep briefly polling for a slow render.
-                if answered:
-                    return True
-                await asyncio.sleep(0.3)
-                continue
-            try:
-                if allow:
-                    self.send_keys("Enter", literal=False)
-                else:
-                    self.send_keys("Escape", literal=False)
-            except AgentError:
-                return answered
-            answered = True
-            logger.info(
-                "tmux_perm_selector_answered",
-                tmux_name=self.tmux_name,
-                allow=allow,
-            )
-            await asyncio.sleep(0.6)
-            if not self.perm_selector_present():
-                return True
-        return answered
+        if self._perm_drive_active:
+            return False
+        self._perm_drive_active = True
+        key = "Enter" if allow else "Escape"
+        try:
+            deadline = time.monotonic() + timeout
+            appear_deadline = time.monotonic() + appear_timeout
+            pressed_at: dict[str, float] = {}
+            presses = 0
+            while time.monotonic() < deadline:
+                screen = self.capture()
+                signature = self.perm_selector_signature(screen)
+                if signature is None:
+                    if pressed_at:
+                        return True
+                    if time.monotonic() >= appear_deadline:
+                        logger.info(
+                            "tmux_perm_selector_never_rendered",
+                            tmux_name=self.tmux_name,
+                            allow=allow,
+                        )
+                        return False
+                    await asyncio.sleep(0.3)
+                    continue
+                if presses >= _PERM_SELECTOR_MAX_PRESSES or not self._perm_press_due(
+                    signature, pressed_at, screen, allow=allow
+                ):
+                    await asyncio.sleep(0.3)
+                    continue
+                try:
+                    self.send_keys(key, literal=False)
+                except AgentError:
+                    return presses > 0
+                presses += 1
+                repress = signature in pressed_at
+                pressed_at[signature] = time.monotonic()
+                logger.info(
+                    "tmux_perm_selector_answered",
+                    tmux_name=self.tmux_name,
+                    allow=allow,
+                    press=presses,
+                    repress=repress,
+                )
+                await asyncio.sleep(0.6)
+            if pressed_at and self.perm_selector_present():
+                logger.warning(
+                    "tmux_perm_selector_unconfirmed",
+                    tmux_name=self.tmux_name,
+                    allow=allow,
+                    presses=presses,
+                )
+            return presses > 0
+        finally:
+            self._perm_drive_active = False
+
+    def _perm_press_due(
+        self,
+        signature: str,
+        pressed_at: dict[str, float],
+        screen: str,
+        *,
+        allow: bool,
+    ) -> bool:
+        """May this rendered dialog be pressed now?
+
+        A signature not yet pressed always may. A signature already pressed
+        normally may not — that rule is what stopped the keystroke storm, since
+        a dismissed dialog stays painted and re-pressing it reaches the live
+        agent instead.
+
+        But it cannot tell an answered dialog from a press claude swallowed,
+        and it resolved that ambiguity as answered. The drive fires within
+        milliseconds of the hook verdict, which is the same instant claude
+        paints the dialog, so the keystroke can land before the dialog is
+        listening. Then every later poll reads that same signature, skips it as
+        already pressed, and the drive retires having answered nothing — an ssh
+        docker build sat on an auto-approved dialog for 5m47s until the user
+        typed into the chat, which is the only thing that released it.
+
+        A still-modal pane is what separates the two: once the press lands
+        claude either resumes the turn or returns to the composer, and
+        ``_composer_accepts_input`` sees both. So a repeat press is allowed
+        only while the pane still accepts nothing else, and only after
+        ``_PERM_SELECTOR_REPRESS_AFTER_S`` so the check is not racing the
+        repaint. Enter only: a stray Enter on a live composer submits nothing,
+        while a stray Escape interrupts the turn, which is the failure this
+        drive already had to be taught not to cause.
+        """
+        last = pressed_at.get(signature)
+        if last is None:
+            return True
+        if not allow:
+            return False
+        if time.monotonic() - last < _PERM_SELECTOR_REPRESS_AFTER_S:
+            return False
+        return not self._composer_accepts_input(screen)
 
     # Native AskUserQuestion selector — distinct from the binary permission
     # prompt above: a numbered option list under a
@@ -1550,10 +2429,39 @@ class TmuxClaudeSession:
         )
 
     def is_idle_at_composer(self, screen: str | None = None) -> bool:
-        """True iff the pane shows the idle composer — a ready footer marker and
+        """True iff the pane shows the idle composer — its footer line drawn and
         no ``esc to interrupt`` (claude is done, not mid-turn)."""
         s = self.capture() if screen is None else screen
-        return "esc to interrupt" not in s and any(m in s for m in self._IDLE_MARKERS)
+        return "esc to interrupt" not in s and self.composer_footer_present(s)
+
+    _INTERRUPT_MARKERS = (
+        "Interrupted · What should Claude do instead?",
+        "Interrupted by user",
+    )
+
+    def was_interrupted(self, screen: str | None = None) -> bool:
+        """True iff the newest transcript entry is an aborted tool call.
+
+        An Escape that reaches the live agent instead of a dialog aborts the
+        tool and leaves one of these lines behind. The pane then reads as a
+        perfectly normal idle composer, so the completion backstop cannot tell
+        an interrupted turn from a finished one and the chat gets a bare tool
+        summary with no explanation ("terminated for no reason").
+
+        An interrupt from an EARLIER turn can still be on screen, so the marker
+        alone is not enough: the turn only ended on the interrupt if claude
+        emitted no assistant bullet (``⏺``) after it.
+        """
+        s = self.capture() if screen is None else screen
+        lines = s.splitlines()
+        last_interrupt = -1
+        last_bullet = -1
+        for i, line in enumerate(lines):
+            if any(m in line for m in self._INTERRUPT_MARKERS):
+                last_interrupt = i
+            if line.lstrip().startswith("⏺"):
+                last_bullet = i
+        return last_interrupt >= 0 and last_bullet < last_interrupt
 
     def _plan_target_row(self, screen: str, target_mode: str) -> int:
         """The plan-dialog row to select. Row ORDER is stable across claude
@@ -1938,6 +2846,7 @@ class TmuxClaudeSession:
         # Drop any in-flight decision futures from a prior turn so a new turn
         # never reuses a stale approval (parity intent with plan_state reset).
         self.inflight_decisions = {}
+        self.policy_block = None
         return turn
 
     def complete_turn(self, *, is_error: bool = False) -> None:
@@ -1999,12 +2908,15 @@ class TmuxClaudeSession:
         self.goal_active = rest.lower() not in _GOAL_CLEAR_WORDS
         self._goal_indicator_seen = False
 
-    async def teardown(self) -> None:
-        # Unblock any awaiting TmuxAgent.execute() FIRST — daemon shutdown
-        # tears down sessions without going through cancel(), and a turn
-        # waiting on stop_event would otherwise hang until task cancellation
-        # (no clean agent_execute_completed). cancel() already does this; the
-        # shutdown_all() path did not.
+    async def detach(self, *, deny_reason: str) -> None:
+        """Release leashd's half of the pane without touching the pane itself.
+
+        Everything leashd owns — the awaited turn, blocked hooks, the tailer,
+        the dialog watcher — is released, because none of it survives the
+        process. The pane and the ``claude`` in it are deliberately left
+        running: they live on a tmux server of their own, and a restarted
+        daemon re-adopts them from the manifest.
+        """
         self.complete_turn(is_error=True)
         # Resolve any in-flight tool-decision futures so a PermissionRequest
         # hook awaiting this session's PreToolUse decision fails closed fast
@@ -2012,9 +2924,7 @@ class TmuxClaudeSession:
         # pane is torn down mid-approval (/stop, /cancel, daemon shutdown).
         for f in list(self.inflight_decisions.values()):
             if not f.done():
-                f.set_result(
-                    _hook_decision("deny", "leashd: session ended before decision")
-                )
+                f.set_result(_hook_decision("deny", deny_reason))
         self.inflight_decisions = {}
         if self.jsonl_task is not None:
             self.jsonl_task.cancel()
@@ -2026,6 +2936,14 @@ class TmuxClaudeSession:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self.dialog_watcher_task
             self.dialog_watcher_task = None
+
+    async def teardown(self) -> None:
+        # Unblock any awaiting TmuxAgent.execute() FIRST — daemon shutdown
+        # tears down sessions without going through cancel(), and a turn
+        # waiting on stop_event would otherwise hang until task cancellation
+        # (no clean agent_execute_completed). cancel() already does this; the
+        # shutdown_all() path did not.
+        await self.detach(deny_reason="leashd: session ended before decision")
         if self._tmux_session is not None:
             try:
                 self._tmux_session.kill_session()
@@ -2049,7 +2967,7 @@ class TmuxSessionManager:
         self._config = config
         self._socket_dir = Path(config.tmux_socket_dir).expanduser()
         self._socket_path = self._socket_dir / "tmux.sock"
-        self._secret = config.tmux_hook_secret or secrets.token_urlsafe(32)
+        self._secret = config.tmux_hook_secret or self._load_or_mint_secret()
         self._projects_root = Path.home() / ".claude" / "projects"
         self._server: Any = None
         self._preflighted = False
@@ -2078,6 +2996,33 @@ class TmuxSessionManager:
         self._orphan_reap_task: asyncio.Task[int] | None = None
 
     # -- configuration / wiring ---------------------------------------------
+
+    def _load_or_mint_secret(self) -> str:
+        """Read the daemon-independent hook secret, minting it on first use.
+
+        A pane authenticates its hooks with the secret baked into the
+        ``--settings`` file it was spawned with, so a secret regenerated per
+        daemon makes every surviving pane's hooks unauthorized after a restart
+        — the pane would keep running with no gate leashd could answer. Living
+        on disk beside the socket it protects, the secret is scoped exactly
+        like that socket: a loopback route, readable only by this user.
+        """
+        path = self._socket_dir / "hook-secret"
+        try:
+            existing = path.read_text().strip()
+            if existing:
+                return existing
+        except OSError:
+            pass
+        secret = secrets.token_urlsafe(32)
+        try:
+            self._socket_dir.mkdir(parents=True, exist_ok=True)
+            path.touch(mode=0o600, exist_ok=True)
+            path.chmod(0o600)
+            path.write_text(secret)
+        except OSError as exc:
+            logger.warning("tmux_hook_secret_persist_failed", error=str(exc))
+        return secret
 
     @property
     def hook_secret(self) -> str:
@@ -2295,6 +3240,67 @@ class TmuxSessionManager:
             if sid == session_id:
                 del self._by_pane_token[token]
 
+    # -- pane manifests (restart survival) -----------------------------------
+
+    @staticmethod
+    def _tailer_position(cs: TmuxClaudeSession) -> tuple[Path | None, int, int | None]:
+        """This session's transcript read position, or a zeroed one.
+
+        A manifest that cannot record the position is still worth writing — the
+        pane is adopted and simply resumes at the end of the transcript — so
+        every failure here degrades rather than propagates.
+        """
+        reader = getattr(cs.jsonl_tailer, "position", None)
+        if reader is None:
+            return None, 0, None
+        try:
+            return reader()  # type: ignore[no-any-return]
+        except Exception:
+            return None, 0, None
+
+    def _manifest_for(self, cs: TmuxClaudeSession) -> PaneManifest:
+        """Snapshot the live session as the record a restart adopts it from."""
+        turn = cs.turn
+        path, offset, inode = self._tailer_position(cs)
+        return PaneManifest(
+            session_id=cs.session_id,
+            chat_id=cs.chat_id,
+            user_id=cs.user_id,
+            working_directory=cs.working_directory,
+            tmux_name=cs.tmux_name,
+            settings_path=str(cs.settings_path),
+            mode=cs.mode,
+            task_run_id=cs.task_run_id,
+            plan_origin=cs.plan_origin,
+            pane_token=cs.pane_token,
+            claude_uuid=cs.claude_uuid,
+            native_auto_allowed=bool(cs.native_auto_allowed),
+            native_auto_active=bool(cs.native_auto_active),
+            native_ask_rules=sorted(cs.native_ask_rules),
+            applied_system_prompt=cs.applied_system_prompt,
+            append_system_prompt_path=(
+                str(cs.append_system_prompt_path)
+                if cs.append_system_prompt_path is not None
+                else None
+            ),
+            last_prompt=cs.last_prompt,
+            last_model=cs.last_model,
+            goal_active=bool(cs.goal_active),
+            turn_active=turn is not None and not turn.stop_event.is_set(),
+            jsonl_path=str(path) if path is not None else None,
+            jsonl_offset=offset,
+            jsonl_inode=inode,
+        )
+
+    def persist_manifest(self, cs: TmuxClaudeSession) -> None:
+        """Write this session's adoption record. Best-effort, never raises."""
+        write_manifest(self._socket_dir, self._manifest_for(cs))
+
+    def persist_all_manifests(self) -> None:
+        for cs in list(self._sessions.values()):
+            if cs.tmux_name.startswith(TMUX_NAME_PREFIX):
+                self.persist_manifest(cs)
+
     def _hook_headers(self, pane_token: str | None) -> dict[str, str]:
         headers = {"X-Leashd-Token": self._secret}
         if pane_token:
@@ -2383,6 +3389,24 @@ class TmuxSessionManager:
                 per_tool = set()
         return native_allow_rules(rules, per_tool)
 
+    def native_ask_for_policy(self) -> tuple[list[str], list[str]]:
+        """``permissions.ask`` entries and the policy rule names they mirror.
+
+        Empty when safety is unbound (tests / sandbox spawns), or when
+        ``LEASHD_TMUX_NATIVE_ASK=0`` opts a session out and restores the old
+        hook-only gating.
+        """
+        if self._gatekeeper is None:
+            return [], []
+        if os.environ.get("LEASHD_TMUX_NATIVE_ASK", "").strip().lower() in (
+            "0",
+            "false",
+            "no",
+        ):
+            return [], []
+        policy = getattr(self._gatekeeper, "_policy_engine", None)
+        return native_ask_rules(getattr(policy, "rules", []) or [])
+
     def write_managed_settings(
         self,
         session_id: str,
@@ -2443,6 +3467,17 @@ class TmuxSessionManager:
                     "tmux_native_allow_written",
                     session_id=session_id,
                     count=len(allow),
+                )
+            # Only `auto` needs these: every other perm_mode already raises a
+            # native prompt claude blocks on, so the hook gates there on its own.
+            ask, ask_names = self.native_ask_for_policy()
+            if ask:
+                permissions["ask"] = ask
+                logger.info(
+                    "tmux_native_ask_written",
+                    session_id=session_id,
+                    count=len(ask),
+                    rules=ask_names,
                 )
         payload: dict[str, Any] = {"hooks": hooks, "permissions": permissions}
         enabled = self._security_enabled_plugins()
@@ -2581,6 +3616,7 @@ class TmuxSessionManager:
                 del self._by_uuid[uuid_key]
         self._drop_pane_tokens(session_id)
         self._pending_pane_tokens.pop(session_id, None)
+        delete_manifest(self._socket_dir, session_id)
         if cs is not None:
             await cs.teardown()
             if self._tmux_session_exists(cs.tmux_name) is not False:
@@ -2703,7 +3739,13 @@ class TmuxSessionManager:
         """Best-effort kill of a single tmux session by exact name. Never raises.
 
         rc 1 (session already gone) is the desired end-state, not an error.
+        Killing a pane also retires its adoption record, so every kill path —
+        ``terminate``, the orphan reap, the startup sweep — leaves nothing for a
+        later start to try to adopt.
         """
+        killed_session_id = session_id_from_tmux_name(name)
+        if killed_session_id is not None:
+            delete_manifest(self._socket_dir, killed_session_id)
         try:
             proc = subprocess.run(  # noqa: S603
                 self._tmux_argv("kill-session", "-t", f"={name}"),
@@ -2741,12 +3783,69 @@ class TmuxSessionManager:
                 return
         logger.warning("tmux_orphan_reap_incomplete", tmux_name=name)
 
-    _APPEND_SYSPROMPT_INLINE_MAX = 4096
-
     def _write_append_system_prompt_file(self, session_id: str, text: str) -> Path:
         self._socket_dir.mkdir(parents=True, exist_ok=True)
         path = self._socket_dir / f"{session_id}.append-system-prompt.txt"
         path.write_text(text)
+        return path
+
+    _HOISTED_TOOL_FLAGS: ClassVar[dict[str, str]] = {
+        "--allowedTools": "allow",
+        "--disallowedTools": "deny",
+    }
+
+    def _hoist_tool_lists_into_settings(
+        self, parts: list[str], settings_path: Path
+    ) -> None:
+        """Move the tool allow/deny lists off argv into the managed settings.
+
+        ``--disallowedTools`` alone carries ~30 comma-joined tool names, so
+        every pane's command line held "playwright" and "browser" for its whole
+        life and matched an unrelated ``pkill -f playwright``. A bare tool name
+        in ``permissions.deny`` removes the tool from claude's context exactly
+        as the flag does, so the move is behaviour-preserving — verified
+        against CLI 2.1.251, where the model reports the same toolset either
+        way. Entries already in the file are kept; order is not significant.
+        """
+        try:
+            payload = json.loads(settings_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        permissions = payload.setdefault("permissions", {})
+        if not isinstance(permissions, dict):
+            return
+        moved = False
+        for flag, bucket in self._HOISTED_TOOL_FLAGS.items():
+            if flag not in parts:
+                continue
+            i = parts.index(flag)
+            if i + 1 >= len(parts):
+                continue
+            existing = permissions.get(bucket) or []
+            names = [n for n in parts[i + 1].split(",") if n]
+            permissions[bucket] = existing + [n for n in names if n not in existing]
+            del parts[i : i + 2]
+            moved = True
+        if moved:
+            settings_path.write_text(json.dumps(payload, indent=2))
+
+    def _spill_mcp_config(self, parts: list[str], session_id: str) -> Path | None:
+        """Point ``--mcp-config`` at a file instead of inlining its JSON.
+
+        The inline form puts every MCP server's name and launch command in
+        argv, which is the same ``pkill -f`` surface the tool lists were.
+        """
+        if "--mcp-config" not in parts:
+            return None
+        i = parts.index("--mcp-config")
+        if i + 1 >= len(parts) or not parts[i + 1].lstrip().startswith("{"):
+            return None
+        self._socket_dir.mkdir(parents=True, exist_ok=True)
+        path = self._socket_dir / f"{session_id}.mcp.json"
+        path.write_text(parts[i + 1])
+        parts[i + 1] = str(path)
         return path
 
     def _build_claude_command(
@@ -2761,6 +3860,18 @@ class TmuxSessionManager:
         resume_uuid: str | None,
         append_system_prompt: str | None,
     ) -> tuple[str, Path | None]:
+        """Build the pane's argv, keeping prose out of it.
+
+        A process command line is readable by everything on the machine, and
+        ``pkill -f`` matches against it. The appended system prompt is kilobytes
+        of English — "agent-browser", "pytest", "chrome", the user's project
+        names — so inlining it turned every pane into a match for patterns that
+        have nothing to do with claude. One conversation running a routine
+        ``pkill -f agent-browser`` then SIGTERMs every *other* conversation's
+        agent mid-turn, and never its own: ``pkill`` skips the caller's own
+        ancestors, so the pane that fired it is the one pane that survives.
+        Spilling the prompt to a file leaves argv as flags and paths only.
+        """
         import shlex
 
         from leashd.agents.runtimes._helpers import build_agent_cli_args
@@ -2778,10 +3889,7 @@ class TmuxSessionManager:
         )
 
         sysprompt_path: Path | None = None
-        if (
-            append_system_prompt
-            and len(append_system_prompt) > self._APPEND_SYSPROMPT_INLINE_MAX
-        ):
+        if append_system_prompt:
             for i in range(len(parts) - 1):
                 if parts[i] == "--append-system-prompt":
                     sysprompt_path = self._write_append_system_prompt_file(
@@ -2790,6 +3898,9 @@ class TmuxSessionManager:
                     parts[i] = "--append-system-prompt-file"
                     parts[i + 1] = str(sysprompt_path)
                     break
+
+        self._hoist_tool_lists_into_settings(parts, settings_path)
+        self._spill_mcp_config(parts, session_id)
 
         quoted = " ".join(shlex.quote(p) for p in parts)
         return f"env CLAUDECODE= CLAUDE_CODE_ENTRYPOINT=cli {quoted}", sysprompt_path
@@ -2827,7 +3938,7 @@ class TmuxSessionManager:
 
         await self._reap_leftover_chat_panes(chat_id, keep=session_id)
 
-        tmux_name = f"leashd_{session_id}"
+        tmux_name = f"{TMUX_NAME_PREFIX}{session_id}"
         settings_path = self.write_managed_settings(
             session_id, chat_id=chat_id, perm_mode=perm_mode
         )
@@ -2904,6 +4015,8 @@ class TmuxSessionManager:
         cs.applied_system_prompt = append_system_prompt
         cs.append_system_prompt_path = sysprompt_path
         cs.native_auto_active = perm_mode == "auto"
+        if cs.native_auto_active:
+            cs.native_ask_rules = frozenset(self.native_ask_for_policy()[1])
         cs.attach(tmux_session, pane)
         self._sessions[session_id] = cs
         cs.pane_token = self._adopt_pane_token(session_id)
@@ -2923,6 +4036,7 @@ class TmuxSessionManager:
             resume=resume_uuid is not None,
             cwd_is_shared=lambda: self.cwd_has_rival_pane(session_id),
         )
+        cs.jsonl_tailer = tailer
         cs.jsonl_task = asyncio.create_task(tailer.run())
 
         # Stage 2 belt-and-suspenders gate: a background watcher that
@@ -2938,6 +4052,8 @@ class TmuxSessionManager:
         # otherwise leak a polling task per spawn.
         if self.is_bound and self._interactions is not None:
             cs.dialog_watcher_task = asyncio.create_task(self._dialog_watcher_loop(cs))
+
+        self.persist_manifest(cs)
 
         logger.info(
             "tmux_session_spawned",
@@ -2977,6 +4093,7 @@ class TmuxSessionManager:
                 self._by_uuid[claude_uuid] = sid
                 if cs.claude_uuid is None:
                     cs.claude_uuid = claude_uuid
+                    self.persist_manifest(cs)
                     logger.info(
                         "tmux_pane_bound",
                         session_id=sid,
@@ -3016,6 +4133,39 @@ class TmuxSessionManager:
 
         return token is not None and hmac.compare_digest(token, self._secret)
 
+    @staticmethod
+    def _note_tool_decision(
+        cs: TmuxClaudeSession,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        hook_out: dict[str, Any],
+        *,
+        inline: bool = False,
+    ) -> None:
+        """Record a block so the chat can name it, or clear a stale one.
+
+        ``inline`` marks a Bash block reported to the model as a failed tool
+        result instead of a turn-ending deny — the agent carried on, so the
+        record only survives if nothing followed it. A hard deny (every
+        non-Bash tool) does end the turn, and reads as the cause of it.
+        """
+        hso = hook_out.get("hookSpecificOutput", {})
+        if hso.get("permissionDecision") != "deny":
+            cs.policy_block = None
+            return
+        cs.policy_block = PolicyBlock(
+            tool_name=tool_name,
+            description=describe_tool(tool_name, tool_input),
+            reason=str(hso.get("permissionDecisionReason") or ""),
+            inline=inline,
+        )
+        logger.info(
+            "tmux_policy_block_recorded",
+            session_id=cs.session_id,
+            chat_id=cs.chat_id,
+            tool_name=tool_name,
+        )
+
     def _spawn_perm_selector_drive(
         self, cs: TmuxClaudeSession, hook_out: dict[str, Any]
     ) -> None:
@@ -3025,9 +4175,26 @@ class TmuxSessionManager:
         :meth:`TmuxClaudeSession.answer_perm_selector` so a no-selector tool is
         a harmless no-op. ``allow``/``deny`` is read from the PreToolUse-shaped
         envelope. AskUserQuestion is routed to the question selector instead
-        (see :meth:`_spawn_selector_drive`)."""
+        (see :meth:`_spawn_selector_drive`).
+
+        Only a DECISIVE envelope drives the pane. ``defer`` (native-auto
+        pass-through) and ``ask`` are not leashd decisions at all — Claude's
+        own permission mode owns the call and re-raises it through
+        PermissionRequest, which drives the selector there with the real
+        verdict. Treating a non-decision as ``allow != decision`` → deny made
+        every ungated auto-mode tool press Escape: the first press cancelled a
+        tool leashd had explicitly allowed, and the presses that landed after
+        the dialog closed reached the live agent and interrupted the turn."""
         hso = hook_out.get("hookSpecificOutput", {})
-        allow = hso.get("permissionDecision") == "allow"
+        decision = hso.get("permissionDecision")
+        if decision not in ("allow", "deny"):
+            logger.debug(
+                "tmux_perm_selector_drive_skipped",
+                tmux_name=cs.tmux_name,
+                decision=decision,
+            )
+            return
+        allow = decision == "allow"
 
         async def _drive() -> None:
             try:
@@ -3169,6 +4336,24 @@ class TmuxSessionManager:
                 "deny", "leashd could not evaluate this tool safely — denied"
             )
 
+        # A Bash deny becomes an allow that runs a blocked-notice no-op, so the
+        # policy stops the command without Claude aborting the whole turn. Done
+        # BEFORE the future is published so the PermissionRequest dedupe reuses
+        # the same substituted verdict, and before the selector drive so it
+        # never presses a deny into the pane for a call that is now an allow.
+        if cs is not None:
+            swapped = _deny_without_ending_the_turn(tool_name, tool_input, out)
+            self._note_tool_decision(
+                cs, tool_name, tool_input, out, inline=swapped is not None
+            )
+            if swapped is not None:
+                logger.info(
+                    "tmux_bash_deny_reported_in_band",
+                    session_id=cs.session_id,
+                    chat_id=cs.chat_id,
+                )
+                out = swapped
+
         # Always publish the outcome (even a non-final `defer`) so a waiting
         # PermissionRequest unblocks immediately; the dedupe path in
         # on_permission_request inspects decisiveness and falls through to the
@@ -3261,6 +4446,7 @@ class TmuxSessionManager:
                     cs.chat_id,
                     session_mode=cs.mode,
                     task_run_id=cs.task_run_id,
+                    native_ask_rules=cs.native_ask_rules,
                 )
                 if gated is None:
                     return _hook_decision(
@@ -3427,7 +4613,9 @@ class TmuxSessionManager:
         )
         if decision is not None:
             permreq = _permission_to_permreq(decision)
-            self._spawn_perm_selector_drive(cs, _permission_to_hook(decision))
+            hook_out = _permission_to_hook(decision)
+            self._note_tool_decision(cs, tool_name, tool_input, hook_out)
+            self._spawn_perm_selector_drive(cs, hook_out)
             return permreq
 
         result = await self._gatekeeper.check(
@@ -3438,7 +4626,23 @@ class TmuxSessionManager:
             session_mode=cs.mode,
             task_run_id=cs.task_run_id,
         )
-        self._spawn_perm_selector_drive(cs, _permission_to_hook(result))
+        hook_out = _permission_to_hook(result)
+        swapped = _deny_without_ending_the_turn(tool_name, tool_input, hook_out)
+        self._note_tool_decision(
+            cs, tool_name, tool_input, hook_out, inline=swapped is not None
+        )
+        if swapped is not None:
+            logger.info(
+                "tmux_bash_deny_reported_in_band",
+                session_id=cs.session_id,
+                chat_id=cs.chat_id,
+            )
+            self._spawn_perm_selector_drive(cs, swapped)
+            return _permreq_decision(
+                "allow",
+                updated_input=swapped["hookSpecificOutput"]["updatedInput"],
+            )
+        self._spawn_perm_selector_drive(cs, hook_out)
         return _permission_to_permreq(result)
 
     async def _apply_plan_approved(
@@ -3610,6 +4814,54 @@ class TmuxSessionManager:
         except Exception:
             logger.exception("tmux_dialog_watcher_loop_error", session_id=cs.session_id)
 
+    async def _answer_native_dialog_with_text(
+        self, cs: TmuxClaudeSession, match: NativeDialogMatch, text: str
+    ) -> None:
+        """Deliver an answer that matches none of the dialog's options.
+
+        The prompt leashd sends invites one — "Or reply with a message for a
+        custom answer" — so an unmatched label is the human answering in their
+        own words, not a mismatch to discard. Escape returns the pane to the
+        composer and the words go in as a follow-up, which is what a person at
+        the TUI would do. Dropping them left the dialog dismissed, the answer
+        gone, and the turn carrying on as if nobody had replied.
+        """
+        logger.info(
+            "tmux_native_dialog_answered_with_text",
+            session_id=cs.session_id,
+            tmux_name=cs.tmux_name,
+            name=match.name,
+            text_length=len(text),
+        )
+        with contextlib.suppress(Exception):
+            cs.send_keys("Escape", literal=False)
+        for _ in range(_DIALOG_DRIVE_CONFIRM_RETRIES):
+            await asyncio.sleep(_DIALOG_DRIVE_CONFIRM_POLL_S)
+            if cs._composer_accepts_input(cs.capture()):
+                break
+            with contextlib.suppress(Exception):
+                cs.send_keys("Escape", literal=False)
+        turn = cs.turn
+        counted = turn is not None and not turn.stop_event.is_set()
+        if counted and turn is not None:
+            turn.pending_followups += 1
+        delivered = False
+        try:
+            delivered = await cs.submit(text)
+        except Exception:
+            logger.exception(
+                "tmux_native_dialog_text_answer_failed",
+                session_id=cs.session_id,
+                name=match.name,
+            )
+        if not delivered and counted and turn is not None:
+            turn.pending_followups = max(0, turn.pending_followups - 1)
+            logger.warning(
+                "tmux_native_dialog_text_answer_undelivered",
+                session_id=cs.session_id,
+                name=match.name,
+            )
+
     async def _bridge_native_dialog(
         self, cs: TmuxClaudeSession, match: NativeDialogMatch
     ) -> None:
@@ -3694,15 +4946,7 @@ class TmuxSessionManager:
             None,
         )
         if chosen_idx is None:
-            logger.warning(
-                "tmux_native_dialog_unknown_choice",
-                session_id=cs.session_id,
-                name=match.name,
-                chosen=chosen_label,
-                options=[o.get("label") for o in match.options],
-            )
-            with contextlib.suppress(Exception):
-                cs.send_keys("Escape", literal=False)
+            await self._answer_native_dialog_with_text(cs, match, chosen_label)
             return
 
         row_digit = str(chosen_idx + 1)
@@ -3714,6 +4958,13 @@ class TmuxSessionManager:
                 if on_target:
                     await asyncio.sleep(_DIALOG_NAV_STEP_DELAY_S)
                     cs.send_keys("s", literal=True)
+            elif not match.numbered:
+                on_target = await self._navigate_dialog_highlight(
+                    cs, chosen_idx, numbered=False
+                )
+                if on_target:
+                    await asyncio.sleep(_DIALOG_NAV_STEP_DELAY_S)
+                    cs.send_keys("Enter", literal=False)
             else:
                 cs.send_keys(row_digit, literal=True)
                 await asyncio.sleep(0.2)
@@ -3732,14 +4983,18 @@ class TmuxSessionManager:
                     on_target = await self._navigate_dialog_highlight(cs, chosen_idx)
                     if on_target:
                         cs.send_keys("s", literal=True)
-                elif not session_scoped:
+                elif match.numbered:
                     cs.send_keys("Enter", literal=False)
+                elif not on_target:
+                    break
+            if not confirmed and not match.numbered and on_target:
+                confirmed = await self._dismiss_open_dialog(cs)
             if not confirmed:
                 await asyncio.sleep(_DIALOG_DRIVE_CONFIRM_POLL_S)
                 confirmed = cs._composer_accepts_input(cs.capture())
             if not confirmed:
                 screen = cs.capture()
-                rows = _parse_numbered_options(screen)
+                rows, _ = _dialog_block_options(screen)
                 logger.warning(
                     "tmux_native_dialog_drive_unconfirmed",
                     session_id=cs.session_id,
@@ -3754,11 +5009,7 @@ class TmuxSessionManager:
                     screen_tail=" ".join(screen.split())[-220:],
                 )
                 cs.failed_dialog_fingerprints[match.fingerprint] = time.monotonic()
-                for _ in range(2):
-                    cs.send_keys("Escape", literal=False)
-                    await asyncio.sleep(_DIALOG_DRIVE_CONFIRM_POLL_S)
-                    if cs._composer_accepts_input(cs.capture()):
-                        break
+                await self._dismiss_open_dialog(cs)
         except Exception:
             logger.exception(
                 "tmux_native_dialog_drive_error",
@@ -3776,6 +5027,23 @@ class TmuxSessionManager:
             session_scoped=session_scoped,
             confirmed=confirmed,
         )
+
+    @staticmethod
+    async def _dismiss_open_dialog(cs: TmuxClaudeSession) -> bool:
+        """Escape until the composer takes input again. True once it does.
+
+        This is also how a panel dialog (``/chrome``) ends: it runs the chosen
+        row's action and then redraws itself, so the composer never returns on
+        its own and a retried Enter would run the action a second time. There
+        the verified Enter is the whole drive and closing the panel is the rest
+        of it, not a failed attempt to suppress for a minute afterwards.
+        """
+        for _ in range(2):
+            cs.send_keys("Escape", literal=False)
+            await asyncio.sleep(_DIALOG_DRIVE_CONFIRM_POLL_S)
+            if cs._composer_accepts_input(cs.capture()):
+                return True
+        return False
 
     @staticmethod
     def _accept_model_switch_confirm(cs: TmuxClaudeSession, screen: str) -> None:
@@ -3804,14 +5072,22 @@ class TmuxSessionManager:
 
     @staticmethod
     async def _navigate_dialog_highlight(
-        cs: TmuxClaudeSession, chosen_idx: int
+        cs: TmuxClaudeSession, chosen_idx: int, *, numbered: bool = True
     ) -> bool:
         """Move the dialog highlight onto ``chosen_idx``, one verified arrow
         at a time. Returns True once a fresh capture shows the ❯ on the
         chosen row; False when the rows disappear or the budget runs out
-        (the caller fails closed instead of confirming a wrong row)."""
+        (the caller fails closed instead of confirming a wrong row).
+
+        ``numbered=False`` reads a cursor-only list (``/chrome``), whose rows
+        carry no digits to re-find them by."""
         for _ in range(_DIALOG_NAV_MAX_STEPS):
-            rows = _parse_numbered_options(cs.capture())
+            screen = cs.capture()
+            rows = (
+                _parse_numbered_options(screen)
+                if numbered
+                else _cursor_block_options(screen)
+            )
             if not rows:
                 return False
             current = next((i for i, (_, hl, _) in enumerate(rows) if hl), None)
@@ -3836,6 +5112,7 @@ class TmuxSessionManager:
         if isinstance(sid, str) and sid and cs.claude_uuid is None:
             cs.claude_uuid = sid
             self._by_uuid[sid] = cs.session_id
+            self.persist_manifest(cs)
 
         obj_type = obj.get("type")
         turn = cs.turn
@@ -3853,6 +5130,10 @@ class TmuxSessionManager:
                 await self._process_blocks(turn, content)
             return
 
+        if obj_type == "queue-operation":
+            self._handle_queue_operation(cs, turn, obj)
+            return
+
         if obj_type == "result":
             if turn is not None:
                 turn.cost_usd = float(obj.get("total_cost_usd") or 0.0)
@@ -3862,6 +5143,41 @@ class TmuxSessionManager:
                 # Fallback completion if the Stop hook was lost.
                 turn.complete(is_error=turn.is_error)
             return
+
+    @staticmethod
+    def _handle_queue_operation(
+        cs: TmuxClaudeSession, turn: TmuxTurn | None, obj: dict[str, Any]
+    ) -> None:
+        """Keep ``pending_followups`` honest against claude's native queue.
+
+        ``enqueue`` is the CLI's own receipt that the injected keystrokes
+        landed — the only positive delivery evidence there is, since the
+        pane already reads "esc to interrupt" mid-turn and so confirms
+        nothing. ``dequeue`` runs the item as its own prompt and earns its
+        own completion signal, so the counter stays as it is. Every other
+        drain (``remove``, whatever the reason) ends the item without a
+        response of its own and has to give the credit back, or the turn
+        hangs waiting on a signal that will never come — but only for text
+        leashd injected, since claude queues its own notifications here too.
+        """
+        operation = obj.get("operation")
+        if operation == "enqueue":
+            cs.followup_enqueued_at = time.monotonic()
+            return
+        if operation != "remove" or turn is None:
+            return
+        content = obj.get("content")
+        finalize = turn.release_followup(content if isinstance(content, str) else None)
+        logger.info(
+            "tmux_followup_absorbed",
+            session_id=cs.session_id,
+            chat_id=cs.chat_id,
+            reason=obj.get("reason"),
+            pending_followups=turn.pending_followups,
+            finalize=finalize,
+        )
+        if finalize:
+            turn.complete()
 
     @staticmethod
     async def _process_blocks(turn: TmuxTurn | None, blocks: list[Any]) -> None:
@@ -3882,20 +5198,14 @@ class TmuxSessionManager:
             btype = block.get("type")
             if btype == "text":
                 text = str(block.get("text", ""))
-                if text.strip():
-                    if turn.text_parts and turn.on_text_chunk:
-                        # Paragraph break between steps so the live stream
-                        # reads like the assembled transcript, not a run-on.
-                        await safe_callback(
-                            turn.on_text_chunk,
-                            "\n\n",
-                            log_event="tmux_on_text_chunk_error",
-                        )
-                    turn.text_parts.append(text.strip())
+                stripped = text.strip()
+                needs_break = bool(stripped and turn.text_parts)
+                if stripped:
+                    turn.text_parts.append(stripped)
                 if turn.on_text_chunk:
                     await safe_callback(
                         turn.on_text_chunk,
-                        text,
+                        f"\n\n{text}" if needs_break else text,
                         log_event="tmux_on_text_chunk_error",
                     )
             elif btype == "tool_use":
@@ -3903,12 +5213,6 @@ class TmuxSessionManager:
                 turn.tools_used.append(name)
                 tool_input = block.get("input", {}) or {}
                 desc = describe_tool(name, tool_input)
-                # Record the call in the transcript so the persisted message
-                # reflects what the agent did — the engine's tool summary is
-                # not applied to the tmux AgentResponse.content.
-                turn.text_parts.append(
-                    f"\U0001f527 {name}: {desc}" if desc else f"\U0001f527 {name}"
-                )
                 if turn.on_tool_activity and turn.claim_jsonl_activity(
                     _tool_identity_key("", name, tool_input)
                 ):
@@ -3939,34 +5243,7 @@ class TmuxSessionManager:
         self._by_uuid.clear()
         self._by_pane_token.clear()
         self._pending_pane_tokens.clear()
-        if not self._socket_path.exists():
-            return 0
-        try:
-            proc = subprocess.run(  # noqa: S603
-                self._tmux_argv("list-sessions", "-F", "#{session_name}"),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("tmux_list_sessions_failed", error=str(exc))
-            return 0
-        if proc.returncode != 0:
-            # rc 1 with "no server running" is the clean common case (nothing
-            # to reap); any other failure is logged but still best-effort.
-            if "no server running" not in proc.stderr:
-                logger.warning(
-                    "tmux_list_sessions_failed",
-                    rc=proc.returncode,
-                    stderr=proc.stderr.strip(),
-                )
-            return 0
-        owned = [
-            n
-            for n in (line.strip() for line in proc.stdout.splitlines())
-            if n.startswith("leashd_")  # never a user's own session on this socket
-        ]
+        owned = self.owned_session_names()
         killed = 0
         for name in owned:
             self._kill_tmux_session(name)
@@ -3978,6 +5255,263 @@ class TmuxSessionManager:
             logger.info("tmux_owned_sessions_killed", count=killed)
         logger.info("tmux_owned_sessions_swept", found=len(owned), killed=killed)
         return killed
+
+    def owned_session_names(self) -> list[str]:
+        """``leashd_``-prefixed tmux sessions currently on leashd's socket."""
+        if not self._socket_path.exists():
+            return []
+        try:
+            proc = subprocess.run(  # noqa: S603
+                self._tmux_argv("list-sessions", "-F", "#{session_name}"),
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("tmux_list_sessions_failed", error=str(exc))
+            return []
+        if proc.returncode != 0:
+            if "no server running" not in proc.stderr:
+                logger.warning(
+                    "tmux_list_sessions_failed",
+                    rc=proc.returncode,
+                    stderr=proc.stderr.strip(),
+                )
+            return []
+        return [
+            n
+            for n in (line.strip() for line in proc.stdout.splitlines())
+            if n.startswith(TMUX_NAME_PREFIX)
+        ]
+
+    def _lookup_tmux_session(self, name: str) -> tuple[Any, Any] | None:
+        """Resolve a live tmux session name to its libtmux ``(session, pane)``."""
+        try:
+            server = self._ensure_server()
+            tmux_session = server.sessions.get(session_name=name, default=None)
+            if tmux_session is None:
+                return None
+            pane = tmux_session.active_window.active_pane
+        except Exception as exc:
+            logger.warning("tmux_adopt_lookup_failed", tmux_name=name, error=str(exc))
+            return None
+        if pane is None:
+            return None
+        return tmux_session, pane
+
+    async def adopt_orphan_panes(
+        self, *, max_age_hours: float = 24.0
+    ) -> list[TmuxClaudeSession]:
+        """Re-adopt every surviving ``leashd_`` pane, reaping the rest.
+
+        The tmux server is a process of its own on leashd's private socket, so
+        a pane and the interactive ``claude`` in it outlive the daemon. What
+        did not outlive it was leashd's half of the binding, which is why a
+        restart used to kill every pane. Rebuilding that half from the pane's
+        manifest — identity token, Claude uuid, safety context, transcript
+        position — makes a daemon restart a reconnect rather than a reset.
+
+        A pane is only adopted when leashd can still *gate* it: a manifest it
+        can parse, a matching live pane, and an age within ``max_age_hours``.
+        Anything else is killed exactly as before, because a pane whose hooks
+        cannot be routed spins forever on denied tools.
+        """
+        adopted: list[TmuxClaudeSession] = []
+        reaped = 0
+        for name in self.owned_session_names():
+            session_id = session_id_from_tmux_name(name)
+            if session_id is None or session_id in self._sessions:
+                continue
+            manifest = read_manifest(self._socket_dir, session_id)
+            reason = self._unadoptable_reason(manifest, max_age_hours)
+            if reason is not None:
+                logger.info(
+                    "tmux_pane_not_adopted",
+                    tmux_name=name,
+                    session_id=session_id,
+                    reason=reason,
+                )
+                self._kill_tmux_session(name)
+                reaped += 1
+                continue
+            assert manifest is not None  # noqa: S101 — _unadoptable_reason checked it
+            cs = await self._adopt_one(manifest)
+            if cs is None:
+                self._kill_tmux_session(name)
+                reaped += 1
+                continue
+            adopted.append(cs)
+        prune_manifests(self._socket_dir, keep={cs.session_id for cs in adopted})
+        if adopted or reaped:
+            logger.info("tmux_panes_adopted", adopted=len(adopted), reaped=reaped)
+        return adopted
+
+    def _unadoptable_reason(
+        self, manifest: PaneManifest | None, max_age_hours: float
+    ) -> str | None:
+        if manifest is None:
+            return "no_manifest"
+        if manifest.pane_token is None:
+            return "no_pane_token"
+        if max_age_hours > 0 and manifest.age_seconds > max_age_hours * 3600:
+            return "too_old"
+        if not self._hooks_still_reach_us(manifest):
+            return "stale_hook_settings"
+        return None
+
+    def _hooks_still_reach_us(self, manifest: PaneManifest) -> bool:
+        """True iff the pane's hooks would still arrive here, authenticated.
+
+        ``claude`` reads its ``--settings`` once at spawn, so a pane carries
+        the hook URL and secret it was born with for life. If the daemon has
+        since moved port or rotated the secret, adopting the pane would leave
+        it running with a gate it can no longer call — worse than reaping it,
+        because it looks connected.
+        """
+        try:
+            payload = json.loads(Path(manifest.settings_path).read_text())
+            block = payload["hooks"]["PreToolUse"][0]["hooks"][0]
+        except (OSError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+            return False
+        headers = block.get("headers") or {}
+        return (
+            block.get("url") == self._hook_url("PreToolUse")
+            and headers.get("X-Leashd-Token") == self._secret
+            and headers.get(_PANE_TOKEN_HEADER) == manifest.pane_token
+        )
+
+    async def _adopt_one(self, manifest: PaneManifest) -> TmuxClaudeSession | None:
+        """Rebuild one ``TmuxClaudeSession`` from its manifest, or None."""
+        pane_token = manifest.pane_token
+        if pane_token is None:
+            logger.info(
+                "tmux_pane_not_adopted",
+                tmux_name=manifest.tmux_name,
+                session_id=manifest.session_id,
+                reason="no_pane_token",
+            )
+            return None
+        found = self._lookup_tmux_session(manifest.tmux_name)
+        if found is None:
+            logger.info(
+                "tmux_pane_not_adopted",
+                tmux_name=manifest.tmux_name,
+                session_id=manifest.session_id,
+                reason="pane_vanished",
+            )
+            return None
+        tmux_session, pane = found
+
+        cs = TmuxClaudeSession(
+            session_id=manifest.session_id,
+            chat_id=manifest.chat_id,
+            user_id=manifest.user_id,
+            working_directory=manifest.working_directory,
+            mode=manifest.mode,
+            task_run_id=manifest.task_run_id,
+            plan_origin=manifest.plan_origin,
+            tmux_name=manifest.tmux_name,
+            settings_path=Path(manifest.settings_path),
+            native_auto_allowed=manifest.native_auto_allowed,
+            typing=_typing_profile_from_config(self._config),
+        )
+        cs.adopted = True
+        cs.native_auto_active = manifest.native_auto_active
+        # From the manifest, not recomputed: the adopted pane is still running
+        # against the settings file it was spawned with, so a policy edit since
+        # then must not change which verdicts leashd hands to the native prompt.
+        cs.native_ask_rules = frozenset(manifest.native_ask_rules)
+        cs.applied_system_prompt = manifest.applied_system_prompt
+        cs.append_system_prompt_path = (
+            Path(manifest.append_system_prompt_path)
+            if manifest.append_system_prompt_path
+            else None
+        )
+        cs.last_prompt = manifest.last_prompt
+        cs.last_model = manifest.last_model
+        cs.goal_active = manifest.goal_active
+        cs.claude_uuid = manifest.claude_uuid
+        cs.pane_token = pane_token
+        cs.attach(tmux_session, pane)
+
+        if cs.pane_is_dead():
+            # Carry the death cause into the log: a pane that died while the
+            # daemon was down is reaped here, and without the exit status the
+            # restart reports a bare ``reaped=3`` that cannot be told apart
+            # from a clean shutdown. A whole conversation's worth of panes
+            # SIGTERMed by a sibling's ``pkill`` looked exactly like that.
+            logger.info(
+                "tmux_pane_not_adopted",
+                tmux_name=manifest.tmux_name,
+                session_id=manifest.session_id,
+                chat_id=manifest.chat_id,
+                reason="pane_dead",
+                **cs.death_report(),
+            )
+            return None
+
+        self._sessions[manifest.session_id] = cs
+        self._by_pane_token[pane_token] = manifest.session_id
+        if manifest.claude_uuid:
+            self._by_uuid[manifest.claude_uuid] = manifest.session_id
+
+        # A pane still working when the daemon went down keeps a turn open, so
+        # the transcript written meanwhile is output nobody has seen. Arm the
+        # turn BEFORE the tailer starts draining — JSONL events with no turn
+        # are dropped — and let the engine attach the chat's stream to it.
+        if self._pane_is_working(cs):
+            cs.begin_turn(on_text_chunk=None, on_tool_activity=None)
+
+        from leashd.web.tmux_jsonl import JSONLTailer
+
+        tailer = JSONLTailer(
+            projects_root=self._projects_root,
+            on_event=self._dispatch_jsonl_event,
+            session=cs,
+            cwd_is_shared=lambda: self.cwd_has_rival_pane(manifest.session_id),
+            adopt_from=(
+                Path(manifest.jsonl_path) if manifest.jsonl_path else None,
+                manifest.jsonl_offset,
+                manifest.jsonl_inode,
+            ),
+        )
+        cs.jsonl_tailer = tailer
+        cs.jsonl_task = asyncio.create_task(tailer.run())
+
+        if self.is_bound and self._interactions is not None:
+            cs.dialog_watcher_task = asyncio.create_task(self._dialog_watcher_loop(cs))
+
+        self.persist_manifest(cs)
+        logger.info(
+            "tmux_pane_adopted",
+            session_id=cs.session_id,
+            chat_id=cs.chat_id,
+            tmux_name=cs.tmux_name,
+            cwd=cs.working_directory,
+            mode=cs.mode,
+            turn_in_flight=cs.turn is not None,
+            age_seconds=round(manifest.age_seconds),
+        )
+        return cs
+
+    @staticmethod
+    def _pane_is_working(cs: TmuxClaudeSession) -> bool:
+        """True when the pane is demonstrably mid-turn.
+
+        Read from the live screen, not from the manifest: a daemon killed with
+        SIGKILL never wrote a final manifest, and the screen is right either
+        way. It takes POSITIVE evidence — the interrupt hint, or a dialog
+        waiting on an answer — because the turn armed here is one the engine
+        then waits on, and the runtime's turn ceilings are disabled by default.
+        A merely unrecognised screen (claude still booting, a build that
+        reworded its footer) must read as idle, or the chat is left holding a
+        turn that can never complete.
+        """
+        screen = cs.capture()
+        if not screen.strip():
+            return False
+        return "esc to interrupt" in screen or cs.dedicated_selector_present(screen)
 
     def _schedule_orphan_reap(self) -> None:
         """Debounced, fire-and-forget reap triggered by an unmappable hook.
@@ -4002,27 +5536,8 @@ class TmuxSessionManager:
         leashd does not currently own, so a live session (this or any other
         chat) and a user's own tmux are never touched. Best-effort.
         """
-        if not self._socket_path.exists():
-            return 0
-        try:
-            proc = subprocess.run(  # noqa: S603
-                self._tmux_argv("list-sessions", "-F", "#{session_name}"),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("tmux_orphan_list_failed", error=str(exc))
-            return 0
-        if proc.returncode != 0:
-            return 0
         owned = {cs.tmux_name for cs in self._sessions.values()}
-        orphans = [
-            n
-            for n in (line.strip() for line in proc.stdout.splitlines())
-            if n.startswith("leashd_") and n not in owned
-        ]
+        orphans = [n for n in self.owned_session_names() if n not in owned]
         killed = 0
         for name in orphans:
             self._kill_tmux_session(name)
@@ -4032,7 +5547,34 @@ class TmuxSessionManager:
             logger.info("tmux_orphan_panes_reaped", count=killed, found=len(orphans))
         return killed
 
-    async def shutdown_all(self) -> None:
+    async def shutdown_all(self, *, keep_panes: bool = False) -> None:
+        """Release every session. With ``keep_panes`` the panes stay running.
+
+        Persisting first and detaching second is the order that matters: the
+        manifest has to capture the turn and the transcript position as they
+        were while still live, so the next daemon resumes the pane where this
+        one left it rather than replaying or skipping its output.
+        """
+        if keep_panes:
+            kept = 0
+            for cs in list(self._sessions.values()):
+                if not cs.tmux_name.startswith(TMUX_NAME_PREFIX):
+                    await cs.teardown()
+                    continue
+                self.persist_manifest(cs)
+                await cs.detach(
+                    deny_reason=(
+                        "leashd: the daemon restarted while this call was waiting "
+                        "for approval — run it again"
+                    )
+                )
+                kept += 1
+            self._sessions.clear()
+            self._by_uuid.clear()
+            self._by_pane_token.clear()
+            self._pending_pane_tokens.clear()
+            logger.info("tmux_panes_kept_for_restart", count=kept)
+            return
         for cs in list(self._sessions.values()):
             await cs.teardown()
         # Reap anything still on the socket (orphans / races) so a daemon
@@ -4109,6 +5651,56 @@ def _hook_to_permreq(hook_out: dict[str, Any]) -> dict[str, Any]:
     # deny / ask / defer / anything non-allow → fail closed to deny (the
     # PreToolUse path is authoritative; PermissionRequest must not re-open it).
     return _permreq_decision("deny")
+
+
+def _blocked_bash_command(reason: str) -> str:
+    """A Bash command that reports a leashd block and fails, running nothing.
+
+    Substituted for the command the policy denied. Single-quoted with the shell
+    escape for an embedded quote, so nothing in ``reason`` can break out and
+    become executable text.
+    """
+    text = reason.strip() or "blocked by safety policy"
+    msg = (
+        f"leashd blocked this command: {text}. "
+        "It did not run. Do not retry it — take a different approach."
+    )
+    return "printf '%s\\n' '" + msg.replace("'", "'\\''") + "' >&2; exit 1"
+
+
+def _deny_without_ending_the_turn(
+    tool_name: str, tool_input: dict[str, Any], hook_out: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Re-shape a Bash ``deny`` into an allow that runs a blocked-notice no-op.
+
+    Claude Code has no "refuse this call but keep going" verdict: a hook
+    ``deny`` aborts the WHOLE turn — the model is handed "the tool use was
+    rejected ... STOP what you are doing and wait for the user". Measured over
+    the local transcript corpus, 45/45 denies ended the turn, and supplying a
+    ``permissionDecisionReason`` does not change it. So a single blocked
+    command cost a user everything the turn had done — 21 minutes of work in
+    the reported case, for a cleanup the policy was right to stop.
+
+    Swapping the command for a notice keeps the guarantee that matters (the
+    denied command never executes) while the model gets an ordinary failed
+    tool result it can read and work around. Bash only: it is the one tool with
+    a harmless rewrite, and the one the deny rules actually fire on. Everything
+    else keeps the hard deny.
+    """
+    if normalize_tool_name(tool_name) != "Bash":
+        return None
+    if "command" not in tool_input:
+        return None
+    hso = hook_out.get("hookSpecificOutput", {})
+    if hso.get("permissionDecision") != "deny":
+        return None
+    reason = str(hso.get("permissionDecisionReason") or "")
+    out = _hook_decision("allow", f"leashd: blocked, reported in-band ({reason})")
+    out["hookSpecificOutput"]["updatedInput"] = {
+        **tool_input,
+        "command": _blocked_bash_command(reason),
+    }
+    return out
 
 
 def _hook_decision(decision: str, reason: str) -> dict[str, Any]:

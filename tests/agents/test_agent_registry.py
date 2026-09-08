@@ -94,4 +94,4 @@ class TestListRuntimes:
         runtimes = {rt["name"]: rt["stability"] for rt in list_runtimes()}
         assert runtimes["claude-code"] == "stable"
         assert runtimes["codex"] == "beta"
-        assert runtimes["tmux"] == "experimental"
+        assert runtimes["tmux"] == "stable"

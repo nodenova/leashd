@@ -152,6 +152,7 @@ class ApprovalCoordinator:
             return ApprovalResult(approved=False)
         finally:
             self.pending.pop(approval_id, None)
+            self.connector.discard_prompt(approval_id)
 
     async def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         pending = self.pending.get(approval_id)
@@ -165,6 +166,10 @@ class ApprovalCoordinator:
 
     def has_pending(self, chat_id: str) -> bool:
         return any(p.chat_id == chat_id for p in self.pending.values())
+
+    def pending_chats(self) -> set[str]:
+        """Every conversation currently blocked on an approval."""
+        return {p.chat_id for p in self.pending.values()}
 
     async def _settle_rejected(
         self, pending: PendingApproval, reason: str | None = None

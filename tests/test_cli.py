@@ -1648,7 +1648,7 @@ class TestRuntime:
 
         _handle_runtime_show()
         captured = capsys.readouterr()
-        assert "claude-code" in captured.out
+        assert "tmux" in captured.out
 
     def test_runtime_show_configured(self, fake_config_dir, capsys):
         from leashd.cli import _handle_runtime_show
@@ -1695,7 +1695,7 @@ class TestRuntime:
         args = argparse.Namespace(runtime_command=None)
         _handle_runtime(args)
         captured = capsys.readouterr()
-        assert "claude-code" in captured.out
+        assert "tmux" in captured.out
 
 
 class TestSkillCli:

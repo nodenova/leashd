@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from leashd.core.session import Session
 
 
@@ -14,6 +16,10 @@ class SessionStore(Protocol):
     async def save(self, session: Session) -> None: ...
 
     async def load(self, user_id: str, chat_id: str) -> Session | None: ...
+
+    async def list_sessions(self, user_id: str, *, chat_base: str) -> list[Session]: ...
+
+    async def list_foreground_sessions(self) -> list[Session]: ...
 
     async def delete(self, user_id: str, chat_id: str) -> None: ...
 
@@ -44,6 +50,15 @@ class MessageStore(Protocol):
         limit: int = ...,
         offset: int = ...,
     ) -> list[dict[str, Any]]: ...
+
+    async def get_last_message(
+        self,
+        user_id: str,
+        chat_id: str,
+        *,
+        role: str | None = ...,
+        since: datetime | None = ...,
+    ) -> dict[str, Any] | None: ...
 
     async def switch_db(self, new_path: Path | str) -> None: ...
 

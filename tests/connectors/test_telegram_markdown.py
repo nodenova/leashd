@@ -490,11 +490,17 @@ class TestRenderOne:
         for limit in range(1, 120):
             assert_parses(render_one(SAMPLE, limit).html)
 
-    def test_falls_back_to_escaped_source_when_rendering_outgrows_the_ceiling(self):
+    def test_sheds_table_alignment_before_it_sheds_markup(self):
         chunk = render_one(GROWING_TABLE, 4000)
 
-        assert visible_length(chunk.html) <= len(chunk.source)
-        assert "<pre>" not in chunk.html
+        assert visible_length(chunk.html) <= TELEGRAM_TEXT_LIMIT
+        assert "<pre>" in chunk.html
+        assert_parses(chunk.html)
+
+    def test_escapes_the_source_only_when_compacting_cannot_save_it(self):
+        chunk = render_one("---\n" * 1200, 4000)
+
+        assert chunk.html == escape(chunk.source)
         assert_parses(chunk.html)
 
 
@@ -527,6 +533,17 @@ GROWING_TABLE = (
     "| leashd/core/safety/gatekeeper.py | 100 |\n" + "| a | b |\n" * 430
 )
 
+TABLE_IN_A_FORMATTED_REPLY = (
+    "## Coverage by module\n\n"
+    "The gaps are **real**, and the ones in *safety* are the ones that matter. "
+    "Start with `gatekeeper.py` before anything else.\n\n"
+    "| module | cov |\n|---|---|\n"
+    "| leashd/core/safety/gatekeeper.py | 100 |\n"
+    + "| a | b |\n" * 60
+    + "\n"
+    + "Each remaining module is a thin wrapper and reads as one screen. " * 30
+)
+
 
 class TestRenderingThatOutgrowsItsSource:
     """Column padding is the one transform that adds characters.
@@ -543,6 +560,23 @@ class TestRenderingThatOutgrowsItsSource:
         for chunk in chunks:
             assert visible_length(chunk.html) <= TELEGRAM_TEXT_LIMIT
             assert_parses(chunk.html)
+
+    def test_a_streamed_reply_keeps_its_markup_when_its_table_overflows(self):
+        """A caller editing one message cannot be given a second one.
+
+        The padded table pushes this reply past the ceiling on its own; before
+        the compact retry existed the message was resent as plain text and lost
+        every heading, bold run and code span it had — the whole reply
+        unformatted because of one table.
+        """
+        chunk = render_one(TABLE_IN_A_FORMATTED_REPLY, 4000)
+
+        assert visible_length(to_html(chunk.source)) > TELEGRAM_TEXT_LIMIT
+        assert visible_length(chunk.html) <= TELEGRAM_TEXT_LIMIT
+        assert chunk.html != escape(chunk.source)
+        for tag in ("<b>", "<i>", "<code>", "<pre>"):
+            assert tag in chunk.html
+        assert_parses(chunk.html)
 
     def test_backstop_escapes_the_source_rather_than_recursing_forever(
         self, monkeypatch

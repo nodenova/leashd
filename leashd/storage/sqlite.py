@@ -7,10 +7,18 @@ from typing import Any
 import aiosqlite
 import structlog
 
+from leashd.core.chat_sessions import SLOT_SEPARATOR
 from leashd.core.session import Session
 from leashd.exceptions import StorageError
 
 logger = structlog.get_logger()
+
+
+def _like_escape(value: str) -> str:
+    for char in ("\\", "%", "_"):
+        value = value.replace(char, f"\\{char}")
+    return value
+
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -128,6 +136,10 @@ class SqliteSessionStore:
                 await self._db.execute(
                     "ALTER TABLE sessions ADD COLUMN resumable_token TEXT"
                 )
+            if "is_foreground" not in existing:
+                await self._db.execute(
+                    "ALTER TABLE sessions ADD COLUMN is_foreground INTEGER DEFAULT 0"
+                )
             # Rename claude_session_id → agent_resume_token for existing DBs
             if "claude_session_id" in existing and "agent_resume_token" not in existing:
                 await self._db.execute(
@@ -173,9 +185,9 @@ class SqliteSessionStore:
             """INSERT OR REPLACE INTO sessions
                (user_id, chat_id, session_id, working_directory,
                 agent_resume_token, resumable_token, created_at, last_used,
-                total_cost, message_count, is_active,
+                total_cost, message_count, is_active, is_foreground,
                 workspace_name, mode, mode_instruction, task_run_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 session.user_id,
                 session.chat_id,
@@ -188,6 +200,7 @@ class SqliteSessionStore:
                 session.total_cost,
                 session.message_count,
                 int(session.is_active),
+                int(session.is_foreground),
                 session.workspace_name,
                 session.mode,
                 session.mode_instruction,
@@ -209,11 +222,58 @@ class SqliteSessionStore:
             return None
         return self._row_to_session(row)
 
+    async def list_sessions(self, user_id: str, *, chat_base: str) -> list[Session]:
+        """Every live session in *chat_base*'s conversation family.
+
+        Matches the base chat id itself plus its ``:s<n>`` slots, so a chat id
+        that merely starts with the same digits is never pulled in.
+        """
+        if not self._db:
+            raise StorageError("Store not initialized — call setup() first")
+        cursor = await self._db.execute(
+            """SELECT * FROM sessions
+               WHERE user_id = ? AND is_active = 1
+                 AND (chat_id = ? OR chat_id LIKE ? ESCAPE '\\')
+               ORDER BY chat_id ASC""",
+            (
+                user_id,
+                chat_base,
+                f"{_like_escape(chat_base)}{SLOT_SEPARATOR}%",
+            ),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_session(row) for row in rows]
+
+    async def list_foreground_sessions(self) -> list[Session]:
+        """Every conversation that owned its chat's stream when work stopped.
+
+        Read once at startup to reattach each chat where its user left it, so
+        only slotted rows matter — a chat sitting on slot 1 is already the
+        default and never needs restoring.
+        """
+        if not self._db:
+            raise StorageError("Store not initialized — call setup() first")
+        cursor = await self._db.execute(
+            """SELECT * FROM sessions
+               WHERE is_active = 1 AND is_foreground = 1
+                 AND chat_id LIKE ? ESCAPE '\\'""",
+            (f"%{SLOT_SEPARATOR}%",),
+        )
+        rows = await cursor.fetchall()
+        return [self._row_to_session(row) for row in rows]
+
     async def delete(self, user_id: str, chat_id: str) -> None:
+        """Retire a session row.
+
+        ``is_foreground`` is cleared with it: a conversation that no longer
+        exists cannot be the one its chat is showing, and a row left flagged
+        is one a later reuse of the same slot restores the chat onto.
+        """
         if not self._db:
             raise StorageError("Store not initialized — call setup() first")
         await self._db.execute(
-            "UPDATE sessions SET is_active = 0 WHERE user_id = ? AND chat_id = ?",
+            "UPDATE sessions SET is_active = 0, is_foreground = 0 "
+            "WHERE user_id = ? AND chat_id = ?",
             (user_id, chat_id),
         )
         await self._db.commit()
@@ -239,6 +299,9 @@ class SqliteSessionStore:
             total_cost=row["total_cost"],
             message_count=row["message_count"],
             is_active=bool(row["is_active"]),
+            is_foreground=bool(
+                row["is_foreground"] if "is_foreground" in keys else False
+            ),
             workspace_name=row["workspace_name"],
             mode=row["mode"] if "mode" in keys else "default",
             mode_instruction=row["mode_instruction"]
@@ -299,3 +362,31 @@ class SqliteSessionStore:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    async def get_last_message(
+        self,
+        user_id: str,
+        chat_id: str,
+        *,
+        role: str | None = None,
+        since: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._db:
+            raise StorageError("Store not initialized — call setup() first")
+        clause = ""
+        params: list[Any] = [user_id, chat_id]
+        if role:
+            clause += " AND role = ?"
+            params.append(role)
+        if since is not None:
+            clause += " AND created_at >= ?"
+            params.append(since.isoformat())
+        cursor = await self._db.execute(
+            f"""SELECT * FROM messages
+                WHERE user_id = ? AND chat_id = ?{clause}
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1""",  # noqa: S608
+            tuple(params),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None

@@ -42,6 +42,7 @@ leashd writes a **managed `--settings`** file and never touches the user's `~/.c
 - **Phantom empty turns.** Stale cross-pane `Stop` hooks can report `num_turns=0`. Turn-completion must be read-before-write so one pane doesn't act on another pane's event.
 - **Orphan panes.** A daemon restart reaps panes; `TmuxSessionManager` also reaps orphaned sessions on a debounce (`_ORPHAN_REAP_DEBOUNCE_SECONDS`).
 - **Dialog watcher leak.** A native-dialog watcher handles unhandled TUI dialogs; it must clear pending interactions, or a leaked interaction gets fed into the next phase's prompt (`/task` verify-hang class).
+- **A follow-up is not always a second response.** `inject_followup` bumps `pending_followups`, and each unit makes the next completion signal *defer* instead of ending the turn. Claude honours that only when it drains its queue with `dequeue`; with `remove` / `reason: absorbed_mid_turn` it folds the text into the response already running, so one signal arrives where two were expected and the turn hangs with **no reply to either message**. The tailer reads `queue-operation` records to keep the counter honest — don't drop that handler. Note the pane cannot tell you this: `_drive_submission`'s `started` check is `"esc to interrupt" in screen`, which is always true mid-turn, so `enqueue` in the JSONL is the only real delivery receipt.
 
 ## Debugging
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -38,9 +39,25 @@ RETRYABLE_PATTERNS = (
     "api_error",
     "overloaded",
     "rate_limit",
-    "529",
-    "500",
+    "temporarily unavailable",
     "maximum buffer size",
+    "response was too large",
+)
+
+_SEP = r"[^0-9A-Za-z]"
+_WORD = r"[0-9A-Za-z]+"
+_ERROR_WORD = (
+    r"(?:http|https|status|code|error|errors|err|exception|failed|failure"
+    r"|server|api|request|response|retry|overloaded|unavailable|internal"
+    r"|gateway|timeout|timed)"
+)
+_ERROR_TOKEN = rf"(?<![0-9A-Za-z]){_ERROR_WORD}(?![0-9A-Za-z])"
+_HTTP_5XX = r"(?<![0-9A-Za-z])5(?:0\d|2\d)(?![0-9A-Za-z])"
+_SLACK = rf"(?:{_SEP}+{_WORD}){{0,2}}{_SEP}+"
+
+HTTP_5XX_PATTERN = re.compile(
+    rf"{_ERROR_TOKEN}{_SLACK}{_HTTP_5XX}|{_HTTP_5XX}{_SLACK}{_ERROR_TOKEN}",
+    re.IGNORECASE,
 )
 
 ERROR_MESSAGES: dict[str, str] = {
@@ -140,8 +157,19 @@ def truncate(text: str, max_len: int = 60) -> str:
 
 
 def is_retryable_error(content: str) -> bool:
+    """Does this text describe a transient failure worth re-running?
+
+    Callers pass a whole agent response, not just a runtime error envelope, and
+    the interactive runtimes fill that with assembled assistant prose. So a 5xx
+    status code counts only when error vocabulary sits within a couple of words
+    of it: a bare "500" in a reply is far more often a row count or a budget
+    figure than an overloaded API, and treating one as transient re-runs the
+    user's prompt behind their back.
+    """
     lowered = content.lower()
-    return any(p in lowered for p in RETRYABLE_PATTERNS)
+    if any(p in lowered for p in RETRYABLE_PATTERNS):
+        return True
+    return HTTP_5XX_PATTERN.search(lowered) is not None
 
 
 def friendly_error(raw: str) -> str:

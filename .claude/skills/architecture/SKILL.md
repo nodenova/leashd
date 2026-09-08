@@ -42,6 +42,7 @@ connector (web / telegram) → MultiConnector (chat_id routing)
 | ↳ audit | `core/safety/audit.py` → `.leashd/audit.jsonl` | append-only decisions |
 | Agent runtimes | `agents/registry.py` + `agents/runtimes/` | `tmux` (default), `claude-cli`, `claude-code`, `codex` |
 | Connectors | `connectors/{web,telegram,multi}.py` | `MultiConnector` routes by `chat_id` |
+| Multi-conversation | `core/chat_sessions.py` + `connectors/telegram_sessions.py` | `/session` — N conversations in one chat, addressed `<chat>:s<n>` |
 | Middleware | `middleware/{auth,rate_limit}.py` | run before the agent |
 | Plugins / events | `core/events.py` (`EventBus`) + `plugins/registry.py` | pub/sub; `create_builtin_plugins()` registers builtins |
 | Autonomous / task | `plugins/builtin/task_v4.py`, `autonomous_loop.py` | `/task` pipeline and post-task retry |

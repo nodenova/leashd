@@ -983,6 +983,36 @@ class TestRequestApprovalButtons:
         assert markup.inline_keyboard[1][0].text == "Approve all 'uv run' cmds"
         assert markup.inline_keyboard[1][0].callback_data == "approval:all:abc-123"
 
+    async def test_approve_all_button_names_a_curl_host(self, connector):
+        mock_app = _make_mock_app()
+        connector._app = mock_app
+
+        await connector.request_approval(
+            "123", "abc-123", "Network access", "Bash::curl raw.githubusercontent.com"
+        )
+
+        calls = mock_app.bot.send_message.await_args_list
+        markup = calls[-1].kwargs["reply_markup"]
+        assert markup.inline_keyboard[1][0].text == (
+            "Approve all 'curl raw.githubusercontent.com' cmds"
+        )
+
+    async def test_approve_all_button_text_is_trimmed(self, connector):
+        """A whole command line as a button label is unreadable on a phone."""
+        mock_app = _make_mock_app()
+        connector._app = mock_app
+
+        long_tool = (
+            "Bash::curl -X POST -d @dump --max-time 60 "
+            "https://api.example.com/a/very/long/path/that/keeps/going"
+        )
+        await connector.request_approval("123", "abc-123", "Network?", long_tool)
+
+        calls = mock_app.bot.send_message.await_args_list
+        text = calls[-1].kwargs["reply_markup"].inline_keyboard[1][0].text
+        assert len(text) < len(long_tool)
+        assert text.endswith("…' cmds")
+
     async def test_approve_all_callback_data_within_64_bytes(self, connector):
         mock_app = _make_mock_app()
         connector._app = mock_app

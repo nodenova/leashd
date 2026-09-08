@@ -141,6 +141,45 @@ class BaseConnector(ABC):
     ) -> None:
         """Schedule a message for deletion after a delay. Default: no-op."""
 
+    def supports_chat_sessions(self, chat_id: str) -> bool:  # noqa: ARG002
+        """True when one chat here multiplexes several leashd conversations.
+
+        A connector whose client already opens a conversation per view (the
+        Web UI's tabs) returns False — it has no single stream to switch.
+        """
+        return False
+
+    async def activate_chat_session(  # noqa: B027
+        self, chat_id: str
+    ) -> None:
+        """Point this chat's stream at *chat_id*. Default: no-op."""
+
+    def chat_session_visible(self, chat_id: str) -> bool:  # noqa: ARG002
+        """Whether what is sent to *chat_id* right now actually reaches a reader.
+
+        False for a conversation whose chat is showing a different one: its
+        output is reduced to a notice, so the caller cannot treat it as seen.
+        """
+        return True
+
+    def discard_prompt(self, prompt_id: str) -> None:  # noqa: B027
+        """Forget a prompt that settled before it was ever shown.
+
+        Only connectors that hold a background conversation's prompts back
+        have anything to drop; everywhere else it is already on screen.
+        """
+
+    async def flush_chat_session_prompts(  # noqa: B027
+        self, chat_id: str
+    ) -> None:
+        """Render the prompts held while *chat_id* was off screen.
+
+        Separate from ``activate_chat_session`` so the caller can put its own
+        landing message up first — a held question released before it reads as
+        belonging to the conversation being left, which is what holding it back
+        was for.
+        """
+
     def set_message_handler(
         self,
         handler: MessageHandler,

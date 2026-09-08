@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from leashd.core.chat_sessions import PRIMARY_INDEX, index_of, is_member
+
 if TYPE_CHECKING:
     from leashd.core.session import Session
 
@@ -23,6 +25,24 @@ class MemorySessionStore:
         if session and session.is_active:
             return session
         return None
+
+    async def list_sessions(self, user_id: str, *, chat_base: str) -> list[Session]:
+        return [
+            session
+            for session in self._data.values()
+            if session.user_id == user_id
+            and session.is_active
+            and is_member(session.chat_id, chat_base)
+        ]
+
+    async def list_foreground_sessions(self) -> list[Session]:
+        return [
+            session
+            for session in self._data.values()
+            if session.is_active
+            and session.is_foreground
+            and index_of(session.chat_id) > PRIMARY_INDEX
+        ]
 
     async def delete(self, user_id: str, chat_id: str) -> None:
         self._data.pop(self._key(user_id, chat_id), None)

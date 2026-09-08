@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import math
 import os
 import shlex
@@ -16,10 +17,20 @@ from typing import TYPE_CHECKING, Any
 import structlog
 from pydantic import BaseModel, ConfigDict
 
+from leashd.agents.runtimes._helpers import is_retryable_error
 from leashd.agents.types import PermissionAllow, PermissionDeny
 from leashd.browser_profile import profile_in_use, prune_restore_state
 from leashd.connectors.base import Attachment, InlineButton
 from leashd.core import plan_gate
+from leashd.core.chat_sessions import (
+    MAX_SLOTS,
+    ChatSessionDirectory,
+    ChatSessionInfo,
+    base_of,
+    compose,
+    index_of,
+    slot_label,
+)
 from leashd.core.config import build_directory_names, ensure_leashd_dir
 from leashd.core.events import (
     COMMAND_TEST,
@@ -147,6 +158,10 @@ _BROWSER_SHUTDOWN_POLLS = 10
 _BROWSER_SHUTDOWN_POLL_SECONDS = 0.3
 
 
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
 class AgentDeadline:
     """Mutable deadline that pauses during user interactions and can be reset.
 
@@ -241,7 +256,21 @@ class _ToolCallbackState:
 
 
 class _StreamingResponder:
-    """Accumulates text chunks and progressively edits a Telegram message."""
+    """Accumulates text chunks and progressively edits a Telegram message.
+
+    Recording and rendering are separate. Every chunk and every tool call is
+    recorded unconditionally, because the buffer is what the engine persists as
+    the turn's reply and what a re-attached chat replays; ``_active`` gates only
+    the writes to the connector. A conversation the chat has moved off keeps
+    filling its buffer in silence, so switching back shows the whole answer and
+    the stored message is not a fragment of it.
+
+    Rendering is serialized on ``_lock``. Chunks arrive from the agent while a
+    switch is putting the same turn back on screen, and the two writers share
+    the message ids and the display offset: unserialized, a chunk landing during
+    a replay opens a second message for text the replay is already writing, and
+    the turn finishes split across duplicates.
+    """
 
     def __init__(
         self,
@@ -257,11 +286,15 @@ class _StreamingResponder:
         self._message_id: str | None = None
         self._last_edit: float = 0.0
         self._active = True
+        self._suspended = False
+        self._closed = False
         self._has_activity: bool = False
         self._tool_counts: dict[str, int] = {}
         self._display_offset: int = 0
         self._all_message_ids: list[str] = []
         self._cursor_paused: bool = False
+        self._current_activity: ToolActivity | None = None
+        self._lock = asyncio.Lock()
 
     @property
     def buffer(self) -> str:
@@ -285,6 +318,10 @@ class _StreamingResponder:
         return {"message_id": self._message_id, "text": text}
 
     async def delete_all_messages(self) -> None:
+        async with self._lock:
+            await self._delete_all_messages()
+
+    async def _delete_all_messages(self) -> None:
         for msg_id in self._all_message_ids:
             await self._connector.delete_message(self._chat_id, msg_id)
         self._all_message_ids.clear()
@@ -305,23 +342,14 @@ class _StreamingResponder:
             parts.append(f"{name} x{count}" if count > 1 else name)
         return "\U0001f9f0 " + ", ".join(parts)
 
-    async def on_chunk(self, text: str) -> None:
-        if not self._active:
-            return
+    async def _advance(self) -> bool:
+        """Bring the chat level with the buffer. False when a send was refused.
 
-        self._cursor_paused = False
-
-        if self._has_activity:
-            await self._connector.clear_activity(self._chat_id)
-            self._has_activity = False
-
-        self._buffer += text
-
-        # Overflow: finalize current message and start a new one
-        while (
-            self._message_id is not None
-            and len(self._buffer) > self._display_offset + _MAX_STREAMING_DISPLAY
-        ):
+        The one place a window is committed and the next one opened, so a live
+        chunk and a replay after a switch paginate identically and land on the
+        same ``_display_offset`` — which is where ``finalize`` picks up.
+        """
+        while len(self._buffer) > self._display_offset + _MAX_STREAMING_DISPLAY:
             window_end = self._display_offset + _MAX_STREAMING_DISPLAY
             raw_window = self._buffer[self._display_offset : window_end]
             split = pending_marker_start(raw_window)
@@ -329,47 +357,80 @@ class _StreamingResponder:
                 window_end = self._display_offset + split
                 raw_window = self._buffer[self._display_offset : window_end]
             committed = strip_file_markers(raw_window) or raw_window
-            await self._connector.edit_message(
-                self._chat_id, self._message_id, committed
-            )
+            if self._message_id is None:
+                msg_id = await self._connector.send_message_with_id(
+                    self._chat_id, committed
+                )
+                if msg_id is None:
+                    return False
+                self._all_message_ids.append(msg_id)
+            else:
+                await self._connector.edit_message(
+                    self._chat_id, self._message_id, committed
+                )
             self._display_offset = window_end
-            display = self._build_display()
-            msg_id = await self._connector.send_message_with_id(self._chat_id, display)
-            if msg_id is None:
-                self._active = False
-                return
-            self._message_id = msg_id
-            self._all_message_ids.append(msg_id)
-            self._last_edit = time.monotonic()
-
+            self._message_id = None
         if self._message_id is None:
-            display = self._build_display()
-            msg_id = await self._connector.send_message_with_id(self._chat_id, display)
+            msg_id = await self._connector.send_message_with_id(
+                self._chat_id, self._build_display()
+            )
             if msg_id is None:
-                self._active = False
-                return
+                return False
             self._message_id = msg_id
             self._all_message_ids.append(msg_id)
             self._last_edit = time.monotonic()
-            return
+        return True
 
-        now = time.monotonic()
-        if now - self._last_edit >= self._throttle:
-            display = self._build_display()
-            await self._connector.edit_message(self._chat_id, self._message_id, display)
-            self._last_edit = now
-
-    async def on_activity(self, activity: ToolActivity | None) -> None:
+    async def on_chunk(self, text: str) -> None:
+        self._buffer += text
         if not self._active:
             return
-
-        if activity is None:
+        async with self._lock:
+            if not self._active:
+                return
+            self._cursor_paused = False
             if self._has_activity:
                 await self._connector.clear_activity(self._chat_id)
                 self._has_activity = False
-            await self._connector.close_agent_group(self._chat_id)
+
+            opened_on = self._message_id
+            if not await self._advance():
+                self._active = False
+                return
+            message_id = self._message_id
+            if message_id is None or message_id != opened_on:
+                return
+
+            now = time.monotonic()
+            if now - self._last_edit >= self._throttle:
+                await self._connector.edit_message(
+                    self._chat_id, message_id, self._build_display()
+                )
+                self._last_edit = now
+
+    async def on_activity(self, activity: ToolActivity | None) -> None:
+        if activity is None:
+            self._current_activity = None
+            if not self._active:
+                return
+            async with self._lock:
+                if self._has_activity:
+                    await self._connector.clear_activity(self._chat_id)
+                    self._has_activity = False
+                await self._connector.close_agent_group(self._chat_id)
             return
 
+        self._tool_counts[activity.tool_name] = (
+            self._tool_counts.get(activity.tool_name, 0) + 1
+        )
+        self._current_activity = activity
+        if not self._active:
+            return
+        async with self._lock:
+            if self._active:
+                await self._show_activity(activity)
+
+    async def _show_activity(self, activity: ToolActivity) -> None:
         if self._message_id is not None and not self._cursor_paused:
             tail = visible_text(self._buffer[self._display_offset :])
             if tail:
@@ -378,9 +439,6 @@ class _StreamingResponder:
                 )
                 self._cursor_paused = True
 
-        self._tool_counts[activity.tool_name] = (
-            self._tool_counts.get(activity.tool_name, 0) + 1
-        )
         await self._connector.send_activity(
             self._chat_id,
             activity.tool_name,
@@ -398,72 +456,175 @@ class _StreamingResponder:
         self._display_offset = 0
         self._all_message_ids.clear()
         self._cursor_paused = False
+        self._current_activity = None
+        self._suspended = False
+        self._closed = False
 
     async def deactivate(self) -> None:
         """Suppress all further streaming and clear any visible activity."""
+        async with self._lock:
+            await self._deactivate()
+
+    async def _deactivate(self) -> None:
         self._active = False
+        self._closed = True
         self._has_activity = False
         await self._connector.clear_activity(self._chat_id)
         await self._connector.close_agent_group(self._chat_id)
 
+    async def suspend(self) -> None:
+        """Stop writing while this conversation is off screen, keeping the turn.
+
+        Distinct from ``deactivate``, which ends the stream for good: a
+        suspended turn is still running and ``resume`` puts it back on screen.
+        What it had written is taken down, because the rest of the reply is
+        about to be withheld and a half-written message left behind would sit
+        frozen mid-sentence under whichever conversation the chat moved to.
+        The buffer keeps filling either way.
+        """
+        async with self._lock:
+            if self._closed:
+                return
+            self._suspended = True
+            self._active = False
+            self._has_activity = False
+            with contextlib.suppress(Exception):
+                await self._delete_all_messages()
+            self._message_id = None
+            self._display_offset = 0
+            self._cursor_paused = False
+            await self._connector.clear_activity(self._chat_id)
+            await self._connector.close_agent_group(self._chat_id)
+
+    async def resume(self) -> bool:
+        """Put a suspended turn back on screen, whole.
+
+        Without it a turn that kept running while the chat looked at another
+        conversation would stay mute after switching back — the roster says
+        *working* and nothing else ever appears. The messages it had written
+        were taken down on the way out, so it re-opens on fresh ones showing
+        everything recorded since, including the tool it is running right now;
+        from here it streams normally again.
+
+        A turn that has already delivered its answer is not resumable — it has
+        no more to say, and replaying its buffer would repeat the reply the
+        chat is about to be handed.
+
+        Reports whether anything was actually put on screen, which is what the
+        caller uses to decide the conversation has something to read. A turn
+        still thinking has produced no text yet, so it puts nothing there and
+        says so: running is not the same as visible, and the caller shows the
+        conversation's last reply instead of leaving it on a bare banner.
+
+        A failed replay is a bad send, not a reason to go mute for the rest of
+        the turn — the conversation is on screen now, so the stream stays open
+        and the next chunk opens a fresh message.
+        """
+        async with self._lock:
+            if self._closed or not self._suspended:
+                return False
+            self._suspended = False
+            self._active = True
+            self._message_id = None
+            self._all_message_ids.clear()
+            self._display_offset = 0
+            self._last_edit = 0.0
+            self._cursor_paused = False
+            self._has_activity = False
+            if not visible_text(self._buffer):
+                return False
+            if not await self._advance():
+                logger.warning("streaming_replay_failed", chat_id=self._chat_id)
+                self._display_offset = len(self._buffer)
+                self._message_id = None
+                return False
+            if self._current_activity is not None:
+                await self._show_activity(self._current_activity)
+            return True
+
     async def cleanup(self) -> None:
         """Remove the streaming cursor and deactivate. Used on error paths."""
-        if self._message_id is not None:
-            tail = visible_text(self._buffer[self._display_offset :])
-            if tail:
-                with contextlib.suppress(Exception):
-                    await self._connector.edit_message(
-                        self._chat_id, self._message_id, tail
-                    )
-            else:
-                with contextlib.suppress(Exception):
-                    await self._connector.delete_message(
-                        self._chat_id, self._message_id
-                    )
-        await self.deactivate()
+        async with self._lock:
+            if self._message_id is not None:
+                tail = visible_text(self._buffer[self._display_offset :])
+                if tail:
+                    with contextlib.suppress(Exception):
+                        await self._connector.edit_message(
+                            self._chat_id, self._message_id, tail
+                        )
+                else:
+                    with contextlib.suppress(Exception):
+                        await self._connector.delete_message(
+                            self._chat_id, self._message_id
+                        )
+            await self._deactivate()
 
     async def finalize(self, final_text: str) -> bool:
+        async with self._lock:
+            return await self._finalize(final_text)
+
+    async def _finalize(self, final_text: str) -> bool:
         if not self._active or self._message_id is None:
             return False
+        self._closed = True
 
         if self._has_activity:
             await self._connector.clear_activity(self._chat_id)
             self._has_activity = False
         await self._connector.close_agent_group(self._chat_id)
-        if len(final_text) > len(strip_file_markers(self._buffer)):
-            # final_text has content not in the streaming buffer (e.g.
-            # sub-agent output filtered during streaming).  _display_offset
-            # was calculated from _buffer and is meaningless here.
-            source = final_text
-            offset = 0
+        stream_showed_every_word = len(final_text) <= len(
+            strip_file_markers(self._buffer)
+        )
+        if stream_showed_every_word:
+            body = (
+                self._buffer[self._display_offset :]
+                if self._display_offset < len(self._buffer)
+                else self._buffer
+            )
+            targets = self._all_message_ids[-1:]
         else:
-            source = self._buffer
-            offset = self._display_offset
-        tail = visible_text(source[offset:] if offset < len(source) else source)
+            body = final_text
+            targets = list(self._all_message_ids)
+        tail = visible_text(body)
 
         summary = self._build_tools_summary()
         last_line = tail.rstrip().rsplit("\n", 1)[-1]
         if summary and not last_line.startswith("\U0001f9f0 "):
             tail = tail + "\n\n" + summary
 
-        try:
-            if len(tail) <= _MAX_STREAMING_DISPLAY:
-                await self._connector.edit_message(
-                    self._chat_id, self._message_id, tail
-                )
-            else:
-                first_chunk = tail[:_MAX_STREAMING_DISPLAY]
-                await self._connector.edit_message(
-                    self._chat_id, self._message_id, first_chunk
-                )
-                remainder = tail[_MAX_STREAMING_DISPLAY:]
-                await self._connector.send_message(self._chat_id, remainder)
+        windows = [
+            tail[i : i + _MAX_STREAMING_DISPLAY]
+            for i in range(0, len(tail), _MAX_STREAMING_DISPLAY)
+        ] or [tail]
 
-            await self._connector.complete_stream(self._chat_id, self._message_id)
+        try:
+            rendered: list[str] = []
+            for message_id, window in zip(targets, windows, strict=False):
+                await self._connector.edit_message(self._chat_id, message_id, window)
+                rendered.append(message_id)
+
+            for message_id in targets[len(windows) :]:
+                await self._connector.delete_message(self._chat_id, message_id)
+                if message_id in self._all_message_ids:
+                    self._all_message_ids.remove(message_id)
+
+            for window in windows[len(targets) :]:
+                new_id = await self._connector.send_message_with_id(
+                    self._chat_id, window
+                )
+                if new_id is None:
+                    await self._connector.send_message(self._chat_id, window)
+                else:
+                    self._all_message_ids.append(new_id)
+                    rendered.append(new_id)
+
+            self._message_id = rendered[-1]
+            for message_id in rendered:
+                await self._connector.complete_stream(self._chat_id, message_id)
             return True
         except Exception:
             logger.debug("streaming_finalize_edit_failed", chat_id=self._chat_id)
-            await self.deactivate()
+            await self._deactivate()
             return False
 
 
@@ -555,6 +716,19 @@ class Engine:
         self._interrupt_message_ids: dict[str, str] = {}
         self._interrupted_chats: set[str] = set()
         self._executing_sessions: dict[str, str] = {}
+        self._chat_session_banners: dict[str, str] = {}
+        self._chat_stream_tail: dict[str, tuple[str, str]] = {}
+        # Strong refs to the turns adopted from a previous daemon (asyncio only
+        # weak-refs tasks), self-pruning via the done-callback.
+        self._reattach_tasks: set[asyncio.Task[None]] = set()
+
+        self._chat_sessions = ChatSessionDirectory(
+            self.session_manager,
+            self._store,
+            live_chats=self._live_chat_ids,
+            busy_chats=lambda: set(self._executing_chats),
+            label_directory=self._directory_label,
+        )
 
         if connector:
             if self.middleware_chain and self.middleware_chain.has_middleware():
@@ -637,6 +811,8 @@ class Engine:
 
         self._pending_interrupts.pop(chat_id, None)
         self._interrupt_message_ids.pop(chat_id, None)
+        if self.connector:
+            self.connector.discard_prompt(interrupt_id)
 
         if send_now:
             self._interrupted_chats.add(chat_id)
@@ -660,6 +836,8 @@ class Engine:
             ctx = PluginContext(event_bus=self.event_bus, config=self.config)
             await self.plugin_registry.init_all(ctx)
             await self.plugin_registry.start_all()
+        await self._restore_chat_session_foreground()
+        await self._adopt_agent_panes()
         await self.event_bus.emit(Event(name=ENGINE_STARTED))
 
     async def shutdown(self) -> None:
@@ -868,6 +1046,16 @@ class Engine:
         chat_id: str,
         attachments: list[Attachment] | None = None,
     ) -> str:
+        """Handle one typed message, always as input to the conversation on screen.
+
+        A prompt raised by a background conversation is deliberately not in the
+        chat — it is held as a notice with an Open button, and rendered only
+        once that conversation is back on screen — so typed text can never be
+        an answer to it. Reading it as one silently swallows a prompt meant for
+        the agent the user is actually looking at.
+        """
+        await self._clear_chat_session_banner(chat_id)
+        self._bury_chat_stream_tail(chat_id)
         if self.approval_coordinator and self.approval_coordinator.has_pending(chat_id):
             resolved = await self.approval_coordinator.reject_with_reason(chat_id, text)
             if resolved:
@@ -1029,6 +1217,8 @@ class Engine:
             old_iid = self._pending_interrupts.pop(chat_id, None)
             if old_iid:
                 self._interrupt_to_chat.pop(old_iid, None)
+                if self.connector:
+                    self.connector.discard_prompt(old_iid)
                 mid = self._interrupt_message_ids.pop(chat_id, None)
                 if mid and self.connector:
                     await self.connector.edit_message(
@@ -1102,6 +1292,7 @@ class Engine:
         await self._realign_paths_for_session(session)
         self._ensure_session_leashd_dir(session)
         self._executing_sessions[chat_id] = session.session_id
+        turn_session_id = session.session_id
         structlog.contextvars.bind_contextvars(session_id=session.session_id)
 
         responder = None
@@ -1144,7 +1335,11 @@ class Engine:
                 attachments=attachments,
             )
 
-            if response.is_error and self._is_retryable_response(response):
+            if (
+                response.is_error
+                and not self._turn_superseded(chat_id, session, turn_session_id)
+                and self._is_retryable_response(response)
+            ):
                 self._recent_failures.setdefault(chat_id, []).append(time.monotonic())
                 backoff = self._failure_backoff(chat_id)
                 delay = max(4, backoff)
@@ -1155,8 +1350,7 @@ class Engine:
                     delay=delay,
                 )
                 await asyncio.sleep(delay)
-                if responder:
-                    responder.reset()
+                await _handle_agent_retry()
                 deadline.reset()
                 response = await self._execute_agent_with_timeout(
                     text,
@@ -1169,6 +1363,21 @@ class Engine:
                     on_retry=_handle_agent_retry,
                     attachments=attachments,
                 )
+
+            if session.session_id != turn_session_id:
+                self._interrupted_chats.discard(chat_id)
+                if responder:
+                    await responder.deactivate()
+                    await responder.delete_all_messages()
+                session.agent_resume_token = None
+                session.resumable_token = None
+                await self.session_manager.save(session)
+                logger.info(
+                    "execution_discarded_cleared_session",
+                    chat_id=chat_id,
+                    turn_session_id=turn_session_id,
+                )
+                return ""
 
             if chat_id in self._interrupted_chats:
                 self._interrupted_chats.discard(chat_id)
@@ -1248,6 +1457,7 @@ class Engine:
 
                 if not streamed and self.connector:
                     await self.connector.send_message(chat_id, response.content)
+                self._note_chat_stream_tail(chat_id, stored_content)
 
                 await self.event_bus.emit(
                     Event(
@@ -1374,6 +1584,20 @@ class Engine:
             return response.content
 
         except AgentError as e:
+            if session.session_id != turn_session_id:
+                self._interrupted_chats.discard(chat_id)
+                if responder:
+                    await responder.deactivate()
+                    await responder.delete_all_messages()
+                session.agent_resume_token = None
+                session.resumable_token = None
+                await self.session_manager.save(session)
+                logger.info(
+                    "execution_discarded_cleared_session",
+                    chat_id=chat_id,
+                    turn_session_id=turn_session_id,
+                )
+                return ""
             if chat_id in self._interrupted_chats:
                 self._interrupted_chats.discard(chat_id)
                 if responder:
@@ -1609,19 +1833,23 @@ class Engine:
     def _is_retryable_response(response: AgentResponse) -> bool:
         if not response.is_error:
             return False
-        lowered = response.content.lower()
-        return any(
-            p in lowered
-            for p in (
-                "temporarily unavailable",
-                "api_error",
-                "overloaded",
-                "rate_limit",
-                "500",
-                "529",
-                "maximum buffer size",
-                "response was too large",
-            )
+        return is_retryable_error(response.content)
+
+    def _turn_superseded(
+        self, chat_id: str, session: Session, turn_session_id: str
+    ) -> bool:
+        """True once this turn no longer owns the chat.
+
+        A cancelled turn returns ``is_error=True`` carrying whatever text the
+        agent had assembled, which is indistinguishable from a transient API
+        failure. Retrying one replays the pre-cancel prompt — after ``/clear``,
+        into a conversation the user has already thrown away. ``/stop`` and
+        ``/cancel`` mark the chat interrupted; ``/clear`` also swaps a fresh
+        ``session_id`` in underneath the running turn, which is what catches a
+        clear whose interrupt marker was already consumed.
+        """
+        return (
+            chat_id in self._interrupted_chats or session.session_id != turn_session_id
         )
 
     def _failure_backoff(self, chat_id: str) -> float:
@@ -1665,9 +1893,33 @@ class Engine:
         chat_id: str,
         attachments: list[Attachment] | None = None,
     ) -> str:
+        """Run a slash command, noting whether its output lands in the chat.
+
+        A command that answers with text buries whatever the conversation last
+        said, so the next return to it has to replay. Keyed on the result
+        rather than on the command name because ``/session <n>`` — the one
+        command that must *not* bury, or every switch would stutter — is told
+        apart from its siblings only by answering with nothing.
+        """
+        result = await self._dispatch_command(
+            user_id, command, args, chat_id, attachments
+        )
+        if result.strip():
+            self._bury_chat_stream_tail(chat_id)
+        return result
+
+    async def _dispatch_command(
+        self,
+        user_id: str,
+        command: str,
+        args: str,
+        chat_id: str,
+        attachments: list[Attachment] | None = None,
+    ) -> str:
         logger.info(
             "command_received", user_id=user_id, chat_id=chat_id, command=command
         )
+        await self._clear_chat_session_banner(chat_id)
 
         session = await self.session_manager.get_or_create(
             user_id, chat_id, self._default_directory
@@ -1687,6 +1939,9 @@ class Engine:
 
         if command == "dir":
             return await self._handle_dir_command(session, args, chat_id, user_id)
+
+        if command in ("session", "sessions"):
+            return await self._handle_session_command(args, chat_id, user_id)
 
         if command in ("workspace", "ws"):
             return await self._handle_workspace_command(session, args, chat_id, user_id)
@@ -1944,6 +2199,14 @@ class Engine:
                 f"Mode: {mode}",
                 f"Directory: {active_name}",
             ]
+            siblings = await self._chat_sessions.slots(
+                user_id, base_of(chat_id), foreground=chat_id
+            )
+            if len(siblings) > 1:
+                lines.insert(
+                    0,
+                    f"Conversation: {slot_label(index_of(chat_id))} of {len(siblings)}",
+                )
             if session.workspace_name:
                 lines.append(f"Workspace: {session.workspace_name}")
             lines.extend(
@@ -2265,11 +2528,25 @@ class Engine:
         )
 
     def _active_dir_name(self, session: Session) -> str:
-        wd = Path(session.working_directory)
+        return self._directory_label(session.working_directory)
+
+    def _directory_label(self, working_directory: str) -> str:
+        wd = Path(working_directory)
         for name, path in self._dir_names.items():
             if path == wd:
                 return name
         return wd.name
+
+    def _live_chat_ids(self) -> set[str]:
+        """Chats whose runtime is holding a live agent, when it can say."""
+        probe = getattr(self.agent, "live_chat_ids", None)
+        if probe is None:
+            return set(self._executing_chats)
+        try:
+            return set(probe())
+        except Exception:
+            logger.debug("live_chat_ids_probe_failed")
+            return set(self._executing_chats)
 
     def _ensure_session_leashd_dir(self, session: Session) -> None:
         wd = Path(session.working_directory)
@@ -2358,6 +2635,7 @@ class Engine:
                 await self.connector.send_message(
                     chat_id, "Select directory:", buttons=buttons
                 )
+                self._bury_chat_stream_tail(chat_id)
                 return ""
             lines = []
             for name, path in self._dir_names.items():
@@ -2390,6 +2668,665 @@ class Engine:
         )
         suffix = f" (workspace '{old_workspace}' deactivated)" if old_workspace else ""
         return f"Switched to {target} ({target_path}){suffix}"
+
+    async def _handle_session_command(
+        self, args: str, chat_id: str, user_id: str
+    ) -> str:
+        """``/session`` — several conversations inside one connector chat.
+
+        Only meaningful where the connector shows one conversation at a time;
+        a client with its own tabs (the Web UI) gets the roster read-only.
+        """
+        base = base_of(chat_id)
+        raw = args.strip()
+        verb, _, rest = raw.partition(" ")
+        verb = verb.lower()
+        rest = rest.strip()
+        if verb.isdigit():
+            verb, rest = "switch", verb
+
+        if verb == "switch":
+            return await self._switch_chat_session(rest, base, chat_id, user_id)
+        if verb == "new":
+            return await self._new_chat_session(rest, base, chat_id, user_id)
+        if verb == "confirm-kill":
+            return await self._confirm_kill_chat_session(rest, base, chat_id, user_id)
+        if verb in ("kill", "terminate", "close"):
+            return await self._kill_chat_session(rest, base, chat_id, user_id)
+        if verb:
+            return (
+                f"Unknown /session action: {verb}\n"
+                "Usage: /session · /session <n> · /session new [dir] · "
+                "/session kill <n>"
+            )
+        return await self._render_chat_sessions(base, chat_id, user_id)
+
+    async def _render_chat_sessions(self, base: str, chat_id: str, user_id: str) -> str:
+        infos = await self._chat_sessions.slots(user_id, base, foreground=chat_id)
+        lines = ["Conversations in this chat:", ""]
+        lines.extend(info.render() for info in infos)
+
+        switchable = self.connector is not None and (
+            self.connector.supports_chat_sessions(chat_id)
+        )
+        if not switchable:
+            return "\n".join(lines)
+
+        buttons: list[list[InlineButton]] = []
+        for info in infos:
+            row = [
+                InlineButton(
+                    text=info.button_text(),
+                    callback_data=f"sess:sw:{info.index}",
+                )
+            ]
+            if not info.is_primary:
+                row.append(InlineButton(text="✕", callback_data=f"sess:k:{info.index}"))
+            buttons.append(row)
+        if len(infos) < MAX_SLOTS:
+            buttons.append(
+                [InlineButton(text="+ New conversation", callback_data="sess:new")]
+            )
+        await self.connector.send_message(  # type: ignore[union-attr]
+            chat_id, "\n".join(lines), buttons=buttons
+        )
+        self._bury_chat_stream_tail(chat_id)
+        return ""
+
+    async def _switch_chat_session(
+        self, token: str, base: str, chat_id: str, user_id: str
+    ) -> str:
+        target = await self._chat_sessions.resolve(
+            user_id, base, token, foreground=chat_id
+        )
+        if target is None:
+            if not token.isdigit():
+                return "Usage: /session <n>"
+            return f"No conversation {slot_label(int(token))} in this chat."
+        if target.chat_id == chat_id:
+            await self._send_transient(
+                chat_id, f"▸ {slot_label(target.index)} · {target.directory}"
+            )
+            return ""
+
+        await self._attach_chat_session(target, user_id, leaving=chat_id)
+        return ""
+
+    async def _retire_foreground_stream(self, chat_id: str) -> None:
+        """Withdraw a half-streamed reply the chat is about to move off.
+
+        The rest of that reply is about to be withheld — the conversation is
+        going into the background — so leaving the responder writing would
+        freeze a partial message mid-sentence and swallow the finished answer
+        (``finalize`` reports success on a stream it can no longer write to).
+        Suspending it removes the fragment and lets the engine's plain-send
+        fallback deliver the completed reply as a background notice instead,
+        while keeping the turn resumable if the chat comes back to it.
+        """
+        responder = self._active_responders.get(chat_id)
+        if responder is None:
+            return
+        with contextlib.suppress(Exception):
+            await responder.suspend()
+        logger.info("chat_session_stream_retired", chat_id=chat_id)
+
+    async def _resume_foreground_stream(self, chat_id: str) -> bool:
+        """Put a still-running turn back on screen after switching into it.
+
+        Returns whether anything was actually put back on screen, which is
+        also the answer to whether the banner should replay this
+        conversation's previous reply: a turn that has written something is
+        about to render it underneath, one that is still thinking has nothing
+        to show for itself and leaves the replay to say where it left off.
+        """
+        responder = self._active_responders.get(chat_id)
+        if responder is None:
+            return False
+        resumed = await responder.resume()
+        logger.info("chat_session_stream_resumed", chat_id=chat_id, resumed=resumed)
+        return resumed
+
+    async def _attach_chat_session(
+        self,
+        target: ChatSessionInfo,
+        user_id: str,
+        *,
+        leaving: str | None = None,
+        banner: bool = True,
+    ) -> None:
+        """Put the chat's stream on *target* and replay where it left off.
+
+        ``banner`` is off where the caller is about to say where the chat
+        landed itself — the roster after a terminate names the same slot the
+        banner would have, one line apart.
+
+        A turn with something already written renders it underneath the
+        banner. Anything else — no turn running, one that ended during the
+        banner's own round trip, one still thinking with nothing to show —
+        gets the conversation's last reply replayed instead, as a message of
+        its own rather than folded into the banner, which the next thing the
+        user says clears.
+        """
+        if leaving is not None and leaving != target.chat_id:
+            await self._retire_foreground_stream(leaving)
+        if self.connector is not None:
+            await self.connector.activate_chat_session(target.chat_id)
+        session = await self.session_manager.get_or_create(
+            user_id, target.chat_id, target.working_directory
+        )
+        await self._realign_paths_for_session(session)
+        self._ensure_session_leashd_dir(session)
+        await self._persist_foreground(session, user_id, leaving=leaving)
+
+        header = (
+            f"▸ {slot_label(target.index)} · {target.directory} · "
+            f"{target.mode} · {target.status}"
+        )
+        mid_turn = target.chat_id in self._active_responders
+        if banner:
+            await self._post_chat_session_banner(target.chat_id, header)
+        resumed = False
+        if mid_turn:
+            resumed = await self._resume_foreground_stream(target.chat_id)
+        if banner and not resumed:
+            await self._replay_chat_session_transcript(session)
+        if self.connector is not None:
+            await self.connector.flush_chat_session_prompts(target.chat_id)
+        logger.info(
+            "chat_session_attached",
+            chat_id=target.chat_id,
+            slot=target.index,
+            live=target.live,
+            busy=target.busy,
+            resumed=resumed,
+        )
+
+    async def _persist_foreground(
+        self, session: Session, user_id: str, *, leaving: str | None
+    ) -> None:
+        """Record which conversation owns the chat's stream, across restarts.
+
+        The connector's foreground map is in-memory, so without this a restart
+        drops the chat back to slot 1 and the next thing the user says lands in
+        a different conversation — and a different working directory — with no
+        sign that it moved.
+        """
+        session.is_foreground = True
+        await self.session_manager.save(session)
+        if leaving is None or leaving == session.chat_id:
+            return
+        previous = self.session_manager.get(user_id, leaving)
+        if previous is None or not previous.is_foreground:
+            return
+        previous.is_foreground = False
+        await self.session_manager.save(previous)
+
+    async def _adopt_agent_panes(self) -> None:
+        """Reclaim the agents a previous daemon left running.
+
+        The tmux runtime's panes live on a tmux server of their own, so
+        restarting leashd to pick up a fix no longer has to end the work in
+        them. Each reclaimed pane is matched back to its stored conversation;
+        one that was mid-turn keeps streaming into the chat as if the restart
+        had not happened, and one whose conversation has since moved on is
+        terminated rather than left running unreachable.
+        """
+        adopter = getattr(self.agent, "adopt_panes", None)
+        if adopter is None:
+            return
+        try:
+            adopted = await adopter()
+        except Exception:
+            logger.exception("agent_pane_adoption_failed")
+            return
+        for pane in adopted:
+            session = await self.session_manager.get_or_create(
+                pane.user_id, pane.chat_id, pane.working_directory
+            )
+            if session.session_id != pane.session_id:
+                logger.info(
+                    "adopted_pane_conversation_moved_on",
+                    chat_id=pane.chat_id,
+                    pane_session_id=pane.session_id,
+                    session_id=session.session_id,
+                )
+                await self.agent.cancel(pane.session_id)
+                continue
+            if pane.turn is None:
+                continue
+            self._executing_sessions[pane.chat_id] = pane.session_id
+            task = asyncio.create_task(self._finish_reattached_turn(session))
+            self._reattach_tasks.add(task)
+            task.add_done_callback(self._reattach_tasks.discard)
+
+    async def _finish_reattached_turn(self, session: Session) -> None:
+        """Stream and deliver a turn that started under a previous daemon."""
+        chat_id = session.chat_id
+        start = time.monotonic()
+        responder: _StreamingResponder | None = None
+        if self.connector and self.config.streaming_enabled:
+            responder = _StreamingResponder(
+                self.connector,
+                chat_id,
+                throttle_seconds=self.config.streaming_throttle_seconds,
+            )
+            self._active_responders[chat_id] = responder
+        reattach = getattr(self.agent, "reattach_turn", None)
+        if reattach is None:
+            return
+        try:
+            response = await reattach(
+                session,
+                on_text_chunk=responder.on_chunk if responder else None,
+                on_tool_activity=responder.on_activity if responder else None,
+            )
+            if response is None:
+                return
+            await self.session_manager.update_from_result(
+                session, agent_resume_token=response.session_id, cost=response.cost
+            )
+            stored_content = response.content
+            if responder and responder.buffer:
+                stored_content = strip_file_markers(responder.buffer)
+            await self._message_logger.log(
+                user_id=session.user_id,
+                chat_id=chat_id,
+                role="assistant",
+                content=stored_content,
+                cost=response.cost,
+                duration_ms=round((time.monotonic() - start) * 1000),
+                session_id=response.session_id,
+            )
+            streamed = False
+            if responder:
+                with contextlib.suppress(Exception):
+                    streamed = await responder.finalize(response.content)
+            if not streamed and self.connector:
+                await self.connector.send_message(chat_id, response.content)
+            self._note_chat_stream_tail(chat_id, stored_content)
+            await self.event_bus.emit(
+                Event(
+                    name=MESSAGE_OUT,
+                    data={"chat_id": chat_id, "content": response.content},
+                )
+            )
+            await self.event_bus.emit(
+                Event(
+                    name=SESSION_COMPLETED,
+                    data={
+                        "session": session,
+                        "session_id": session.session_id,
+                        "chat_id": chat_id,
+                        "user_id": session.user_id,
+                        "response_content": response.content,
+                        "cost": response.cost,
+                        "is_error": response.is_error,
+                    },
+                )
+            )
+            logger.info(
+                "reattached_turn_completed",
+                chat_id=chat_id,
+                session_id=session.session_id,
+                response_length=len(response.content),
+                cost_usd=response.cost,
+            )
+        except Exception:
+            logger.exception("reattached_turn_failed", chat_id=chat_id)
+        finally:
+            if self._active_responders.get(chat_id) is responder:
+                self._active_responders.pop(chat_id, None)
+            if self._executing_sessions.get(chat_id) == session.session_id:
+                self._executing_sessions.pop(chat_id, None)
+
+    async def _restore_chat_session_foreground(self) -> None:
+        """Reattach every chat to the conversation it was showing.
+
+        Slot 1 is the default, so only slotted rows are stored and restored;
+        a chat that never opened a second conversation is untouched.
+        """
+        if self.connector is None or self._store is None:
+            return
+        reader = getattr(self._store, "list_foreground_sessions", None)
+        if reader is None:
+            return
+        try:
+            sessions = await reader()
+        except Exception:
+            logger.debug("chat_session_foreground_restore_failed")
+            return
+        newest: dict[str, Session] = {}
+        for session in sessions:
+            base = base_of(session.chat_id)
+            held = newest.get(base)
+            if held is None or session.last_used > held.last_used:
+                newest[base] = session
+        for session in newest.values():
+            await self.connector.activate_chat_session(session.chat_id)
+            logger.info(
+                "chat_session_foreground_restored",
+                chat_id=session.chat_id,
+                slot=index_of(session.chat_id),
+            )
+
+    async def _post_chat_session_banner(self, chat_id: str, text: str) -> None:
+        """Show where the chat just landed, without leaving chrome behind.
+
+        Exactly one banner exists per chat and the next thing the user says
+        clears it, so a chat that has finished switching reads the same as one
+        that never held more than a single conversation.
+        """
+        if self.connector is None:
+            return
+        await self._clear_chat_session_banner(chat_id)
+        message_id = await self.connector.send_message_with_id(chat_id, text)
+        if message_id is None:
+            await self.connector.send_message(chat_id, text)
+            return
+        self._chat_session_banners[base_of(chat_id)] = message_id
+
+    async def _replay_chat_session_transcript(self, session: Session) -> None:
+        """Put this conversation's last reply back in the chat, whole.
+
+        A message of its own rather than part of the landing banner: the banner
+        is chrome the next thing the user says clears, and a reply folded into
+        it would be cleared along with it. Sent through the connector's normal
+        chunking too, so a long answer arrives complete rather than cut down to
+        whatever fits one message.
+
+        Replayed on every arrival, because one chat stream carries every
+        conversation in it: whatever this one last said is buried under
+        whatever the others have said since, and landing on a bare banner
+        leaves nothing to read the next message against.
+
+        The one exception is a reply that is still the last thing in the chat
+        — nothing has been written over it, so it sits directly above the
+        banner and posting it again would only stutter.
+        """
+        if self.connector is None:
+            return
+        content = await self._last_chat_session_message(session)
+        if not content:
+            return
+        chat_id = session.chat_id
+        tail = (chat_id, _digest(content))
+        if self._chat_stream_tail.get(base_of(chat_id)) == tail:
+            return
+        await self.connector.send_message(chat_id, content)
+        self._chat_stream_tail[base_of(chat_id)] = tail
+
+    def _note_chat_stream_tail(self, chat_id: str, content: str) -> None:
+        """Record which conversation's reply now ends the chat it went to.
+
+        Only what actually reached the chat counts. A conversation off screen
+        delivers a notice instead, so nothing of its reply is in the chat and
+        the tail belongs to no conversation at all — the next arrival replays
+        in full.
+
+        Digested exactly as the replay reads it back out of the store, or the
+        two never match and the guard never fires.
+        """
+        body = content.strip()
+        if not body:
+            return
+        base = base_of(chat_id)
+        if self.connector is None or not self.connector.chat_session_visible(chat_id):
+            self._chat_stream_tail.pop(base, None)
+            return
+        self._chat_stream_tail[base] = (chat_id, _digest(body))
+
+    def _drop_chat_stream_tail(self, chat_id: str) -> None:
+        """Forget a conversation's reply once its transcript is gone."""
+        base = base_of(chat_id)
+        tail = self._chat_stream_tail.get(base)
+        if tail is not None and tail[0] == chat_id:
+            self._chat_stream_tail.pop(base, None)
+
+    def _bury_chat_stream_tail(self, chat_id: str) -> None:
+        """Note that something else has been written into the chat.
+
+        The replay is skipped only while the conversation's own reply is still
+        the last thing in the chat. Anything else that lands there buries it —
+        a roster, a picker, a command's output, the next thing the user types —
+        and the guard has to hear about it, or coming back lands on a banner
+        with the answer scrolled away above it. Only the landing banner is
+        exempt: it sits directly under the reply and is cleared on the way out.
+        """
+        self._chat_stream_tail.pop(base_of(chat_id), None)
+
+    async def _clear_chat_session_banner(self, chat_id: str) -> None:
+        base = base_of(chat_id)
+        message_id = self._chat_session_banners.pop(base, None)
+        if message_id is None or self.connector is None:
+            return
+        with contextlib.suppress(Exception):
+            await self.connector.delete_message(base, message_id)
+
+    async def _last_chat_session_message(self, session: Session) -> str:
+        """The last reply *this* conversation gave, never an earlier tenant's.
+
+        A terminated slot is handed to the next ``/session new``, and the store
+        is keyed by that slot rather than by the conversation, so the rows the
+        dead one left behind sit under the new one's chat id. Reading from the
+        conversation's own start excludes them, and excludes what `/clear` and
+        a directory switch have already put behind the conversation.
+        """
+        if self._message_store is None:
+            return ""
+        reader = getattr(self._message_store, "get_last_message", None)
+        if reader is None:
+            return ""
+        chat_id = session.chat_id
+        try:
+            row = await reader(
+                session.user_id, chat_id, role="assistant", since=session.created_at
+            )
+        except Exception:
+            logger.debug("chat_session_last_message_failed", chat_id=chat_id)
+            return ""
+        if not row:
+            return ""
+        return str(row.get("content", "")).strip()
+
+    async def _new_chat_session(
+        self, target_dir: str, base: str, chat_id: str, user_id: str
+    ) -> str:
+        index = await self._chat_sessions.next_index(user_id, base)
+        if index is None:
+            return (
+                f"This chat already has {MAX_SLOTS} conversations — "
+                "terminate one first (/session)."
+            )
+        working_directory = self._default_directory
+        if target_dir:
+            if target_dir not in self._dir_names:
+                available = ", ".join(self._dir_names)
+                return f"Unknown directory: {target_dir}\nAvailable: {available}"
+            working_directory = str(self._dir_names[target_dir])
+        else:
+            current = self.session_manager.get(user_id, chat_id)
+            if current is not None:
+                working_directory = current.working_directory
+
+        new_chat_id = compose(base, index)
+        session = await self.session_manager.get_or_create(
+            user_id, new_chat_id, working_directory
+        )
+        session.working_directory = working_directory
+        await self.session_manager.save(session)
+        logger.info(
+            "chat_session_created",
+            chat_id=new_chat_id,
+            slot=index,
+            directory=working_directory,
+        )
+
+        target = ChatSessionInfo(
+            chat_id=new_chat_id,
+            index=index,
+            session_id=session.session_id,
+            working_directory=working_directory,
+            directory=self._directory_label(working_directory),
+            mode=session.mode,
+            live=False,
+            busy=False,
+            foreground=True,
+            message_count=0,
+            total_cost=0.0,
+        )
+        await self._attach_chat_session(target, user_id, leaving=chat_id)
+        if not target_dir:
+            await self._offer_new_session_directory(session, new_chat_id)
+        return ""
+
+    async def _offer_new_session_directory(
+        self, session: Session, chat_id: str
+    ) -> None:
+        """Ask a brand-new conversation which project it is for.
+
+        It inherits the directory of the one it was opened from, which is
+        almost never what a second conversation is for — the point of opening
+        one is usually to work somewhere else. The picker is offered rather
+        than forced: the inherited directory is already live and marked, so
+        ignoring this and typing straight away works.
+        """
+        if self.connector is None or len(self._dir_names) <= 1:
+            return
+        buttons = [
+            [
+                InlineButton(
+                    text=f"{name}{' ✅' if str(path) == session.working_directory else ''}",
+                    callback_data=f"dir:{name}",
+                )
+            ]
+            for name, path in self._dir_names.items()
+        ]
+        await self.connector.send_message(
+            chat_id, "Select directory for this conversation:", buttons=buttons
+        )
+        self._bury_chat_stream_tail(chat_id)
+
+    async def _confirm_kill_chat_session(
+        self, token: str, base: str, chat_id: str, user_id: str
+    ) -> str:
+        target = await self._chat_sessions.resolve(
+            user_id, base, token, foreground=chat_id
+        )
+        if target is None:
+            return "That conversation is already gone."
+        if self.connector is None:
+            return ""
+        warning = " It is working right now — that work is lost." if target.busy else ""
+        outcome = (
+            "Its agent is stopped and its history cleared, but it stays in the "
+            "list — the first conversation is the chat itself."
+            if target.is_primary
+            else "Its agent is stopped and its pane closed."
+        )
+        verb = "Clear" if target.is_primary else "Terminate"
+        confirm = "Yes, clear it" if target.is_primary else "Yes, terminate"
+
+        await self.connector.send_message(
+            chat_id,
+            f"{verb} {slot_label(target.index)} · {target.directory}?{warning}\n"
+            f"{outcome}",
+            buttons=[
+                [
+                    InlineButton(
+                        text=confirm,
+                        callback_data=f"sess:kk:{target.index}",
+                    ),
+                    InlineButton(text="Cancel", callback_data="sess:list"),
+                ]
+            ],
+        )
+        self._bury_chat_stream_tail(chat_id)
+        return ""
+
+    async def _kill_chat_session(
+        self, token: str, base: str, chat_id: str, user_id: str
+    ) -> str:
+        """Stop a conversation's agent and, where it can be, drop the slot.
+
+        Slot 1 is the connector chat's own id, so there is no slot to free —
+        the chat always has a first conversation. Terminating it is a reset,
+        and saying "terminated" while the row stays on the roster is what sent
+        people round the loop of tapping it again; it reports what it did
+        instead, and the roster offers no ✕ on the one row it cannot remove.
+        """
+        target = await self._chat_sessions.resolve(
+            user_id, base, token, foreground=chat_id
+        )
+        if target is None:
+            return "That conversation is already gone."
+
+        session = await self.session_manager.get_or_create(
+            user_id, target.chat_id, target.working_directory
+        )
+        await self._signal_task_cancel(target.chat_id, user_id)
+        await self._cleanup_session(session, target.chat_id)
+
+        if target.is_primary:
+            await self.session_manager.reset(user_id, target.chat_id)
+        else:
+            await self.session_manager.deactivate(user_id, target.chat_id)
+        self._drop_chat_stream_tail(target.chat_id)
+        logger.info(
+            "chat_session_terminated",
+            chat_id=target.chat_id,
+            slot=target.index,
+            primary=target.is_primary,
+        )
+
+        if target.is_primary:
+            await self._send_transient(
+                chat_id,
+                f"Cleared {slot_label(target.index)} · {target.directory}. "
+                "The first conversation is this chat, so it is reset rather "
+                "than removed.",
+            )
+            return ""
+        if target.chat_id == chat_id:
+            return await self._land_after_kill(user_id, base, target)
+        await self._send_transient(
+            chat_id,
+            f"Terminated {slot_label(target.index)} · {target.directory}.",
+        )
+        return ""
+
+    async def _land_after_kill(
+        self, user_id: str, base: str, killed: ChatSessionInfo
+    ) -> str:
+        """Where the chat goes once the conversation it was showing is gone.
+
+        With one conversation left there is nothing to choose, so it just goes
+        there. With several, picking one for the user drops them into whichever
+        happened to sort first — so the roster is shown and they say which.
+        """
+        await self._retire_foreground_stream(killed.chat_id)
+        remaining = await self._fallback_chat_sessions(user_id, base, killed.chat_id)
+        terminated = f"Terminated {slot_label(killed.index)} · {killed.directory}."
+        if not remaining:
+            if self.connector is not None:
+                await self.connector.activate_chat_session(base)
+            await self._send_transient(base, terminated)
+            return ""
+        landing = next((info for info in remaining if info.is_primary), remaining[0])
+        choosing = len(remaining) > 1
+        await self._attach_chat_session(landing, user_id, banner=not choosing)
+        if not choosing:
+            return ""
+        await self._send_transient(base, terminated)
+        return await self._render_chat_sessions(base, landing.chat_id, user_id)
+
+    async def _fallback_chat_sessions(
+        self, user_id: str, base: str, closed: str
+    ) -> list[ChatSessionInfo]:
+        return [
+            info
+            for info in await self._chat_sessions.slots(user_id, base, foreground=base)
+            if info.chat_id != closed
+        ]
 
     async def _handle_workspace_command(
         self, session: Session, args: str, chat_id: str, user_id: str
@@ -2429,6 +3366,7 @@ class Engine:
                         ]
                     )
                 await self.connector.send_message(chat_id, text, buttons=buttons)
+                self._bury_chat_stream_tail(chat_id)
                 return ""
             return text
 

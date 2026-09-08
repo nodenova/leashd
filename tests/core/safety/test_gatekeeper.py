@@ -90,7 +90,7 @@ class TestGatekeeperWithPolicy:
 
     async def test_policy_deny(self, policy_gatekeeper):
         result = await policy_gatekeeper.check(
-            "Bash", {"command": "rm -rf /"}, "s1", "c1"
+            "Bash", {"command": "sudo rm -rf /"}, "s1", "c1"
         )
         assert result.behavior == "deny"
 
@@ -234,7 +234,7 @@ class TestGatekeeperEdgeCases:
             event_bus=event_bus,
             policy_engine=policy_engine,
         )
-        result = await gk.check("Bash", {"command": "rm -rf /"}, "s1", "c1")
+        result = await gk.check("Bash", {"command": "sudo rm -rf /"}, "s1", "c1")
         assert result.behavior == "deny"
         assert "Destructive" in result.message or "dangerous" in result.message.lower()
 
@@ -434,7 +434,7 @@ class TestGatekeeperAutoApprove:
         gk = auto_approve_gatekeeper
         gk.enable_auto_approve("c1")
 
-        result = await gk.check("Bash", {"command": "rm -rf /"}, "s1", "c1")
+        result = await gk.check("Bash", {"command": "sudo rm -rf /"}, "s1", "c1")
         assert result.behavior == "deny"
 
     def test_per_tool_auto_approve_enable(self, auto_approve_gatekeeper):
@@ -610,14 +610,111 @@ class TestApprovalKeyExtraction:
     def test_bash_agent_browser_with_long_flag(self):
         # Regression: agent-browser --session <id> click @e5 used to key as
         # Bash::agent-browser (bare), missing the AGENT_BROWSER_AUTO_APPROVE
-        # allowlist entry Bash::agent-browser click. Now the third @-token is
-        # also kept in the key, but matching against the stored 2-token
-        # allowlist entry still works via the prefix-with-word-boundary
-        # check in _matches_auto_approved.
+        # allowlist entry Bash::agent-browser click.
         key = _approval_key(
             "Bash", {"command": "agent-browser --session foo click @e5"}
         )
-        assert key.startswith("Bash::agent-browser click")
+        assert key == "Bash::agent-browser click"
+
+
+class TestApprovalKeyStability:
+    """Keys must survive an argument change, or "Approve all" grants nothing.
+
+    Every command here was gated in a real session; the human tapped "Approve
+    all" and was asked again on the next call because the argument was baked
+    into the key (Bash::agent-browser eval '({w: ...).
+    """
+
+    def test_agent_browser_stops_at_subcommand(self):
+        assert (
+            _approval_key(
+                "Bash",
+                {"command": 'agent-browser open "http://127.0.0.1:8899/a.html"'},
+            )
+            == "Bash::agent-browser open"
+        )
+        assert (
+            _approval_key("Bash", {"command": 'agent-browser eval "({w: innerWidth})"'})
+            == "Bash::agent-browser eval"
+        )
+
+    def test_same_subcommand_different_argument_shares_a_key(self):
+        first = _approval_key("Bash", {"command": 'agent-browser open "http://a"'})
+        second = _approval_key("Bash", {"command": 'agent-browser open "http://b"'})
+        assert first == second
+
+    def test_redirection_not_baked_into_key(self):
+        assert (
+            _approval_key("Bash", {"command": "agent-browser tab 2>&1 | tail -10"})
+            == "Bash::agent-browser tab"
+        )
+
+    def test_leading_assignment_keys_the_real_command(self):
+        assert (
+            _approval_key(
+                "Bash",
+                {"command": 'SP=/tmp/x; agent-browser eval "x" >/dev/null 2>&1'},
+            )
+            == "Bash::agent-browser eval"
+        )
+
+    def test_loop_body_keys_the_real_command(self):
+        assert (
+            _approval_key(
+                "Bash", {"command": 'for y in 1 2; do agent-browser eval "x"; done'}
+            )
+            == "Bash::agent-browser eval"
+        )
+
+    def test_cd_prefix_still_keys_the_real_command(self):
+        assert (
+            _approval_key(
+                "Bash", {"command": 'cd /tmp/x && agent-browser eval "y" 2>&1'}
+            )
+            == "Bash::agent-browser eval"
+        )
+
+    def test_kill_commands_key_on_their_target(self):
+        """Each distinct kill target is its own approval decision.
+
+        Regression: the generic key skips flag-shaped tokens, so every
+        ``pkill`` collapsed to ``Bash::pkill``. One "Approve all" on a routine
+        ``pkill -f agent-browser`` browser cleanup then silently authorised
+        ``pkill -f claude`` — which SIGTERMed every other conversation's agent
+        mid-turn, and never the caller's own (pkill skips its ancestors).
+        """
+        browser = _approval_key("Bash", {"command": 'pkill -f "agent-browser"'})
+        chrome = _approval_key("Bash", {"command": 'pkill -f "Chrome for Testing"'})
+        claude = _approval_key("Bash", {"command": "pkill -f claude"})
+        assert browser == 'Bash::pkill -f "agent-browser"'
+        assert len({browser, chrome, claude}) == 3
+
+    def test_kill_key_survives_chained_redirected_form(self):
+        """The form actually seen in the incident keys the same as the bare one."""
+        assert _approval_key(
+            "Bash",
+            {"command": 'pkill -f "agent-browser" 2>/dev/null; sleep 2; echo done'},
+        ) == _approval_key("Bash", {"command": 'pkill -f "agent-browser"'})
+
+    def test_kill_family_covers_kill_and_killall(self):
+        assert (
+            _approval_key("Bash", {"command": "kill -9 1234"}) == "Bash::kill -9 1234"
+        )
+        assert (
+            _approval_key("Bash", {"command": "killall claude"})
+            == "Bash::killall claude"
+        )
+
+    def test_redirect_fd_not_left_as_trailing_token(self):
+        """``2>`` is one operator — the fd must not survive as a key word."""
+        assert _approval_key("Bash", {"command": "ls -la 2>/dev/null"}) == "Bash::ls"
+        assert _approval_key("Bash", {"command": "echo 2 | cat"}) == "Bash::echo 2"
+
+    def test_non_browser_commands_keep_three_words(self):
+        assert (
+            _approval_key("Bash", {"command": "uv run pytest tests/"})
+            == "Bash::uv run pytest"
+        )
 
     def test_bash_agent_browser_with_equals_flag(self):
         assert (
@@ -1326,7 +1423,7 @@ class TestGatekeeperSafetyInvariantsExtended:
     async def test_per_tool_auto_approve_cannot_bypass_policy_deny(self, policy_gk):
         gk = policy_gk
         gk.enable_tool_auto_approve("c1", "Bash")
-        result = await gk.check("Bash", {"command": "rm -rf /"}, "s1", "c1")
+        result = await gk.check("Bash", {"command": "sudo rm -rf /"}, "s1", "c1")
         assert result.behavior == "deny"
 
     async def test_per_tool_auto_approve_cannot_bypass_sandbox(self, policy_gk):
@@ -1601,3 +1698,147 @@ class TestAutoGated:
         )
         assert result is not None
         assert result.behavior == "deny"
+
+
+class TestAutoGatedNativeAsk:
+    """`check_auto_gated` + `native_ask_rules` — the auto-mode gating fix.
+
+    Under `auto`, claude does not block on the PreToolUse hook: a
+    `require_approval` that waits for a human there is ignored, the tool runs,
+    and leashd retires its own gate as a phantom "rejected". When the pane's
+    managed settings mirror that policy rule into `permissions.ask`, claude
+    raises a permission decision itself — so leashd must defer instead of
+    blocking, and take the human's answer on the `PermissionRequest` leg it
+    already implements and claude does honour.
+    """
+
+    @pytest.fixture
+    def policy_gatekeeper(self, sandbox, mock_audit, event_bus, policy_engine):
+        return ToolGatekeeper(
+            sandbox=sandbox,
+            audit=mock_audit,
+            event_bus=event_bus,
+            policy_engine=policy_engine,
+        )
+
+    async def test_require_approval_defers_when_natively_asked(self, policy_gatekeeper):
+        result = await policy_gatekeeper.check_auto_gated(
+            "Bash",
+            {"command": "curl https://example.com"},
+            "s1",
+            "c1",
+            native_ask_rules={"network-bash"},
+        )
+        assert result is None
+
+    async def test_require_approval_still_gates_when_not_natively_asked(
+        self, policy_gatekeeper
+    ):
+        """A rule the settings file could not express keeps the old behaviour —
+        no worse than before the fix, and never a silent pass-through."""
+        result = await policy_gatekeeper.check_auto_gated(
+            "Bash",
+            {"command": "curl https://example.com"},
+            "s1",
+            "c1",
+            native_ask_rules={"git-mutations"},
+        )
+        assert result is not None
+        assert result.behavior == "deny"
+
+    async def test_empty_and_missing_ask_set_keep_the_old_behaviour(
+        self, policy_gatekeeper
+    ):
+        for ask in (None, set(), frozenset()):
+            result = await policy_gatekeeper.check_auto_gated(
+                "Bash",
+                {"command": "curl https://example.com"},
+                "s1",
+                "c1",
+                native_ask_rules=ask,
+            )
+            assert result is not None, f"{ask!r} must not defer"
+            assert result.behavior == "deny"
+
+    async def test_deny_stays_decisive_even_when_natively_asked(
+        self, policy_gatekeeper
+    ):
+        """A deny must remain a hook verdict. The ask rule only guarantees claude
+        stops for a decision; `on_permission_request` then dedupes to THIS deny,
+        which is what keeps the precise regex — not a lossy glob — in charge."""
+        result = await policy_gatekeeper.check_auto_gated(
+            "Bash",
+            {"command": "sudo rm -rf /tmp/x"},
+            "s1",
+            "c1",
+            native_ask_rules={"destructive-bash", "network-bash"},
+        )
+        assert result is not None
+        assert result.behavior == "deny"
+
+    async def test_sandbox_violation_ignores_the_ask_set(
+        self, policy_gatekeeper, mock_audit
+    ):
+        result = await policy_gatekeeper.check_auto_gated(
+            "Read",
+            {"file_path": "/etc/passwd"},
+            "s1",
+            "c1",
+            native_ask_rules={"network-bash", "credential-files"},
+        )
+        assert result is not None
+        assert result.behavior == "deny"
+        mock_audit.log_security_violation.assert_called_once()
+
+    async def test_allow_rule_still_defers_and_audits_as_native(
+        self, policy_gatekeeper, mock_audit
+    ):
+        """The defer branch must not shadow the ungated path: an allow rule was
+        already deferring, and must still audit as claude_native_auto rather
+        than as an ask-deferral."""
+        result = await policy_gatekeeper.check_auto_gated(
+            "Bash",
+            {"command": "git status"},
+            "s1",
+            "c1",
+            native_ask_rules={"network-bash"},
+        )
+        assert result is None
+        mock_audit.log_approval.assert_called_once_with(
+            "s1", "Bash", True, "c1", approver_type="claude_native_auto"
+        )
+
+    async def test_unmatched_tool_never_deferred_by_rule_name(
+        self, policy_gatekeeper, mock_audit
+    ):
+        """An unmatched call has no `matched_rule`, so the ask-set lookup must
+        not raise or accidentally match on a falsy name."""
+        result = await policy_gatekeeper.check_auto_gated(
+            "Bash",
+            {"command": "mkdir build"},
+            "s1",
+            "c1",
+            native_ask_rules={"network-bash", ""},
+        )
+        assert result is None
+        mock_audit.log_approval.assert_called_once_with(
+            "s1", "Bash", True, "c1", approver_type="claude_native_auto"
+        )
+
+    async def test_deferral_is_audited_before_it_returns(
+        self, policy_gatekeeper, mock_audit
+    ):
+        """The attempt must still reach audit.jsonl. Deferring changes WHERE the
+        human answers, never whether the call was recorded."""
+        await policy_gatekeeper.check_auto_gated(
+            "Bash",
+            {"command": "curl https://example.com"},
+            "s1",
+            "c1",
+            native_ask_rules={"network-bash"},
+        )
+        mock_audit.log_tool_attempt.assert_called_once()
+        args = mock_audit.log_tool_attempt.call_args
+        assert args.args[4] == PolicyDecision.REQUIRE_APPROVAL
+        # NOT approved by anyone yet — the PermissionRequest leg decides.
+        mock_audit.log_approval.assert_not_called()

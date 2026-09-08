@@ -28,12 +28,18 @@ from fastapi.responses import JSONResponse
 
 HARNESS_DIR = Path(os.environ.get("HARNESS_DIR", "/tmp/leashd_tmux_harness"))
 REPO = Path(os.environ.get("APPROVED_DIR", str(HARNESS_DIR / "repo")))
+EXTRA_DIRS = [
+    Path(p).expanduser()
+    for p in os.environ.get("APPROVED_DIRS_EXTRA", "").split(",")
+    if p.strip()
+]
 SOCK_DIR = HARNESS_DIR / "tmux"
 TG_PORT = int(os.environ.get("TG_PORT", "8091"))
 WEB_PORT = int(os.environ.get("WEB_PORT", "8090"))
 TOKEN = os.environ.get("TG_TOKEN", "TESTTOKEN")
 CHAT_ID = os.environ.get("CHAT_ID", "284184690")
 USER_ID = os.environ.get("USER_ID", "284184690")
+EDIT_DELAY_S = float(os.environ.get("EDIT_DELAY_MS", "0")) / 1000.0
 
 MAX_TEXT_LEN = 4096
 MAX_CALLBACK_DATA_BYTES = 64
@@ -51,6 +57,8 @@ api_errors: list[dict[str, Any]] = []
 uploads: list[dict[str, Any]] = []
 _uid = [1]
 _mid = [1000]
+_engine: list[Any] = [None]
+_telegram: list[Any] = [None]
 
 app = FastAPI()
 
@@ -270,6 +278,8 @@ async def _handle(
         )
         return ok(_msg_obj(mid, text, int(data.get("chat_id", CHAT_ID))))
     if method in ("editMessageText", "editMessageReplyMarkup", "editMessageCaption"):
+        if EDIT_DELAY_S:
+            await asyncio.sleep(EDIT_DELAY_S)
         mid = int(data.get("message_id", 0) or 0)
         if mid not in msg_text or mid in deleted_mids:
             return err(method, "Bad Request: message to edit not found")
@@ -515,6 +525,39 @@ async def get_state() -> dict[str, Any]:
     }
 
 
+@app.get("/control/sessions")
+async def get_sessions() -> dict[str, Any]:
+    """The chat's conversation roster and which slot owns the stream.
+
+    Reads the live Engine and TelegramConnector rather than parsing chat text,
+    so a driver can assert on the real foreground/live/busy state.
+    """
+    engine, tg = _engine[0], _telegram[0]
+    if engine is None or tg is None:
+        return {"ready": False}
+    foreground = tg._router.inbound(CHAT_ID)
+    slots = await engine._chat_sessions.slots(USER_ID, CHAT_ID, foreground=foreground)
+    return {
+        "ready": True,
+        "foreground": foreground,
+        "slots": [
+            {
+                "index": info.index,
+                "chat_id": info.chat_id,
+                "session_id": info.session_id,
+                "directory": info.directory,
+                "mode": info.mode,
+                "status": info.status,
+                "live": info.live,
+                "busy": info.busy,
+                "foreground": info.foreground,
+                "messages": info.message_count,
+            }
+            for info in slots
+        ],
+    }
+
+
 @app.post("/control/reset")
 async def reset() -> dict[str, Any]:
     calls.clear()
@@ -529,7 +572,7 @@ def build_config() -> Any:
     from leashd.core.config import LeashdConfig
 
     return LeashdConfig(
-        approved_directories=[REPO],
+        approved_directories=[REPO, *EXTRA_DIRS],
         agent_runtime="tmux",
         web_enabled=True,
         web_host="127.0.0.1",
@@ -548,6 +591,23 @@ def build_config() -> Any:
     )  # type: ignore[call-arg]
 
 
+def build_message_store() -> Any:
+    """Message history, pinned inside the harness dir.
+
+    Sessions stay in memory, but the messages DB has to be real for anything
+    that reads history back (``/session`` replays a conversation's last message
+    on switch). ``build_engine`` hardcodes the sqlite paths to the user's real
+    ``~/.leashd/``, so the store is constructed here and injected instead of
+    switching ``storage_backend``.
+    """
+    from leashd.storage.sqlite import SqliteSessionStore
+
+    HARNESS_DIR.mkdir(parents=True, exist_ok=True)
+    db = HARNESS_DIR / "messages.db"
+    db.unlink(missing_ok=True)
+    return SqliteSessionStore(db)
+
+
 async def run_engine() -> None:
     from leashd.agents.runtimes.tmux_session import (
         get_or_create_tmux_session_manager,
@@ -557,14 +617,18 @@ async def run_engine() -> None:
     from leashd.connectors.telegram import TelegramConnector
     from leashd.connectors.web import WebConnector
 
+    msg_store = build_message_store()
+
     config = build_config()
     tmux_sm = get_or_create_tmux_session_manager(config)
     tg = TelegramConnector(TOKEN, api_base_url=f"http://127.0.0.1:{TG_PORT}")
-    web = WebConnector(config, message_store=None, tmux_session_manager=tmux_sm)
+    web = WebConnector(config, message_store=msg_store, tmux_session_manager=tmux_sm)
     multi = MultiConnector([tg, web])
     web._on_connect = lambda cid: multi.register_route(cid, web)
     web._on_disconnect = lambda cid: multi.unregister_route(cid)
-    engine = build_engine(config, connector=multi, message_store=None)
+    engine = build_engine(config, connector=multi, message_store=msg_store)
+    _engine[0] = engine
+    _telegram[0] = tg
     await engine.startup()
     print("ENGINE_STARTED", flush=True)
     await multi.start()

@@ -521,6 +521,13 @@ class WebConnector(BaseConnector):
         super().set_approval_resolver(resolver)
         self._ws_handler.set_approval_resolver(resolver)
 
+    def set_auto_approve_handler(
+        self,
+        handler: Callable[[str, str], None],
+    ) -> None:
+        super().set_auto_approve_handler(handler)
+        self._ws_handler.set_auto_approve_handler(handler)
+
     def set_interaction_resolver(
         self,
         resolver: Callable[[str, str], Coroutine[Any, Any, bool]],

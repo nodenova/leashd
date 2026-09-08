@@ -740,3 +740,84 @@ async def test_resolve_path_fallback_preserves_existing_uuid(tmp_path):
     path = tailer._resolve_path()
     assert path == other_jsonl
     assert sess.claude_uuid == "existing-uuid"
+
+
+async def _adopting_tailer(tmp_path, session, adopt_from):
+    events: list[dict] = []
+
+    async def on_event(_sess, obj):
+        events.append(obj)
+
+    root = tmp_path / "projects"
+    root.mkdir(exist_ok=True)
+    tailer = JSONLTailer(
+        projects_root=root,
+        on_event=on_event,
+        session=session,
+        adopt_from=adopt_from,
+    )
+    return tailer, events, root
+
+
+async def test_adopt_replays_only_what_landed_while_the_daemon_was_down(tmp_path):
+    """A restart mid-turn must deliver the records written during the gap —
+    and only those. Everything before the recorded offset already reached the
+    chat under the previous daemon."""
+    from leashd.agents.runtimes.tmux_session import encode_project_dir
+
+    sess = _fake_session("/work")
+    root = tmp_path / "projects"
+    proj = root / encode_project_dir("/work")
+    proj.mkdir(parents=True)
+    jsonl = proj / "uuid-1.jsonl"
+    seen_before = '{"uuid": "old", "type": "assistant"}\n'
+    jsonl.write_text(seen_before)
+    offset = len(seen_before.encode())
+    inode = jsonl.stat().st_ino
+
+    tailer, events, _ = await _adopting_tailer(tmp_path, sess, (jsonl, offset, inode))
+    with jsonl.open("a") as fh:
+        fh.write('{"uuid": "new", "type": "assistant"}\n')
+
+    path = tailer._resolve_path()
+    tailer._skip_resume_history(path)
+    await tailer._drain(path)
+    assert [e["uuid"] for e in events] == ["new"]
+
+
+async def test_adopt_falls_back_to_the_end_when_the_file_changed(tmp_path):
+    """A rotated or compacted transcript makes the recorded offset meaningless.
+    Losing the gap beats replaying a whole conversation into the chat."""
+    from leashd.agents.runtimes.tmux_session import encode_project_dir
+
+    sess = _fake_session("/work")
+    root = tmp_path / "projects"
+    proj = root / encode_project_dir("/work")
+    proj.mkdir(parents=True)
+    jsonl = proj / "uuid-1.jsonl"
+    jsonl.write_text('{"uuid": "a"}\n{"uuid": "b"}\n')
+
+    tailer, events, _ = await _adopting_tailer(tmp_path, sess, (jsonl, 5, 999999))
+    path = tailer._resolve_path()
+    tailer._skip_resume_history(path)
+    await tailer._drain(path)
+    assert events == []
+    assert tailer.position()[1] == jsonl.stat().st_size
+
+
+async def test_position_reports_what_a_later_adopt_resumes_from(tmp_path):
+    from leashd.agents.runtimes.tmux_session import encode_project_dir
+
+    sess = _fake_session("/work")
+    tailer, _events, root = _tailer(tmp_path, sess)
+    proj = root / encode_project_dir("/work")
+    proj.mkdir(parents=True)
+    jsonl = proj / "uuid-1.jsonl"
+    jsonl.write_text('{"uuid": "a"}\n')
+
+    path = tailer._resolve_path()
+    await tailer._drain(path)
+    reported_path, offset, inode = tailer.position()
+    assert reported_path == jsonl
+    assert offset == jsonl.stat().st_size
+    assert inode == jsonl.stat().st_ino

@@ -114,8 +114,12 @@ async def _maybe_start_tmux_hook_server(config: LeashdConfig) -> Any:
 
 async def _run_cli(config: LeashdConfig) -> None:
     engine = build_engine(config, reap_orphan_tmux=True)
-    hook_server = await _maybe_start_tmux_hook_server(config)
+    # Startup adopts the panes a previous daemon left running; it has to finish
+    # before the hook receiver opens, or a surviving pane's first hook arrives
+    # unroutable and triggers the orphan reap against the very panes being
+    # adopted.
     await engine.startup()
+    hook_server = await _maybe_start_tmux_hook_server(config)
 
     logger.info(
         "cli_starting",
@@ -159,8 +163,9 @@ async def _run_telegram(config: LeashdConfig) -> None:
         api_base_url=config.telegram_api_base_url,
     )
     engine = build_engine(config, connector=connector, reap_orphan_tmux=True)
-    hook_server = await _maybe_start_tmux_hook_server(config)
+    # Adopt before the hook receiver opens — see _run_cli.
     await engine.startup()
+    hook_server = await _maybe_start_tmux_hook_server(config)
     try:
         await connector.start()
     except Exception:

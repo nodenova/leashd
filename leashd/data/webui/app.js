@@ -1733,6 +1733,20 @@ document.addEventListener("keydown", handleModalKeydown);
 // ============================================================
 // Approvals — inline cards in the message stream
 // ============================================================
+function approvalScope(tool) {
+  return tool.startsWith("Bash::") ? tool.slice(6) : tool;
+}
+
+function approveAllLabel(tool) {
+  const scope = approvalScope(tool);
+  const shown = scope.length > 44 ? scope.slice(0, 43) + "…" : scope;
+  return `Approve all “${shown}”`;
+}
+
+function approveAllTitle(tool) {
+  return `Auto-approve every future ${approvalScope(tool)} in this conversation`;
+}
+
 function onApprovalRequest(payload) {
   const { request_id, tool, description } = payload;
   PendingStateCache.saveApproval(state.sessionId, payload);
@@ -1759,7 +1773,13 @@ function onApprovalRequest(payload) {
     `<div class="approval-actions">` +
     `<button class="btn-deny approval-btn" data-action="deny">Deny</button>` +
     `<button class="btn-approve approval-btn" data-action="approve">Approve</button>` +
-    `</div>`;
+    `</div>` +
+    (tool
+      ? `<div class="approval-actions approval-actions-all">` +
+        `<button class="btn-approve-all approval-btn" data-action="approve-all">` +
+        `${escapeHtml(approveAllLabel(tool))}</button>` +
+        `</div>`
+      : "");
 
   card.querySelector('[data-action="approve"]').onclick = () => {
     wsSend("approval_response", { approval_id: request_id, approved: true });
@@ -1769,6 +1789,16 @@ function onApprovalRequest(payload) {
     wsSend("approval_response", { approval_id: request_id, approved: false });
     resolveApprovalCard(row, false);
   };
+  const approveAllBtn = card.querySelector('[data-action="approve-all"]');
+  if (approveAllBtn) {
+    approveAllBtn.title = approveAllTitle(tool);
+    approveAllBtn.onclick = () => {
+      wsSend("approval_response", {
+        approval_id: request_id, approved: true, approve_all: true, tool,
+      });
+      resolveApprovalCard(row, true, approveAllLabel(tool));
+    };
+  }
 
   inner.appendChild(card);
   row.appendChild(inner);
@@ -1781,15 +1811,19 @@ function onApprovalRequest(payload) {
   });
 }
 
-function resolveApprovalCard(row, approved) {
+function resolveApprovalCard(row, approved, allScope) {
   const approvalId = row.getAttribute("data-approval-id");
   if (approvalId) PendingStateCache.removeApproval(state.sessionId, approvalId);
   const card = row.querySelector(".approval-card");
   if (!card) return;
   card.classList.add(approved ? "approved" : "denied");
+  card.querySelector(".approval-actions-all")?.remove();
   const actions = card.querySelector(".approval-actions");
   if (actions) {
-    actions.innerHTML = `<span class="approval-resolved">${approved ? "✓ Approved" : "✗ Denied"}</span>`;
+    const verdict = approved
+      ? allScope ? `✓ ${escapeHtml(allScope)}` : "✓ Approved"
+      : "✗ Denied";
+    actions.innerHTML = `<span class="approval-resolved">${verdict}</span>`;
   }
   // Auto-dismiss with fallback if animation doesn't fire
   setTimeout(() => {
@@ -2945,10 +2979,10 @@ const SettingsManager = {
       <div class="setting-row">
         <div><div class="setting-label">Runtime</div></div>
         <select class="select-control" data-setting="agent.runtime">
+          <option value="tmux" ${runtime === 'tmux' ? 'selected' : ''}>tmux — interactive claude TUI (default)</option>
           <option value="claude-cli" ${runtime === 'claude-cli' ? 'selected' : ''}>Claude CLI</option>
           <option value="claude-code" ${runtime === 'claude-code' ? 'selected' : ''}>Claude Code (SDK)</option>
           <option value="codex" ${runtime === 'codex' ? 'selected' : ''}>Codex</option>
-          <option value="tmux" ${runtime === 'tmux' ? 'selected' : ''}>tmux (interactive, experimental)</option>
         </select>
       </div>
       <div class="setting-row">
@@ -3122,14 +3156,14 @@ const SettingsManager = {
   },
 
   _renderBrowserSection(browser) {
-    const backend = browser.backend || "playwright";
+    const backend = browser.backend || "agent-browser";
     return `<div class="settings-section">
       <h3>Browser</h3>
       <div class="setting-row">
         <div><div class="setting-label">Backend</div></div>
         <select class="select-control" data-setting="browser.backend">
+          <option value="agent-browser" ${backend === 'agent-browser' ? 'selected' : ''}>Agent Browser (default)</option>
           <option value="playwright" ${backend === 'playwright' ? 'selected' : ''}>Playwright</option>
-          <option value="agent-browser" ${backend === 'agent-browser' ? 'selected' : ''}>Agent Browser</option>
         </select>
       </div>
       <div class="setting-row">

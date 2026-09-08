@@ -18,9 +18,9 @@ rules:
     tools: [Read, Write, Edit]
     path_patterns:
       - "\\.env$|\\.env\\."
-      - "\\.ssh/|\\.aws/"
-      - "\\.key$|\\.pem$"
-      - "id_rsa|credentials|secrets?"
+      - "\\.ssh/|\\.aws/|\\.gnupg/"
+      - "\\.key$|\\.pem$|\\.p12$|\\.pfx$|\\.keystore$"
+      - "id_rsa|id_ed25519|id_ecdsa|id_dsa|credentials|secrets?|token\\.json$"
     action: deny
     reason: "Credential/sensitive file access blocked"
     risk_level: critical
@@ -46,7 +46,6 @@ rules:
   - name: destructive-bash
     tool: Bash
     command_patterns:
-      - "rm\\s.*-.*r.*f|rm\\s+-rf"
       - "\\bsudo\\b"
       - "\\b(curl|wget)\\b.*\\|.*\\b(bash|sh|zsh)\\b"
       - "\\bchmod\\s+777\\b"
@@ -55,6 +54,23 @@ rules:
     reason: "Destructive or dangerous command"
     risk_level: critical
 
+  # Recursive delete asks rather than denies: in practice the target is the
+  # agent's own litter (build dirs, caches, logs), and a hard deny ended the
+  # whole job to protect a cache directory. An approval keeps a human in the
+  # loop without ending the work; nothing here runs unattended. `sudo`,
+  # pipe-to-shell, `chmod 777`, SQL `DROP` and force-push stay denied above.
+  - name: recursive-delete
+    tool: Bash
+    command_patterns:
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-\\S*[rR]\\S*[fF]"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-\\S*[fF]\\S*[rR]"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-[rR]\\s+(?:-\\S+\\s+)*-[fF]\\b"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*-[fF]\\s+(?:-\\S+\\s+)*-[rR]\\b"
+      - "(?:^|[;&|`(\\n]|\\$\\()\\s*(?:sudo\\s+)?rm\\s+(?:-\\S+\\s+)*--recursive\\b"
+    action: require_approval
+    reason: "Recursive delete — confirm the path before it runs"
+    risk_level: high
+
   - name: pipe-to-shell
     tool: Bash
     command_patterns:
@@ -62,6 +78,57 @@ rules:
     action: deny
     reason: "Pipe-to-shell blocked"
     risk_level: critical
+
+  # `credential-files` above is scoped to Read/Write/Edit, so it never sees a
+  # shell command: `cat <repo>/.env` and `echo … >> ~/.ssh/authorized_keys` are
+  # otherwise cleared outright by `read-only-bash` below, and claude's native
+  # deny globs — the only thing that used to stop them — are anchored at `~/`
+  # and installed by the tmux runtime alone. In an autonomous run this is the
+  # AI approver's call, and it arrives with the command in front of it.
+  #
+  # One credential path per pattern, unanchored, so the tmux runtime mirrors
+  # each as a narrow `permissions.ask` glob (`Bash(*.ssh/*)`) instead of
+  # prompting on every `cat`. Patterns are matched against what the shell
+  # executes, quoting respected, so a path named inside a quoted remote payload
+  # (`ssh host 'ls ~/.ssh/'`) is not a local credential access and does not
+  # match.
+  - name: credential-bash
+    tool: Bash
+    command_patterns:
+      - "\\.env\\b(?!\\.(example|sample|template|dist))"
+      - "\\.ssh/"
+      - "\\.aws/"
+      - "\\.gnupg/"
+      - "authorized_keys"
+      - "\\.pem\\b"
+      - "\\.key\\b"
+      - "\\.p12\\b"
+      - "\\.pfx\\b"
+      - "\\.keystore\\b"
+      - "id_rsa"
+      - "id_ed25519"
+      - "id_ecdsa"
+      - "id_dsa"
+      - "\\.git-credentials\\b"
+      - "credentials\\b"
+      - "secret\\."
+      - "secrets\\."
+      - "token\\.json\\b"
+    action: require_approval
+    description: "Shell access to a credential path"
+    risk_level: critical
+
+  # Matched against the SQL an interpreter is handed, not the shell skeleton:
+  # `sqlite3 db "DROP TABLE users"` passes its statement positionally, which
+  # the floor used to read as an inert string. Anchored at the start of that
+  # payload — no shell command is named `INSERT INTO`.
+  - name: sql-write
+    tool: Bash
+    command_patterns:
+      - "(?i)^\\s*(INSERT\\s+(OR\\s+\\w+\\s+)?INTO|UPDATE\\s+\\S+\\s+SET|DELETE\\s+FROM|REPLACE\\s+INTO|ALTER\\s+(TABLE|DATABASE|INDEX|VIEW)|CREATE\\s+((UNIQUE|TEMP|TEMPORARY)\\s+)*(TABLE|INDEX|DATABASE|VIEW|TRIGGER)|ATTACH\\s|DETACH\\s|VACUUM\\b|REINDEX\\b|PRAGMA\\s+\\w+\\s*=)"
+    action: require_approval
+    description: "SQL statement that writes"
+    risk_level: high
 
   # ── Auto-allow: agent internals ────────────────────────────────────────────
 
@@ -115,22 +182,48 @@ rules:
     action: require_approval
     description: "Privileged agent-browser operation (code install, listener, real-Chrome attach, third-party send)"
 
+  # Every pattern ends in the same tail: any argument text, then only pipes
+  # into a text filter. Reading a page is read-only; `… | curl -d @-` is an
+  # upload of whatever was read, and the rule matching first means nothing
+  # downstream of the pipe is ever examined.
   - name: agent-browser-readonly
     tool: Bash
     command_patterns:
-      - "^agent-browser\\s+(snapshot|screenshot|console|errors|get|is|wait|diff|highlight|react|skills|profiles)\\b"
-      - "^agent-browser\\s+(read|a11y|vitals)\\b(?!.*(https?://|\\bwww\\.))"
-      - "^agent-browser\\s+doctor\\b"
-      - "^agent-browser\\s+session\\b"
-      - "^agent-browser\\s+tab(\\s+list)?(\\s+--\\S+)*\\s*$"
+      - "^agent-browser\\s+(snapshot|screenshot|console|errors|get|is|wait|diff|highlight|react|skills|profiles)\\b[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
+      - "^agent-browser\\s+(read|a11y|vitals)\\b(?!.*(https?://|\\bwww\\.))[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
+      - "^agent-browser\\s+doctor\\b[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
+      - "^agent-browser\\s+session\\b[^|]*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
+      - "^agent-browser\\s+tab(\\s+list)?(\\s+--\\S+)*\\s*(\\|\\s*(jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr)\\b[^|]*)*$"
     action: allow
     description: "Read-only agent-browser observation"
+
+  # A dev server the run just started is a read: loopback host plus a read
+  # method is allowed, everything else falls to `network-bash` below. Guards
+  # and their reasoning are spelled out on the same rule in `default.yaml`.
+  - name: loopback-read
+    tool: Bash
+    command_patterns:
+      - "^(?:curl|wget)\\b(?![^|]*\\s-[a-zA-Z]*[dFT]\\b)(?![^|]*\\s--(?:data|form|upload-file|json|post-data|post-file)\\b)(?![^|]*\\s(?:-X|--request)\\s+(?!GET\\b|HEAD\\b))(?![^|]*\\shttps?://(?!(?:127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0|\\[::1\\])[:/\\s]))[^|]*\\s(?:https?://)?(?:127\\.0\\.0\\.1|localhost|0\\.0\\.0\\.0|\\[::1\\])(?::\\d+)?(?:/\\S*)?\\s*(?:\\|\\s*(?:jq|head|tail|wc|grep|rg|sort|uniq|column|cat|cut|tr|sed|xargs)\\b[^|]*)*$"
+    action: allow
+    description: "Read-only request to a loopback address"
+
+  - name: sql-read
+    tool: Bash
+    command_patterns:
+      - "(?i)^\\s*(SELECT\\b|WITH\\b|EXPLAIN\\b|\\.tables\\b|\\.schema\\b|\\.databases\\b|\\.dbinfo\\b|\\.indexes\\b)"
+    action: allow
+    description: "Read-only SQL query"
 
   - name: read-only-bash
     tool: Bash
     command_patterns:
       - "^(cd|ls|cat|head|tail|find|grep|wc|du|df|pwd|echo|date|whoami|which|type|file|stat)\\b"
       - "^git\\s+(-[a-zA-Z]\\s+\\S+\\s+|--[a-z-]+(=\\S+)?\\s+)*?(status|log|diff|show|branch|remote|tag)\\b"
+      - "^(sort|uniq|cut|tr|column|nl|rev|tac|comm|join|paste|fold|expand|unexpand|fmt|shuf|jq|rg|ag|tree|printf|seq|true|false|test|sleep|yes)\\b"
+      - "^(basename|dirname|realpath|readlink|diff|cmp|md5|md5sum|shasum|sha1sum|sha256sum|sha512sum|cksum|od|xxd|hexdump|strings)\\b"
+      - "^(ps|pgrep|pstree|lsof|jobs|uptime|id|groups|hostname|uname|arch|sw_vers|locale|printenv|env)\\b"
+      - "^sed\\b(?![^|]*\\s-[a-zA-Z]*[if]\\b)(?![^|]*\\s--(?:in-place|file)\\b)"
+      - "^tmux\\b(?![^|]*\\\\;)[^|]*\\s(list-sessions|list-panes|list-windows|list-clients|list-buffers|list-keys|list-commands|capture-pane|display-message|show-options|show-environment|has-session|info)\\b"
     action: allow
 
   # ── Auto-allow: dev tools ──────────────────────────────────────────────────

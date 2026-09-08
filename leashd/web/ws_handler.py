@@ -55,6 +55,7 @@ class WebSocketHandler:
         self._approval_resolver: (
             Callable[[str, bool], Coroutine[Any, Any, bool]] | None
         ) = None
+        self._auto_approve_handler: Callable[[str, str], None] | None = None
         self._interaction_resolver: (
             Callable[[str, str], Coroutine[Any, Any, bool]] | None
         ) = None
@@ -87,6 +88,9 @@ class WebSocketHandler:
         self, resolver: Callable[[str, bool], Coroutine[Any, Any, bool]]
     ) -> None:
         self._approval_resolver = resolver
+
+    def set_auto_approve_handler(self, handler: Callable[[str, str], None]) -> None:
+        self._auto_approve_handler = handler
 
     def set_interaction_resolver(
         self, resolver: Callable[[str, str], Coroutine[Any, Any, bool]]
@@ -301,11 +305,22 @@ class WebSocketHandler:
         if msg.type == "approval_response":
             approval_id = msg.payload.get("approval_id", "")
             approved = msg.payload.get("approved", False)
+            approve_all = bool(msg.payload.get("approve_all"))
+            tool_name = str(msg.payload.get("tool") or "")
             if approval_id and self._approval_resolver:
                 try:
-                    await self._approval_resolver(approval_id, approved)
+                    resolved = await self._approval_resolver(approval_id, approved)
                 except Exception:
                     logger.exception("webui_approval_error", chat_id=chat_id)
+                    return
+                if resolved and approved and approve_all and tool_name:
+                    if self._auto_approve_handler:
+                        self._auto_approve_handler(chat_id, tool_name)
+                    logger.info(
+                        "webui_auto_approve_enabled",
+                        chat_id=chat_id,
+                        tool_name=tool_name,
+                    )
             return
 
         if msg.type == "interaction_response":

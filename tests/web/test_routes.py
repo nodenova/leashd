@@ -492,8 +492,8 @@ class TestConfigGetEndpoint:
             resp = client.get("/api/config", headers=_AUTH_HEADER)
             data = resp.json()
             assert data["agent"]["effort"] == "xhigh"
-            assert data["agent"]["runtime"] == "claude-code"
-            assert data["browser"]["backend"] == "playwright"
+            assert data["agent"]["runtime"] == "tmux"
+            assert data["browser"]["backend"] == "agent-browser"
 
 
 class TestConfigPutEndpoint:

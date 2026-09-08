@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from leashd.agents.base import AgentResponse, BaseAgent, ToolActivity
+from leashd.agents.runtimes._helpers import is_retryable_error
 from leashd.agents.types import PermissionAllow, PermissionDeny
 from leashd.exceptions import AgentError
 
@@ -36,14 +37,6 @@ logger = structlog.get_logger()
 _MAX_RETRIES = 3
 _MAX_BACKOFF_SECONDS: float = 16
 _ERROR_TRUNCATION_LENGTH = 200
-
-_RETRYABLE_PATTERNS = (
-    "api_error",
-    "overloaded",
-    "rate_limit",
-    "529",
-    "500",
-)
 
 _SANDBOX_MAP: dict[str, str] = {
     "plan": "read-only",
@@ -91,11 +84,6 @@ _EFFORT_MAP: dict[str, str] = {
 def _backoff_delay(attempt: int) -> float:
     delay: float = 2.0 * (2**attempt)
     return min(delay, _MAX_BACKOFF_SECONDS)
-
-
-def _is_retryable_error(content: str) -> bool:
-    lowered = content.lower()
-    return any(p in lowered for p in _RETRYABLE_PATTERNS)
 
 
 def _truncate(text: str, max_len: int = 60) -> str:
@@ -516,7 +504,7 @@ class CodexAgent(BaseAgent):
                     session.agent_resume_token = None
                     continue
 
-                if _is_retryable_error(str(exc)):
+                if is_retryable_error(str(exc)):
                     logger.warning(
                         "codex_retryable_error",
                         session_id=session.session_id,
@@ -718,7 +706,7 @@ class CodexAgent(BaseAgent):
                     session.agent_resume_token = None
                     continue
 
-                if _is_retryable_error(str(exc)):
+                if is_retryable_error(str(exc)):
                     logger.warning(
                         "codex_retryable_error",
                         session_id=session.session_id,

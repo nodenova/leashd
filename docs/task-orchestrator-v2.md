@@ -600,7 +600,7 @@ See [Autonomous Mode — Task Orchestrator](autonomous-mode.md#task-orchestrator
 
 ## Safety Guarantees
 
-1. **All tool calls pass through the full safety pipeline.** The orchestrator configures per-action auto-approvals, but cannot bypass sandbox or deny rules. Credentials, force push, `rm -rf`, sudo, etc. are always denied regardless of what the conductor instructs.
+1. **All tool calls pass through the full safety pipeline.** The orchestrator configures per-action auto-approvals, but cannot bypass sandbox or deny rules. Credentials, force push, sudo, etc. are always denied regardless of what the conductor instructs.
 
 2. **Auto-approvals are action-scoped.** Explore/review get read-only tools only. Implement/fix get write + lint/test tools. Test/verify get browser tools. PR gets git/gh tools. Auto-approvals are cleared between actions and on terminal states.
 
